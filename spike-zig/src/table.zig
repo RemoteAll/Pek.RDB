@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
 // 个人使用免费；商业使用需商业授权，或同样以 AGPL-3.0 开源（见 LICENSE）。
 const std = @import("std");
 const Skiplist = @import("skiplist.zig").Skiplist;
@@ -19,11 +19,19 @@ pub const Options = struct {
     ///
     /// 只在 flush 之后检查，不起后台线程：写入抖动可预测（合并期间该次写变慢，
     /// 不会让别的线程随时被卡），也不需要双写 + 引用计数。
-    /// 依据实测段数曲线（§16.1.6）：段数 ≤8 时点查衰减可忽略，≥16 后不命中点查开始明显变慢。
+    ///
+    /// **选值看 §16.1.7 的实测，不要凭「段数少就快」的直觉**：
+    /// 不命中点查与段数**近似成反比**（25 段 1.66M / 10 段 3.58M / 4 段 9.21M / 1 段 30.8M 次/s），
+    /// 并没有「≤8 段就可忽略」这回事 —— §16.1.6 里 7 段已比 2 段慢 3.3×。
+    /// 写放大只由「总段数/阈值」决定、与数据总量无关（25 段下：阈值 16→1.6×、8→2.8×、4→5.7×）。
+    /// 推荐：写多读少 16/0、均衡 8、读多写少 4。
+    /// 注意它只控制**触发时机**，单次合并的阻塞时长仍随数据总量线性增长（分层合并才能治本）。
     compact_after_segs: usize = 0,
 };
 
 /// 自动 compaction 连续失败上限：到顶就停手，避免每次 flush 都白跑一遍合并。
+/// **停手后不会自动恢复** —— 上层必须定期查 `autoCompactHealthy()`，
+/// 排除原因（磁盘满/OOM 等）后调 `resetAutoCompact()` 重新启用。
 const AUTO_COMPACT_MAX_FAILS: u8 = 5;
 
 /// 范围扫描结果：records 的 key/value 均指向 buf（一次性大缓冲），deinit 只释放 2 块。
@@ -158,10 +166,11 @@ pub const Table = struct {
     auto_compact_count: u32 = 0,
     /// 写入（flush）产生的段字节总数：即「用户数据量」的口径。
     flush_bytes_total: u64 = 0,
-    /// 自动合并累计重写的字节数。
-    /// 写放大 = (flush_bytes_total + auto_compact_bytes) / flush_bytes_total，
+    /// 合并累计重写的字节数（**含手动调 `compact()`**，所以叫 compact 而非 auto_compact）。
+    /// 写放大 = (flush_bytes_total + compact_bytes_total) / flush_bytes_total，
     /// 是**确定性量**：不受磁盘/CPU 噪声影响，比计时可靠得多。
-    auto_compact_bytes: u64 = 0,
+    /// 失败的合并不计入（它没产出可用段）。
+    compact_bytes_total: u64 = 0,
 
     pub fn open(
         io: std.Io,
@@ -346,9 +355,26 @@ pub const Table = struct {
         return null;
     }
 
+    /// 把 memtable 落盘。
+    ///
+    /// **注意语义**：开了 `compact_after_segs` 时，本函数末尾可能触发全量合并，
+    /// 于是这一次 flush 的耗时可从微秒级变成数百毫秒（200 万行约 0.4–0.7 s）。
+    /// 合并失败不影响本次 flush 成功（数据已落盘），错误记在 `auto_compact_error`。
     pub fn flush(self: *Table) !void {
         try self.flushImpl();
         self.maybeAutoCompact();
+    }
+
+    /// 自动 compaction 是否还能工作。到上限后就**不会**再自动合并（不会自动恢复），
+    /// 上层应定期检查；排除原因（磁盘满 / OOM 等）后调 `resetAutoCompact()`。
+    pub fn autoCompactHealthy(self: *const Table) bool {
+        return self.auto_compact_fails < AUTO_COMPACT_MAX_FAILS;
+    }
+
+    /// 重置自动 compaction 的失败状态，让它重新尝试。
+    pub fn resetAutoCompact(self: *Table) void {
+        self.auto_compact_fails = 0;
+        self.auto_compact_error = null;
     }
 
     /// 段数达到 `compact_after_segs` 就自动全量合并。
@@ -356,17 +382,21 @@ pub const Table = struct {
     /// `auto_compact_error` 供上层查询；连续失败到上限就停手，避免每次 flush 都白跑。
     ///
     /// 返回 void（内部 catch）：不把 compact 的错误集传染给写路径。
+    /// 代价：写路径看不到合并失败，**上层必须自己查 `autoCompactHealthy()` / `auto_compact_error`**，
+    /// 否则自动合并会静默失效。
     fn maybeAutoCompact(self: *Table) void {
         if (self.opts.compact_after_segs == 0) return;
         if (self.going_compact) return; // compact 内部的 flush 不得递归触发
         if (self.segs.items.len < self.opts.compact_after_segs) return;
         if (self.auto_compact_fails >= AUTO_COMPACT_MAX_FAILS) return;
-        _ = self.compact() catch |e| {
+        const cr = self.compact() catch |e| {
             self.auto_compact_error = e;
             self.auto_compact_fails +|= 1;
             return;
         };
-        self.auto_compact_count +|= 1;
+        // 只在真的合并了才计数：段数 ≤ 1 时 compact() 会直接返回 did = false，
+        // 不判这个就会在 compact_after_segs = 1 下每次 flush 都虚增 1 次
+        if (cr.did) self.auto_compact_count +|= 1;
     }
 
     /// 真正落盘。返回 `anyerror` 是**有意**的：`compact()` 也要先落盘，
@@ -376,6 +406,10 @@ pub const Table = struct {
         const id = self.next_seg;
         const data_path = try self.alloc.print("{s}/seg/{d:0>6}.data", .{ self.base_path, id });
         defer self.alloc.free(data_path);
+        // 只在**归档尚未引用**它时清理半成品。
+        // archiveAppend 之后归档就有这条 record 了，再删文件会让下次 open 报 FileNotFound。
+        var orphan_maybe = true;
+        errdefer if (orphan_maybe) self.dir.deleteFile(self.io, data_path) catch {};
 
         var w = try segmod.Writer.create(self.io, self.dir, data_path, self.alloc, self.opts.bloom_bits);
         var it = self.mem.iterator();
@@ -389,6 +423,7 @@ pub const Table = struct {
         errdefer self.alloc.free(fin.bytes);
         // 从「有效末尾」写：若上次追加留下崩溃残片，这里会把它覆盖掉
         self.index_valid_len = try segmod.archiveAppend(self.io, self.dir, self.index_path, @intCast(id), fin.bytes, self.index_valid_len);
+        orphan_maybe = false; // 归档已引用该段，不能再当孤儿删
 
         const seg = try segmod.Segment.fromBytes(self.io, self.dir, self.base_path, id, fin.bytes, self.alloc, true, self.opts.mmap_preheat);
         self.segs.append(self.alloc, seg) catch |e| {
@@ -399,7 +434,6 @@ pub const Table = struct {
             return e;
         };
         self.next_seg = id + 1;
-        self.flush_bytes_total += data_bytes + fin.bytes.len;
 
         self.mem.reset();
 
@@ -408,8 +442,11 @@ pub const Table = struct {
         self.dir.deleteFile(self.io, self.wal_path) catch {};
         self.wal = try walmod.Wal.create(self.io, self.dir, self.wal_path, self.alloc);
         self.pending = 0;
-    }
 
+        // 计数放最后：上面的 WAL 同步若失败，调用方会重试 flush，
+        // 提前累加会让同一批数据被统计两次（写放大失真）。
+        self.flush_bytes_total += data_bytes + fin.bytes.len;
+    }
     pub fn scanRange(
         self: *Table,
         start: []const u8,
@@ -454,7 +491,7 @@ pub const Table = struct {
     /// 内存是流式的：不为全部结果分配缓冲（200 万行时那是 100MB+）。
     pub fn compact(self: *Table) !CompactResult {
         if (self.segs.items.len <= 1) {
-            return .{ .before = self.segs.items.len, .after = self.segs.items.len, .rows = 0 };
+            return .{ .before = self.segs.items.len, .after = self.segs.items.len, .rows = 0, .did = false };
         }
 
         // 防重入：下面会调 flush()，而 flush() 末尾可能触发自动合并 ——
@@ -472,6 +509,10 @@ pub const Table = struct {
         const id = self.next_seg;
         const data_path = try self.alloc.print("{s}/seg/{d:0>6}.data", .{ self.base_path, id });
         defer self.alloc.free(data_path);
+        // 合并中途失败时新段是半成品（旧段与归档未动，Table 仍可用）：删掉它。
+        // 但 archiveRewrite 之后归档就指向它了，**再删就是制造 FileNotFound**。
+        var orphan_maybe = true;
+        errdefer if (orphan_maybe) self.dir.deleteFile(self.io, data_path) catch {};
 
         var w = try segmod.Writer.create(self.io, self.dir, data_path, self.alloc, self.opts.bloom_bits);
         var rows: usize = 0;
@@ -502,28 +543,34 @@ pub const Table = struct {
         // 重建归档（临时文件 + 原子 rename）：成功后磁盘才指向新段
         const records = [_]segmod.ArchiveRecord{.{ .id = @intCast(id), .payload = fin.bytes }};
         self.index_valid_len = try segmod.archiveRewrite(self.io, self.dir, self.index_path, &records, self.alloc);
+        orphan_maybe = false; // 归档已指向新段
 
-        // 磁盘已一致，现在才清理旧段与旧归档缓冲
+        // 磁盘已一致，现在才清理旧段与旧归档缓冲。
+        // 这里**不允许再有可能失败的分配**：一旦在这之后返回错误，归档指向新段
+        // 而内存 segs 已清空 → Table 变空表（上轮审计 P0-2 的那类状态）。
+        var del_buf: [512]u8 = undefined;
         for (self.segs.items) |*s| {
             const old_id = s.id;
             s.close();
-            const op = try self.alloc.print("{s}/seg/{d:0>6}.data", .{ self.base_path, old_id });
-            defer self.alloc.free(op);
+            const op = std.fmt.bufPrint(&del_buf, "{s}/seg/{d:0>6}.data", .{ self.base_path, old_id }) catch continue;
             self.dir.deleteFile(self.io, op) catch {};
         }
         self.segs.clearRetainingCapacity();
         if (self.idx_archive.len > 0) self.alloc.free(self.idx_archive);
         self.idx_archive = &.{};
 
-        try self.segs.append(self.alloc, new_seg);
+        // 用 assumeCapacity：`segs` 刚装过 ≥2 个元素、容量一定够，append 不会重分配。
+        // 若这里用 append 而它恰好失败，磁盘归档已指向新段、旧段已删、segs 已空
+        // —— Table 会变成空表（上轮审计 P0-2 的残留路径）。
+        self.segs.appendAssumeCapacity(new_seg);
         self.next_seg = id + 1;
 
         // 合并成功：清除自动触发积累的失败状态
         self.auto_compact_error = null;
         self.auto_compact_fails = 0;
-        self.auto_compact_bytes += out_bytes;
+        self.compact_bytes_total += out_bytes;
 
-        return .{ .before = before, .after = self.segs.items.len, .rows = rows, .bytes = out_bytes };
+        return .{ .before = before, .after = self.segs.items.len, .rows = rows, .bytes = out_bytes, .did = true };
     }
 };
 
@@ -533,6 +580,9 @@ pub const CompactResult = struct {
     rows: usize,
     /// 本次合并写出的段字节数（算写放大用，确定性量、不受磁盘噪声影响）
     bytes: u64 = 0,
+    /// 是否真的做了合并。**段数 ≤ 1 时直接返回 false** —— 调用方不能拿
+    /// `before == after` 去判断（空表合并也是 before == after == 1 但 did = true）。
+    did: bool = false,
 };
 
 /// memtable + 所有段的流式 k 路归并：按 (key asc, seq desc) 产出**可见**记录，
@@ -1045,6 +1095,120 @@ test "自动 compaction: compact 内部的 flush 不得递归触发" {
     try std.testing.expectEqualStrings("va", (try t.get("a", &out)).?);
     try std.testing.expectEqualStrings("vb", (try t.get("b", &out)).?);
     try std.testing.expectEqualStrings("vc", (try t.get("c", &out)).?);
+
+    // did 必须如实反映「有没有真合并」：段数 ≤1 时 compact 直接返回 did=false
+    const cr_again = try t.compact();
+    try std.testing.expectEqual(@as(usize, 1), cr_again.before);
+    try std.testing.expect(!cr_again.did);
+    try std.testing.expectEqual(@as(u64, 0), cr_again.bytes);
+}
+
+test "自动 compaction: 阈值 1 不得虚增合并次数（compact 提前返回）" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-autocompact-thresh1";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0, .compact_after_segs = 1 });
+    defer t.deinit();
+
+    // 第 1 次 flush：1 段达到阈值，但 compact() 见段数 ≤1 会直接返回（未合并）
+    // → auto_compact_count 必须仍是 0。不做这个判断就会虚增 1 次。
+    try t.put("a", "1");
+    try t.flush();
+    try std.testing.expectEqual(@as(usize, 1), t.segs.items.len);
+    try std.testing.expectEqual(@as(u32, 0), t.auto_compact_count);
+
+    // 第 2、3 次：2 段 → 真合并 → 各计 1 次
+    try t.put("b", "2");
+    try t.flush();
+    try std.testing.expectEqual(@as(usize, 1), t.segs.items.len);
+    try std.testing.expectEqual(@as(u32, 1), t.auto_compact_count);
+
+    try t.put("c", "3");
+    try t.flush();
+    try std.testing.expectEqual(@as(u32, 2), t.auto_compact_count);
+    try std.testing.expect(t.autoCompactHealthy());
+}
+
+test "自动 compaction: 失败到上限后停手，resetAutoCompact 能恢复" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-autocompact-fails";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0, .compact_after_segs = 2 });
+    defer t.deinit();
+
+    try t.put("a", "1");
+    try t.flush(); // 1 段
+
+    // 伪造「连续失败已到上限」：此后不得再自动合并
+    t.auto_compact_fails = AUTO_COMPACT_MAX_FAILS;
+    try std.testing.expect(!t.autoCompactHealthy());
+
+    try t.put("b", "2");
+    try t.flush(); // 2 段达到阈值，但已停手 → 不合并
+    try std.testing.expectEqual(@as(usize, 2), t.segs.items.len);
+    try std.testing.expectEqual(@as(u32, 0), t.auto_compact_count);
+
+    // 排除原因后重置 → 下一次 flush 恢复自动合并
+    t.resetAutoCompact();
+    try std.testing.expect(t.autoCompactHealthy());
+    try std.testing.expect(t.auto_compact_error == null);
+
+    try t.put("c", "3");
+    try t.flush();
+    try std.testing.expectEqual(@as(usize, 1), t.segs.items.len);
+    try std.testing.expectEqual(@as(u32, 1), t.auto_compact_count);
+}
+
+test "写放大计数: compact_bytes_total 含手动合并，flush_bytes_total 只算用户数据" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-wamp-counters";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    // 关闭自动合并，只手动触发 → 两个计数器口径必须分清
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+
+    try t.put("a", "1");
+    try t.flush();
+    const after_first = t.flush_bytes_total;
+    try std.testing.expect(after_first > 0);
+    try std.testing.expectEqual(@as(u64, 0), t.compact_bytes_total);
+
+    try t.put("b", "2");
+    try t.flush();
+    try std.testing.expect(t.flush_bytes_total > after_first);
+    try std.testing.expectEqual(@as(u64, 0), t.compact_bytes_total);
+
+    // 手动合并：compact_bytes_total 增加，flush_bytes_total 不变
+    const user_before = t.flush_bytes_total;
+    const cr = try t.compact();
+    try std.testing.expect(cr.did);
+    try std.testing.expectEqual(@as(u64, 0), t.auto_compact_count); // 手动不算「自动次数」
+    try std.testing.expectEqual(user_before, t.flush_bytes_total);
+    try std.testing.expectEqual(cr.bytes, t.compact_bytes_total);
+
+    // 写放大 = (用户 + 合并) / 用户 > 1（手动合并也算进去，字段名已不叫 auto_）
+    try std.testing.expect(t.compact_bytes_total > 0);
 }
 
 test "table scanRefs merges multiple segments" {

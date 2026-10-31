@@ -108,10 +108,10 @@ fn runCase(
     // 不依赖计时，不受磁盘/CPU 噪声影响，是这组实验真正可靠的核心数据。
     {
         const user_bytes = t.flush_bytes_total;
-        const total_bytes = user_bytes + t.auto_compact_bytes;
+        const total_bytes = user_bytes + t.compact_bytes_total;
         const wamp: f64 = @as(f64, @floatFromInt(total_bytes)) / @as(f64, @floatFromInt(user_bytes));
         std.debug.print("ac_userbytes_{s},{d},0\n", .{ tag, user_bytes });
-        std.debug.print("ac_cmpbytes_{s},{d},0\n", .{ tag, t.auto_compact_bytes });
+        std.debug.print("ac_cmpbytes_{s},{d},0\n", .{ tag, t.compact_bytes_total });
         std.debug.print("ac_wamp_{s},{d},{d:.3}\n", .{ tag, rows, wamp });
     }
 
