@@ -36,15 +36,25 @@ pub const Schema = struct {
         }
         if (pk_count == 0) return error.MissingPrimaryKey;
         if (pk_count > 1) return error.TooManyPrimaryKeys;
+
+        const name_copy = try alloc.dupe(u8, name);
+        errdefer alloc.free(name_copy);
+        const cols = try alloc.alloc(Column, columns.len);
+        errdefer alloc.free(cols);
+        for (columns, 0..) |c, i| {
+            cols[i] = c;
+            cols[i].name = try alloc.dupe(u8, c.name);
+        }
         return .{
-            .name = try alloc.dupe(u8, name),
-            .columns = try alloc.dupe(Column, columns),
+            .name = name_copy,
+            .columns = cols,
             .pk_index = pk_index,
         };
     }
 
     pub fn deinit(self: *Schema, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
+        for (self.columns) |c| alloc.free(c.name);
         alloc.free(self.columns);
         self.* = undefined;
     }

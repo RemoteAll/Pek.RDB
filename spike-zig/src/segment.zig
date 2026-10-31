@@ -166,8 +166,11 @@ pub const Writer = struct {
 // ---------------- 读取 ----------------
 
 pub const Segment = struct {
+    io: std.Io,
     alloc: std.mem.Allocator,
-    data: []u8 = &.{},
+    data: []const u8 = &.{},
+    mm: ?std.Io.File.MemoryMap = null,
+    file: ?std.Io.File = null,
     entries: std.ArrayList(IndexEntry) = .empty,
     bits: []u8 = &.{},
     bits_len: u64 = 0,
@@ -191,7 +194,7 @@ pub const Segment = struct {
         if (!std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC)) return error.BadIndexMagic;
 
         var r = codec.Reader{ .buf = idx_bytes[8..] };
-        var seg = Segment{ .alloc = alloc };
+        var seg = Segment{ .io = io, .alloc = alloc };
         seg.rows = @intCast(try r.u64le());
         seg.min_seq = try r.u64le();
         seg.max_seq = try r.u64le();
@@ -211,8 +214,18 @@ pub const Segment = struct {
         // k 未存进结构：固定 7（与写入一致）
         _ = k;
 
-        seg.data = try readWholeFile(io, dir, data_path, alloc, std.math.maxInt(u64));
-        seg.file_size = seg.data.len;
+        const df = try dir.openFile(io, data_path, .{});
+        seg.file = df;
+        seg.file_size = (try df.stat(io)).size;
+        if (seg.file_size > 0) {
+            var mm = try std.Io.File.MemoryMap.create(io, df, .{
+                .len = @intCast(seg.file_size),
+                .protection = .{ .read = true, .write = false },
+            });
+            try mm.read(io);
+            seg.mm = mm;
+            seg.data = mm.memory;
+        }
         return seg;
     }
 
@@ -220,7 +233,8 @@ pub const Segment = struct {
         for (self.entries.items) |e| self.alloc.free(e.key);
         self.entries.deinit(self.alloc);
         self.alloc.free(self.bits);
-        self.alloc.free(self.data);
+        if (self.mm) |*m| m.destroy(self.io);
+        if (self.file) |f| f.close(self.io);
         self.* = undefined;
     }
 
@@ -290,6 +304,52 @@ pub const Segment = struct {
             }
         }
         return null;
+    }
+
+    pub const RefRecord = struct {
+        key: []const u8,
+        seq: u64,
+        flags: u8,
+        value: []const u8,
+    };
+
+    /// 零拷贝扫描：输出借用 mmap 的切片（调用方保证段存活）。
+    /// 同一 key 只输出一个可见版本（墓碑跳过）。
+    pub fn scanRefs(self: *Segment, start: []const u8, end: []const u8, snapshot: u64, out: *std.ArrayList(RefRecord)) !void {
+        if (self.entries.items.len == 0) return;
+        const data = self.data;
+        var pos: usize = @intCast(self.entries.items[self.candidateIndex(start)].offset);
+        var cur_key: []const u8 = &.{};
+        var have_cur = false;
+        var decided = false;
+
+        while (pos + 17 <= data.len) {
+            const klen: usize = @intCast(std.mem.readInt(u32, data[pos..][0..4], .little));
+            const vlen: usize = @intCast(std.mem.readInt(u32, data[pos + 4 ..][0..4], .little));
+            const seq = std.mem.readInt(u64, data[pos + 8 ..][0..8], .little);
+            const flags = data[pos + 16];
+            const total = 17 + klen + vlen;
+            if (pos + total > data.len) break;
+            const k = data[pos + 17 ..][0..klen];
+            const v = data[pos + 17 + klen ..][0..vlen];
+            pos += total;
+
+            switch (keyCmp(k, end)) {
+                .gt, .eq => return,
+                .lt => {},
+            }
+            if (keyCmp(k, start) == .lt) continue;
+            if (!have_cur or !std.mem.eql(u8, k, cur_key)) {
+                cur_key = k;
+                have_cur = true;
+                decided = false;
+            }
+            if (decided) continue;
+            if (seq <= snapshot) {
+                decided = true;
+                if (flags == 0) try out.append(self.alloc, .{ .key = k, .seq = seq, .flags = flags, .value = v });
+            }
+        }
     }
 
     /// 范围扫描（start 含、end 排他），只输出 seq <= snapshot 的记录（含墓碑）。
@@ -384,4 +444,10 @@ test "segment write + point get + scan" {
     try std.testing.expectEqual(@as(usize, 4), rows.items.len);
     try std.testing.expectEqualStrings("a", rows.items[0].key);
     try std.testing.expectEqualStrings("c", rows.items[3].key);
+
+    var refs: std.ArrayList(Segment.RefRecord) = .empty;
+    defer refs.deinit(alloc);
+    try seg.scanRefs("a", "z", 2, &refs);
+    try std.testing.expectEqual(@as(usize, 3), refs.items.len);
+    try std.testing.expectEqualStrings("b", refs.items[1].key);
 }

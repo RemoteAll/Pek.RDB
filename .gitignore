@@ -10,3 +10,11 @@ spike-zig/zig-out/
 # 本地临时
 *.tmp
 *.log
+spike-zig/bench.out
+spike-zig/bench.err
+spike-zig/bench-data*/
+spike-zig/test-*-tmp/
+spike-zig/test-*-db/
+tools/bench-vs-sqlite/*.db
+tools/bench-vs-sqlite/*.db-wal
+tools/bench-vs-sqlite/*.db-shm

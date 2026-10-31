@@ -1,4 +1,4 @@
-const std = @import("std");
+﻿const std = @import("std");
 const spike = @import("pek_rdb_spike");
 const codec = spike.codec;
 const tablemod = spike.table;
@@ -40,7 +40,7 @@ pub fn main() !void {
 
     std.debug.print("metric,count,value\n", .{});
 
-    var t = try tablemod.Table.open(io, dir, path, alloc, .{ .wal_sync_every = 10_000 });
+    var t = try tablemod.Table.open(io, dir, path, alloc, .{ .wal_sync_every = 10_000, .flush_bytes = 1 << 30 });
     defer t.deinit();
 
     {
@@ -124,6 +124,19 @@ pub fn main() !void {
         std.debug.print("scan,{d},{d:.0}\n", .{ rows.items.len, opsPerSec(@intCast(rows.items.len), ns) });
     }
 
+    // 零拷贝扫描（mmap + 单段快路径）
+    {
+        var refs: std.ArrayList(spike.segment.Segment.RefRecord) = .empty;
+        defer refs.deinit(alloc);
+        const lo = keyOf(scan_lo);
+        const hi = keyOf(scan_hi);
+        const t0 = nowNs(io);
+        const fast = try t.scanRefsFast(&lo, &hi, &refs);
+        const ns = nowNs(io) - t0;
+        std.debug.print("scan_refs,{d},{d:.0}\n", .{ refs.items.len, opsPerSec(@intCast(refs.items.len), ns) });
+        std.debug.print("scan_refs_fast,1,{d}\n", .{@intFromBool(fast)});
+    }
+
     t.deinit();
 
     {
@@ -192,3 +205,4 @@ pub fn main() !void {
         std.debug.print("sql_get_hits,{d},{d}\n", .{ get_n, hits });
     }
 }
+

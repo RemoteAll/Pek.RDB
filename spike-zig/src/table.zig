@@ -1,4 +1,4 @@
-const std = @import("std");
+﻿const std = @import("std");
 const Skiplist = @import("skiplist.zig").Skiplist;
 const walmod = @import("wal.zig");
 const segmod = @import("segment.zig");
@@ -260,6 +260,14 @@ pub const Table = struct {
             i = j;
         }
     }
+    /// 快路径：内存表为空且只有一个段时，直接从 mmap 零拷贝扫描。
+    /// 返回 false 表示不满足条件，调用方走通用路径。
+    pub fn scanRefsFast(self: *Table, start: []const u8, end: []const u8, out: *std.ArrayList(segmod.Segment.RefRecord)) !bool {
+        if (self.mem.len() != 0) return false;
+        if (self.segs.items.len != 1) return false;
+        try self.segs.items[0].scanRefs(start, end, self.visible, out);
+        return true;
+    }
 };
 
 pub fn freeRecords(alloc: std.mem.Allocator, list: *std.ArrayList(RecordOwned)) void {
@@ -308,3 +316,4 @@ test "table put/get/flush/reopen" {
     try std.testing.expectEqual(@as(usize, 1), rows.items.len);
     try std.testing.expectEqualStrings("b", rows.items[0].key);
 }
+

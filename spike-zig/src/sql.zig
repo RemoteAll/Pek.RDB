@@ -750,6 +750,31 @@ test "parse select star" {
     }
 }
 
+test "parse update and delete" {
+    var p = try parse(std.testing.allocator, "UPDATE users SET name = 'X', age = 31 WHERE id = 1");
+    defer p.deinit();
+    switch (p.stmt) {
+        .update => |u| {
+            try std.testing.expectEqualStrings("users", u.table);
+            try std.testing.expectEqual(@as(usize, 2), u.assignments.len);
+            try std.testing.expectEqualStrings("age", u.assignments[1].column);
+            try std.testing.expect(u.where != null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var q = try parse(std.testing.allocator, "DELETE FROM users WHERE age < 18");
+    defer q.deinit();
+    switch (q.stmt) {
+        .delete => |d| {
+            try std.testing.expectEqualStrings("users", d.table);
+            try std.testing.expect(d.where != null);
+            try std.testing.expectEqual(@as(i64, 18), d.where.?.value.integer);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "unsupported statement rejected" {
     try std.testing.expectError(error.UnsupportedStatement, parse(std.testing.allocator, "WITH x AS (SELECT 1) SELECT * FROM x"));
 }

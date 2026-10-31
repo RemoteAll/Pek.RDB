@@ -1,4 +1,4 @@
-const std = @import("std");
+﻿const std = @import("std");
 const sql = @import("sql.zig");
 const schema_mod = @import("schema.zig");
 const tablemod = @import("table.zig");
@@ -196,6 +196,113 @@ fn selectByPk(t: *tablemod.Table, s: *const schema_mod.Schema, sel: sql.Select, 
     };
 }
 
+fn freeRecs(alloc: std.mem.Allocator, recs: *std.ArrayList(segmod.RecordOwned)) void {
+    for (recs.items) |r| {
+        alloc.free(r.key);
+        alloc.free(r.value);
+    }
+    recs.deinit(alloc);
+}
+
+pub fn updateRows(
+    t: *tablemod.Table,
+    s: *const schema_mod.Schema,
+    upd: sql.Update,
+    alloc: std.mem.Allocator,
+) !usize {
+    var recs: std.ArrayList(segmod.RecordOwned) = .empty;
+    defer freeRecs(alloc, &recs);
+    var hi: [16]u8 = @splat(0xFF);
+    try t.scanRange(&[_]u8{}, &hi, &recs);
+
+    var count: usize = 0;
+    for (recs.items) |rec| {
+        const vals = try s.decodeRow(alloc, rec.value);
+        var matched = true;
+        if (upd.where) |w| {
+            const idx = s.indexOf(w.column) orelse {
+                alloc.free(vals);
+                return error.ColumnNotFound;
+            };
+            matched = evalWhere(vals[idx], w.op, w.value);
+        }
+        if (!matched) {
+            alloc.free(vals);
+            continue;
+        }
+        for (upd.assignments) |a| {
+            const idx = s.indexOf(a.column) orelse {
+                alloc.free(vals);
+                return error.ColumnNotFound;
+            };
+            vals[idx] = a.value;
+        }
+        const key = try s.encodeKey(alloc, vals);
+        defer alloc.free(key);
+        const encoded = try s.encodeRow(alloc, vals);
+        defer alloc.free(encoded);
+        if (!std.mem.eql(u8, key, rec.key)) try t.delete(rec.key);
+        try t.put(key, encoded);
+        alloc.free(vals);
+        count += 1;
+    }
+    return count;
+}
+
+pub fn deleteRows(
+    t: *tablemod.Table,
+    s: *const schema_mod.Schema,
+    del: sql.Delete,
+    alloc: std.mem.Allocator,
+) !usize {
+    var recs: std.ArrayList(segmod.RecordOwned) = .empty;
+    defer freeRecs(alloc, &recs);
+    var hi: [16]u8 = @splat(0xFF);
+    try t.scanRange(&[_]u8{}, &hi, &recs);
+
+    var count: usize = 0;
+    for (recs.items) |rec| {
+        if (del.where) |w| {
+            const vals = try s.decodeRow(alloc, rec.value);
+            const idx = s.indexOf(w.column) orelse {
+                alloc.free(vals);
+                return error.ColumnNotFound;
+            };
+            const ok = evalWhere(vals[idx], w.op, w.value);
+            alloc.free(vals);
+            if (!ok) continue;
+        }
+        try t.delete(rec.key);
+        count += 1;
+    }
+    return count;
+}
+
+fn appendDecoded(
+    alloc: std.mem.Allocator,
+    s: *const schema_mod.Schema,
+    sel: sql.Select,
+    bytes: []const u8,
+    full_rows: *std.ArrayList([]sql.Value),
+    bufs: *std.ArrayList([]u8),
+) !void {
+    const vals = try s.decodeRow(alloc, bytes);
+    if (sel.where) |w| {
+        const idx = s.indexOf(w.column) orelse {
+            alloc.free(vals);
+            return error.ColumnNotFound;
+        };
+        if (!evalWhere(vals[idx], w.op, w.value)) {
+            alloc.free(vals);
+            return;
+        }
+    }
+    const copied = try copyRow(alloc, vals);
+    alloc.free(vals);
+    try full_rows.append(alloc, copied.vals);
+    try bufs.append(alloc, copied.buf);
+}
+
 pub fn selectRows(
     t: *tablemod.Table,
     s: *const schema_mod.Schema,
@@ -213,18 +320,7 @@ pub fn selectRows(
         }
     }
 
-    var recs: std.ArrayList(segmod.RecordOwned) = .empty;
-    defer {
-        for (recs.items) |r| {
-            alloc.free(r.key);
-            alloc.free(r.value);
-        }
-        recs.deinit(alloc);
-    }
-
     var hi: [16]u8 = @splat(0xFF);
-    try t.scanRange(&[_]u8{}, &hi, &recs);
-
     var full_rows: std.ArrayList([]sql.Value) = .empty;
     var bufs: std.ArrayList([]u8) = .empty;
     errdefer {
@@ -234,19 +330,20 @@ pub fn selectRows(
         bufs.deinit(alloc);
     }
 
-    for (recs.items) |rec| {
-        const vals = try s.decodeRow(alloc, rec.value);
-        if (sel.where) |w| {
-            const idx = s.indexOf(w.column) orelse return error.ColumnNotFound;
-            if (!evalWhere(vals[idx], w.op, w.value)) {
-                alloc.free(vals);
-                continue;
-            }
+    var fast_refs: std.ArrayList(segmod.Segment.RefRecord) = .empty;
+    defer fast_refs.deinit(alloc);
+
+    if (try t.scanRefsFast(&[_]u8{}, &hi, &fast_refs)) {
+        for (fast_refs.items) |rec| {
+            try appendDecoded(alloc, s, sel, rec.value, &full_rows, &bufs);
         }
-        const copied = try copyRow(alloc, vals);
-        alloc.free(vals);
-        try full_rows.append(alloc, copied.vals);
-        try bufs.append(alloc, copied.buf);
+    } else {
+        var recs: std.ArrayList(segmod.RecordOwned) = .empty;
+        defer freeRecs(alloc, &recs);
+        try t.scanRange(&[_]u8{}, &hi, &recs);
+        for (recs.items) |rec| {
+            try appendDecoded(alloc, s, sel, rec.value, &full_rows, &bufs);
+        }
     }
 
     if (sel.order_by.len > 0) {
@@ -340,3 +437,66 @@ test "insert + select with where/order/limit" {
         try std.testing.expectEqualStrings("Bob", rows.rows[0][1].text);
     }
 }
+
+test "update + delete" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-exec-ud";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    const cols = [_]schema_mod.Column{
+        .{ .name = "id", .col_type = .integer, .primary_key = true },
+        .{ .name = "name", .col_type = .text },
+        .{ .name = "age", .col_type = .integer },
+    };
+    var s = try schema_mod.Schema.init(alloc, "users", &cols);
+    defer s.deinit(alloc);
+
+    var t = try tablemod.Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+
+    {
+        var p = try sql.parse(alloc, "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30), (2, 'Bob', 25), (3, 'Cara', 30)");
+        defer p.deinit();
+        _ = try insertRows(&t, &s, p.stmt.insert, alloc);
+    }
+
+    {
+        var p = try sql.parse(alloc, "UPDATE users SET age = 40 WHERE id = 1");
+        defer p.deinit();
+        const n = try updateRows(&t, &s, p.stmt.update, alloc);
+        try std.testing.expectEqual(@as(usize, 1), n);
+    }
+
+    {
+        var p = try sql.parse(alloc, "SELECT * FROM users WHERE id = 1");
+        defer p.deinit();
+        var rows = try selectRows(&t, &s, p.stmt.select, alloc);
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+        try std.testing.expectEqual(@as(i64, 40), rows.rows[0][2].integer);
+    }
+
+    {
+        var p = try sql.parse(alloc, "DELETE FROM users WHERE age < 28");
+        defer p.deinit();
+        const n = try deleteRows(&t, &s, p.stmt.delete, alloc);
+        try std.testing.expectEqual(@as(usize, 1), n);
+    }
+
+    {
+        var p = try sql.parse(alloc, "SELECT id FROM users ORDER BY id");
+        defer p.deinit();
+        var rows = try selectRows(&t, &s, p.stmt.select, alloc);
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
+        try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
+        try std.testing.expectEqual(@as(i64, 3), rows.rows[1][0].integer);
+    }
+}
+
