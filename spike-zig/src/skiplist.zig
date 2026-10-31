@@ -12,7 +12,7 @@ pub const Entry = struct {
     value: []const u8,
 };
 
-const Node = struct {
+pub const Node = struct {
     key_off: u32,
     key_len: u32,
     val_off: u32,

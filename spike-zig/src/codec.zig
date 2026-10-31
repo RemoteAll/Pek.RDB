@@ -16,6 +16,9 @@ const crc_table: [256]u32 = blk: {
     break :blk t;
 };
 
+/// 查表占用的常量区字节数（供 size 报告使用；C 档可换 16 项半字节表降到 64B）。
+pub const CRC_TABLE_BYTES: usize = @sizeOf(@TypeOf(crc_table));
+
 pub fn crc32(bytes: []const u8) u32 {
     var c: u32 = 0xFFFFFFFF;
     for (bytes) |b| {

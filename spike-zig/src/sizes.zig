@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
+// 个人使用免费；商业使用需商业授权，或同样以 AGPL-3.0 开源（见 LICENSE）。
+//
+// 结构体尺寸报告：`zig build sizes` 输出 `metric,item,bytes`，供嵌入式 RAM 预算核算。
+// 注意：这里报的是**类型布局实测值**（@sizeOf，编译期真实计算），不是估算。
+const std = @import("std");
+const spike = @import("pek_rdb_spike");
+
+fn row(name: []const u8, bytes: usize) void {
+    std.debug.print("sizeof,{s},{d}\n", .{ name, bytes });
+}
+
+pub fn main() void {
+    std.debug.print("metric,item,bytes\n", .{});
+
+    // 存储内核
+    row("skiplist.Skiplist", @sizeOf(spike.skiplist.Skiplist));
+    row("skiplist.Node", @sizeOf(spike.skiplist.Node));
+    row("skiplist.Entry", @sizeOf(spike.skiplist.Entry));
+    row("wal.Wal", @sizeOf(spike.wal.Wal));
+    row("wal.Op", @sizeOf(spike.wal.Op));
+    row("wal.Batch", @sizeOf(spike.wal.Batch));
+    row("segment.Segment", @sizeOf(spike.segment.Segment));
+    row("segment.IndexEntry", @sizeOf(spike.segment.IndexEntry));
+    row("segment.RefRecord", @sizeOf(spike.segment.Segment.RefRecord));
+    row("segment.RecordOwned", @sizeOf(spike.segment.RecordOwned));
+    row("segment.RefCursor", @sizeOf(spike.segment.RefCursor));
+    row("table.Table", @sizeOf(spike.table.Table));
+    row("table.Options", @sizeOf(spike.table.Options));
+    row("table.RecordSet", @sizeOf(spike.table.RecordSet));
+
+    // SQL 层
+    row("schema.Schema", @sizeOf(spike.schema.Schema));
+    row("schema.Column", @sizeOf(spike.schema.Column));
+    row("sql.Value", @sizeOf(spike.sql.Value));
+    row("exec.Rows", @sizeOf(spike.exec.Rows));
+
+    // 常量区
+    row("codec.CRC_TABLE_BYTES", spike.codec.CRC_TABLE_BYTES);
+    row("codec.Reader", @sizeOf(spike.codec.Reader));
+
+    // 关键预算项（按 8KB 目标核算用）：每 key 的常驻 RAM = Node + key + value 拷贝
+    const sk = spike.skiplist.Skiplist;
+    _ = sk;
+}
