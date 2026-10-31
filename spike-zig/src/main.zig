@@ -237,5 +237,148 @@ pub fn main() !void {
         std.debug.print("sql_get,{d},{d:.0}\n", .{ get_n, opsPerSec(get_n, ns_get) });
         std.debug.print("sql_get_hits,{d},{d}\n", .{ get_n, hits });
     }
+
+    // 并发写（**跨表并行**：架构口径是「单表串行、跨表并行」）
+    // 每个线程持有独立的 Table，互不共享，测的是引擎在多核上的扩展性。
+    {
+        const threads_list = [_]u32{ 1, 2, 4 };
+        for (threads_list) |nt| {
+            const per: u64 = 300_000;
+            var paths: [4][24]u8 = undefined;
+            var names: [4][]const u8 = undefined;
+            for (0..nt) |i| {
+                const name = try std.fmt.bufPrint(&paths[i], "bench-data-conc-{d}", .{i});
+                names[i] = name;
+                dir.deleteTree(io, name) catch {};
+            }
+            defer for (0..nt) |i| dir.deleteTree(io, names[i]) catch {};
+
+            const t0 = nowNs(io);
+            var workers: [4]std.Thread = undefined;
+            var done: [4]u64 = @splat(0);
+            var failed: [4]bool = @splat(false);
+            for (0..nt) |i| {
+                workers[i] = try std.Thread.spawn(.{}, concWriter, .{ConcArgs{
+                    .io = io,
+                    .dir = dir,
+                    .path = names[i],
+                    .n = per,
+                    .done = &done[i],
+                    .failed = &failed[i],
+                }});
+            }
+            for (0..nt) |i| workers[i].join();
+            const ns = nowNs(io) - t0;
+            var total: u64 = 0;
+            var any_fail = false;
+            for (0..nt) |i| {
+                total += done[i];
+                any_fail = any_fail or failed[i];
+            }
+            std.debug.print("conc_put_{d}t,{d},{d:.0}\n", .{ nt, total, opsPerSec(total, ns) });
+            if (any_fail) std.debug.print("conc_put_{d}t_failed,1,1\n", .{nt});
+        }
+    }
+
+    // 超内存数据集：小 memtable → 大量段，考察多段 k 路归并的点查/扫描
+    {
+        const path6 = "bench-data-big";
+        dir.deleteTree(io, path6) catch {};
+        defer dir.deleteTree(io, path6) catch {};
+
+        const big_n: u64 = 2_000_000;
+        var t6 = try tablemod.Table.open(io, dir, path6, alloc, .{
+            .wal_sync_every = 10_000,
+            .flush_bytes = 8 << 20, // 8MB → 约 28 个段
+        });
+        defer t6.deinit();
+
+        const t_big_put = nowNs(io);
+        var i: u64 = 0;
+        while (i < big_n) : (i += 1) {
+            const kb = keyOf(@intCast(i));
+            try t6.put(&kb, &value);
+        }
+        try t6.flush();
+        const ns_big_put = nowNs(io) - t_big_put;
+        std.debug.print("big_put,{d},{d:.0}\n", .{ big_n, opsPerSec(big_n, ns_big_put) });
+        std.debug.print("big_segs,{d},0\n", .{t6.segs.items.len});
+
+        // 点查（随机）
+        {
+            const t0 = nowNs(io);
+            var x: u64 = 88172645463325252;
+            var hits: u64 = 0;
+            i = 0;
+            while (i < get_n) : (i += 1) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                const kb = keyOf(@intCast(x % big_n));
+                if (try t6.get(&kb, &out) != null) hits += 1;
+            }
+            const ns = nowNs(io) - t0;
+            std.debug.print("big_get,{d},{d:.0}\n", .{ get_n, opsPerSec(get_n, ns) });
+            std.debug.print("big_get_hits,{d},{d}\n", .{ get_n, hits });
+        }
+
+        // 多段范围扫描
+        {
+            var refs6: std.ArrayList(spike.segment.Segment.RefRecord) = .empty;
+            defer refs6.deinit(alloc);
+            const lo6 = keyOf(scan_lo);
+            const hi6 = keyOf(scan_hi);
+            const t0 = nowNs(io);
+            try t6.scanRefs(&lo6, &hi6, &refs6);
+            const ns = nowNs(io) - t0;
+            std.debug.print("big_scan_refs,{d},{d:.0}\n", .{ refs6.items.len, opsPerSec(@intCast(refs6.items.len), ns) });
+        }
+
+        // 冷重开
+        {
+            t6.deinit();
+            const t0 = nowNs(io);
+            var t7 = try tablemod.Table.open(io, dir, path6, alloc, .{
+                .wal_sync_every = 10_000,
+                .flush_bytes = 8 << 20,
+            });
+            const ns = nowNs(io) - t0;
+            defer t7.deinit();
+            std.debug.print("big_recover,{d},{d:.0}\n", .{ big_n, @as(f64, @floatFromInt(ns)) / 1e6 });
+        }
+    }
 }
+
+const ConcArgs = struct {
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    n: u64,
+    done: *u64,
+    failed: *bool,
+};
+
+fn concWriter(a: ConcArgs) void {
+    const alloc = std.heap.smp_allocator;
+    var t = tablemod.Table.open(a.io, a.dir, a.path, alloc, .{ .wal_sync_every = 10_000 }) catch {
+        a.failed.* = true;
+        return;
+    };
+    defer t.deinit();
+
+    const value: [32]u8 = @splat('x');
+    var i: u64 = 0;
+    while (i < a.n) : (i += 1) {
+        const kb = keyOf(@intCast(i));
+        t.put(&kb, &value) catch {
+            a.failed.* = true;
+            break;
+        };
+        a.done.* = i + 1;
+    }
+    t.wal.sync() catch {
+        a.failed.* = true;
+    };
+}
+
 
