@@ -480,6 +480,21 @@ pub const Table = struct {
         while (it.next()) |rec| try out.append(self.alloc, rec);
     }
 
+    /// 只收集 **value 切片**（不收集 key / seq / flags）。
+    ///
+    /// `RefRecord` 是 48 字节（key 16 + seq 8 + flags 1 + padding + value 16），
+    /// 而「全表解码」这类消费方只用得到 `value`（16 字节）。100 万行时输出量
+    /// 从 48MB 降到 16MB —— 实测 `scanRefs` 占了物化总耗时的 66%，写少 2/3 就是最值钱的一刀。
+    ///
+    /// 语义与 `scanRefs` 完全一致（同一套 `MergeIter` 去重、同一可见性规则），
+    /// 只是不往外抛 key。需要 key 的调用方仍用 `scanRefs`。
+    pub fn scanValues(self: *Table, start: []const u8, end: []const u8, out: *std.ArrayList([]const u8)) !void {
+        var it = MergeIter{};
+        try it.init(self, start, end);
+        defer it.deinit();
+        while (it.next()) |rec| try out.append(self.alloc, rec.value);
+    }
+
     /// 全量合并：把全部段重写成一个新段。
     /// - 只保留每个 key 的最新可见版本，**墓碑直接丢弃**（全量合并后不再需要）
     /// - 重建 `index.bin`（用临时文件 + rename，崩溃时不会留下半个归档）

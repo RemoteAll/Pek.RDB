@@ -69,24 +69,24 @@ const Materialized = struct {
 fn decodeAll(
     alloc: std.mem.Allocator,
     s: *const schema_mod.Schema,
-    refs: []const segmod.Segment.RefRecord,
+    values: []const []const u8,
 ) !Materialized {
     const ncols = s.columns.len;
     var total: usize = 0;
-    for (refs) |r| total += r.value.len;
+    for (values) |v| total += v.len;
 
     const buf = try alloc.alloc(u8, total);
     errdefer alloc.free(buf);
-    const flat = try alloc.alloc(sql.Value, refs.len * ncols);
+    const flat = try alloc.alloc(sql.Value, values.len * ncols);
     errdefer alloc.free(flat);
-    const hdrs = try alloc.alloc([]sql.Value, refs.len);
+    const hdrs = try alloc.alloc([]sql.Value, values.len);
     errdefer alloc.free(hdrs);
 
     var off: usize = 0;
-    for (refs, 0..) |r, i| {
-        const raw = buf[off..][0..r.value.len];
-        @memcpy(raw, r.value);
-        off += r.value.len;
+    for (values, 0..) |v, i| {
+        const raw = buf[off..][0..v.len];
+        @memcpy(raw, v);
+        off += v.len;
         const vals = flat[i * ncols ..][0..ncols];
         try s.decodeRowInto(vals, raw);
         hdrs[i] = vals;
@@ -251,7 +251,7 @@ fn selectByPk(t: *tablemod.Table, s: *const schema_mod.Schema, sel: sql.Select, 
         return .{ .alloc = alloc, .columns = proj.columns, .rows = empty };
     };
 
-    const one = [_]segmod.Segment.RefRecord{.{ .key = key, .seq = 0, .flags = 0, .value = raw }};
+    const one = [_][]const u8{raw};
     var m = try decodeAll(alloc, s, &one);
     defer m.deinit();
     return buildOutput(alloc, s, &m, proj, 0, 1);
@@ -347,10 +347,16 @@ pub fn selectRows(
     }
 
     var hi: [16]u8 = @splat(0xFF);
-    var refs: std.ArrayList(segmod.Segment.RefRecord) = .empty;
-    defer refs.deinit(alloc);
-    var keep: std.ArrayList(segmod.Segment.RefRecord) = .empty;
+    // 只收集 value 切片（16B/条），不收集 key/seq/flags（`RefRecord` 是 48B/条）。
+    // 100 万行时输出量 48MB -> 16MB，而实测 `scanRefs` 占物化总耗时 66%。
+    var all_vals: std.ArrayList([]const u8) = .empty;
+    defer all_vals.deinit(alloc);
+    var keep: std.ArrayList([]const u8) = .empty;
     defer keep.deinit(alloc);
+
+    // 容量上界：各段行数 + memtable 行数（段合并过时偏大，但不会重分配）。
+    var cap: usize = t.mem.len();
+    for (t.segs.items) |sg| cap +|= sg.rows;
 
     // ------------------------------------------------------------------
     // 提前终止：没有 ORDER BY 时扫描结果天然按主键升序，而 LIMIT/OFFSET 只要前
@@ -365,8 +371,8 @@ pub fn selectRows(
     else
         null;
 
-    // `src` 指向 refs 或 keep（两者都在函数作用域内，defer 到函数末尾才释放）
-    var src: []const segmod.Segment.RefRecord = &.{};
+    // `src` 指向 all_vals 或 keep（两者都在函数作用域内，defer 到函数末尾才释放）
+    var src: []const []const u8 = &.{};
 
     if (need) |want| {
         var it = tablemod.MergeIter{};
@@ -381,33 +387,39 @@ pub fn selectRows(
             scratch = try alloc.alloc(sql.Value, s.columns.len);
         }
 
+        try keep.ensureTotalCapacity(alloc, want);
         while (keep.items.len < want) {
             const rec = it.next() orelse break;
             if (sel.where) |w| {
                 try s.decodeRowInto(scratch.?, rec.value);
                 if (!evalWhere(scratch.?[widx], w.op, w.value)) continue;
             }
-            try keep.append(alloc, rec);
+            try keep.append(alloc, rec.value);
         }
         src = keep.items;
     } else {
         // 有 ORDER BY 时必须看完全部候选才能排序；无 LIMIT 时必须返回全部。
-        try t.scanRefs(&[_]u8{}, &hi, &refs);
-
-        // 过滤：只解码到复用的 scratch，不分配行
+        //
+        // 有 WHERE 时走流式过滤：命中才 append，不先把全表 value 收进数组
+        // （那会多一份 16MB 的中间数组，而且完全没有必要 —— `MergeIter` 本来就是流式的）。
         if (sel.where) |w| {
             const widx = s.indexOf(w.column) orelse return error.ColumnNotFound;
             const scratch = try alloc.alloc(sql.Value, s.columns.len);
             defer alloc.free(scratch);
-            for (refs.items) |rec| {
+            try keep.ensureTotalCapacity(alloc, cap);
+            var it = tablemod.MergeIter{};
+            try it.init(t, &.{}, &hi);
+            defer it.deinit();
+            while (it.next()) |rec| {
                 try s.decodeRowInto(scratch, rec.value);
-                if (evalWhere(scratch[widx], w.op, w.value)) try keep.append(alloc, rec);
+                if (evalWhere(scratch[widx], w.op, w.value)) try keep.append(alloc, rec.value);
             }
             src = keep.items;
         } else {
-            // 无 WHERE：**直接引用 refs，不再复制一份**。
-            // 100 万行时那是 48MB 的纯拷贝（ref 数组），属于白做的工作。
-            src = refs.items;
+            // 无 WHERE：只收 value，不收 key。
+            try all_vals.ensureTotalCapacity(alloc, cap);
+            try t.scanValues(&[_]u8{}, &hi, &all_vals);
+            src = all_vals.items;
         }
     }
 

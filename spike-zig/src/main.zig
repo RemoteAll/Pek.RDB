@@ -336,6 +336,53 @@ fn benchMain() !void {
             std.debug.print("sql_each,{d},{d:.0}\n", .{ cnt, opsPerSec(@intCast(cnt), ns) });
             std.debug.print("sql_each_readrows,{d},0\n", .{t4.scan_rows_read});
         }
+        // 物化成本拆解：把 selectRows 的四个阶段分别计时，**不猜**。
+        // 只有知道 61ms 花在哪一段，才知道该优化什么（§16.1.11 的起点）。
+        // 本段会重新分配约 136MB，放在 t4 生命周期最后。
+        {
+            var hi: [16]u8 = @splat(0xFF);
+            var vals: std.ArrayList([]const u8) = .empty;
+            defer vals.deinit(alloc);
+
+            const ta = nowNs(io);
+            try t4.scanValues(&.{}, &hi, &vals);
+            const tb = nowNs(io);
+
+            var total_len: usize = 0;
+            for (vals.items) |v| total_len += v.len;
+            const buf = try alloc.alloc(u8, total_len);
+            defer alloc.free(buf);
+            var off: usize = 0;
+            for (vals.items) |v| {
+                @memcpy(buf[off..][0..v.len], v);
+                off += v.len;
+            }
+            const tc = nowNs(io);
+
+            const ncols = s.columns.len;
+            const flat = try alloc.alloc(spike.sql.Value, vals.items.len * ncols);
+            defer alloc.free(flat);
+            var k: usize = 0;
+            var o2: usize = 0;
+            while (k < vals.items.len) : (k += 1) {
+                const raw = buf[o2..][0..vals.items[k].len];
+                o2 += vals.items[k].len;
+                try s.decodeRowInto(flat[k * ncols ..][0..ncols], raw);
+            }
+            const td = nowNs(io);
+
+            const hdrs = try alloc.alloc([]spike.sql.Value, vals.items.len);
+            defer alloc.free(hdrs);
+            for (0..vals.items.len) |j| hdrs[j] = flat[j * ncols ..][0..ncols];
+            const te = nowNs(io);
+
+            const rows_n: u64 = @intCast(vals.items.len);
+            std.debug.print("mat_scanrefs,{d},{d:.0}\n", .{ rows_n, opsPerSec(rows_n, tb - ta) });
+            std.debug.print("mat_buf_copy,{d},{d:.0}\n", .{ @as(u64, @intCast(total_len)), opsPerSec(@intCast(total_len), tc - tb) });
+            std.debug.print("mat_decode,{d},{d:.0}\n", .{ rows_n, opsPerSec(rows_n, td - tc) });
+            std.debug.print("mat_hdrs,{d},{d:.0}\n", .{ rows_n, opsPerSec(rows_n, te - td) });
+            std.debug.print("mat_ms,{d},{d},{d},{d},{d}\n", .{ (tb - ta) / 1_000_000, (tc - tb) / 1_000_000, (td - tc) / 1_000_000, (te - td) / 1_000_000, (te - ta) / 1_000_000 });
+        }
     }
 
     // 并发写（**跨表并行**：架构口径是「单表串行、跨表并行」）
