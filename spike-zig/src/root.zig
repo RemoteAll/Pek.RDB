@@ -10,6 +10,7 @@ pub const schema = @import("schema.zig");
 pub const exec = @import("exec.zig");
 pub const catalog = @import("catalog.zig");
 pub const engine = @import("engine.zig");
+pub const m0 = @import("m0.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

@@ -58,4 +58,22 @@ pub fn build(b: *std.Build) void {
     });
     const check_step = b.step("check", "Cross-compile the core module for an arbitrary target");
     check_step.dependOn(&check_obj.step);
+
+    // MCU 探针（M0 档裸机链接 + flash/RAM 实测）：
+    //   zig build mcu -Dtarget=riscv32-freestanding -Doptimize=ReleaseSmall
+    const mcu = b.addExecutable(.{
+        .name = "mcu-probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mcu_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "pek_rdb_spike", .module = mod },
+            },
+        }),
+    });
+    mcu.root_module.strip = true;
+    b.installArtifact(mcu);
+    const mcu_step = b.step("mcu", "Build the bare-metal M0 probe (cross-compile)");
+    mcu_step.dependOn(&b.addInstallArtifact(mcu, .{}).step);
 }
