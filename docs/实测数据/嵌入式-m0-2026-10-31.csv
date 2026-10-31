@@ -1,26 +1,26 @@
-# 命令：zig build mcu -Dtarget=<t> -Doptimize=ReleaseSmall；工具：tools/elf-size.py
+# 命令：zig build mcu -Dtarget=<t> -Doptimize=ReleaseSmall；工具：tools/elf-size.py；含 M0 压缩/环形日志
 # target=riscv32-freestanding
 section,.rodata,24
-section,.eh_frame_hdr,76
-section,.eh_frame,228
-section,.text,1282
+section,.eh_frame_hdr,84
+section,.eh_frame,248
+section,.text,1620
 section,.bss,544
-total,text,1282
+total,text,1620
 total,rodata,24
 total,data,0
 total,bss,544
-total,other_alloc,304
-total,flash,1610
-total,ram_static,848
+total,other_alloc,332
+total,flash,1976
+total,ram_static,876
 # target=thumb-freestanding
-section,.ARM.exidx,112
+section,.ARM.exidx,120
 section,.rodata,52
-section,.text,1206
+section,.text,1638
 section,.bss,552
-total,text,1206
+total,text,1638
 total,rodata,52
 total,data,0
 total,bss,552
-total,other_alloc,112
-total,flash,1370
-total,ram_static,664
+total,other_alloc,120
+total,flash,1810
+total,ram_static,672

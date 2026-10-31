@@ -88,6 +88,8 @@ pub fn StoreType(comptime max_parts: usize, comptime crc_kind: CrcKind) type {
         part_size: u32,
         /// 每个分区的下一个追加位置（绝对偏移）
         append_at: [max_parts]u32,
+        /// 每个分区最低的「仍可能有存活记录」扇区起点；压缩后才能向后推进（回卷靠它）
+        tail_at: [max_parts]u32,
 
     /// 打开：扫描各分区定位追加点。`scratch` 至少一个扇区，打开后可复用。
     pub fn open(dev: BlockDevice, cfg: Config, scratch: []u8) Error!Self {
@@ -101,6 +103,7 @@ pub fn StoreType(comptime max_parts: usize, comptime crc_kind: CrcKind) type {
             .cfg = cfg,
             .part_size = (dev.capacity / cfg.partitions) & ~(dev.sector_size - 1),
             .append_at = @splat(0),
+            .tail_at = @splat(0),
         };
         if (self.part_size < dev.sector_size) return error.BadPartitions;
 
@@ -138,10 +141,13 @@ pub fn StoreType(comptime max_parts: usize, comptime crc_kind: CrcKind) type {
         const ssize = self.dev.sector_size;
 
         var last_end: u32 = start;
+        var tail: u32 = end; // 全空时 tail = 末尾（表示没有存活数据）
         var pos = start;
         while (pos < end) : (pos += ssize) {
             try self.dev.read(pos, scratch[0..ssize]);
-            if (scratch[0] == BLANK) break;
+            // 空白扇区可能出现在中间（压缩后会这样），不能当作「数据结束」直接 break
+            if (scratch[0] == BLANK) continue;
+            if (tail == end) tail = pos;
 
             var off: usize = 0;
             var clean = true;
@@ -166,12 +172,16 @@ pub fn StoreType(comptime max_parts: usize, comptime crc_kind: CrcKind) type {
                 off += total;
             }
             if (!clean) {
-                // 撕裂或填充：本扇区剩余不可再写，跳到下一扇区
-                last_end = pos + ssize;
-                break;
+                // 撕裂或填充：本扇区剩余不可再写，跳到下一扇区（回卷后后面可能还有数据）
+                if (pos + ssize > last_end) last_end = pos + ssize;
+                continue;
             }
-            last_end = pos + @as(u32, @intCast(off));
+            if (off > 0 and pos + @as(u32, @intCast(off)) > last_end) {
+                last_end = pos + @as(u32, @intCast(off));
+            }
         }
+        if (tail == end and last_end != start) tail = start;
+        self.tail_at[p] = tail;
         return last_end;
     }
 
@@ -187,6 +197,10 @@ pub fn StoreType(comptime max_parts: usize, comptime crc_kind: CrcKind) type {
         const ssize = self.dev.sector_size;
 
         var found: ?usize = null;
+        var best_dist: u32 = 0;
+        var have_best = false;
+        const part = self.part_size;
+        const tail = self.tail_at[p];
         var pos = start;
         while (pos < end) : (pos += ssize) {
             try self.dev.read(pos, scratch[0..ssize]);
@@ -203,12 +217,19 @@ pub fn StoreType(comptime max_parts: usize, comptime crc_kind: CrcKind) type {
 
                 const k = scratch[off + header_len ..][0..klen];
                 if (std.mem.eql(u8, k, key)) {
-                    if (b == OP_DEL) {
-                        found = null;
-                    } else {
-                        if (vlen > out.len) return error.BufferTooSmall;
-                        @memcpy(out[0..vlen], scratch[off + header_len + klen ..][0..vlen]);
-                        found = vlen;
+                    // 环形日志：离 tail 越远越新
+                    const abs = pos + @as(u32, @intCast(off));
+                    const dist = if (tail == end) abs - start else (abs + part - tail) % part;
+                    if (!have_best or dist >= best_dist) {
+                        have_best = true;
+                        best_dist = dist;
+                        if (b == OP_DEL) {
+                            found = null;
+                        } else {
+                            if (vlen > out.len) return error.BufferTooSmall;
+                            @memcpy(out[0..vlen], scratch[off + header_len + klen ..][0..vlen]);
+                            found = vlen;
+                        }
                     }
                 }
                 off += total;
@@ -234,19 +255,6 @@ pub fn StoreType(comptime max_parts: usize, comptime crc_kind: CrcKind) type {
         const total = header_len + key.len + value.len + trailer_len;
         if (scratch.len < self.dev.sector_size or scratch.len < total) return error.BufferTooSmall;
 
-        const p = self.partitionOf(key);
-        const end = self.partitionEnd(p);
-        const ssize = self.dev.sector_size;
-        var pos = self.append_at[p];
-
-        // 记录不跨扇区：剩余空间不够就把该扇区剩余部分写成 0x00（扫描视为填充）
-        const in_sector = pos % ssize;
-        if (in_sector + total > ssize) {
-            pos += ssize - in_sector;
-        }
-        if (pos + total > end) return error.NoSpace;
-
-        // 组记录
         scratch[0] = op;
         scratch[1] = @intCast(key.len);
         std.mem.writeInt(u16, scratch[2..4], @intCast(value.len), .little);
@@ -255,15 +263,166 @@ pub fn StoreType(comptime max_parts: usize, comptime crc_kind: CrcKind) type {
         const body = total - trailer_len;
         std.mem.writeInt(u32, scratch[body..][0..4], crcOf(crc_kind, scratch[0..body]), .little);
 
-        // 扇区填充标记：把新扇区的第一个字节之外的内容保持 0xFF，扫描遇到非记录字节就跳下一扇区。
-        // 跨扇区时，先把旧扇区剩余的首字节写 0x00，避免扫描把它当成「全空白」。
-        if (in_sector + total > ssize) {
+        try self.rawAppend(self.partitionOf(key), scratch[0..total]);
+    }
+
+    /// 追加一段已组好的记录（供 put 与压缩复用）。尾部放不下则回卷到分区头（环形日志）。
+    fn rawAppend(self: *Self, p: u8, rec: []const u8) Error!void {
+        const ssize = self.dev.sector_size;
+        const start = self.partitionStart(p);
+        const end = self.partitionEnd(p);
+        const tail = self.tail_at[p];
+
+        var at: ?u32 = null;
+        if (self.findSlot(p, self.append_at[p], rec.len)) |slot| {
+            if (tail == end or slot >= tail or slot + rec.len <= tail) at = slot;
+        }
+        if (at == null) {
+            // 尾部放不下（或会压到存活区）→ 回卷到分区头，且不得越过 tail
+            if (tail == end) {
+                at = self.findSlot(p, start, rec.len);
+            } else if (self.findSlot(p, start, rec.len)) |slot| {
+                if (slot + rec.len <= tail) at = slot;
+            }
+        }
+        const at_pos = at orelse return error.NoSpace;
+        if (tail != end and at_pos < tail and at_pos + rec.len > tail) return error.NoSpace;
+
+        // 真跳过了扇区剩余（而不是正好对齐）才写 0x00 标记：否则会踩到上一条记录已编程的字节
+        if (at_pos != self.append_at[p] and at_pos % ssize == 0 and at_pos > start and self.append_at[p] % ssize != 0) {
             const pad = [1]u8{0};
-            try self.dev.write(pos - 1, &pad); // 只写 1 字节（设备允许字节内写入）
+            try self.dev.write(at_pos - 1, &pad);
         }
 
-        try self.dev.write(pos, scratch[0..total]);
-        self.append_at[p] = pos + @as(u32, @intCast(total));
+        try self.dev.write(at_pos, rec);
+        // 原本空分区：第一条记录所在扇区成为 tail（存活区起点）
+        if (self.tail_at[p] == end) self.tail_at[p] = at_pos - (at_pos % ssize);
+        self.append_at[p] = at_pos + @as(u32, @intCast(rec.len));
+    }
+
+    /// 从 origin 找一段 rec_len 字节、不跨扇区、不超分区尾的位置（不检查 tail）。
+    fn findSlot(self: *const Self, p: u8, origin: u32, rec_len: usize) ?u32 {
+        const ssize = self.dev.sector_size;
+        const end = self.partitionEnd(p);
+        var pos = origin;
+        const in_sector = pos % ssize;
+        if (in_sector + rec_len > ssize) pos += ssize - in_sector;
+        if (pos + rec_len > end) return null;
+        return pos;
+    }
+
+    /// 环序上 `from` 之后（到追加点为止）是否还有同 key 记录。
+    fn hasNewer(self: *Self, p: u8, from: u32, key: []const u8, buf: []u8) Error!bool {
+        const ssize = self.dev.sector_size;
+        const start = self.partitionStart(p);
+        const end = self.partitionEnd(p);
+        const part = self.part_size;
+        const append_pos = self.append_at[p];
+        const append_dist = (append_pos + part - from) % part;
+        if (append_dist == 0) return false;
+
+        var pos = start;
+        while (pos < end) : (pos += ssize) {
+            try self.dev.read(pos, buf[0..ssize]);
+            var off: usize = 0;
+            while (off + header_len + trailer_len <= ssize) {
+                const b = buf[off];
+                if (b != OP_PUT and b != OP_DEL) break;
+                const klen: usize = buf[off + 1];
+                const vlen: usize = std.mem.readInt(u16, buf[off + 2 ..][0..2], .little);
+                const total = header_len + klen + vlen + trailer_len;
+                if (off + total > ssize) break;
+                const want = std.mem.readInt(u32, buf[off + total - trailer_len ..][0..4], .little);
+                if (want != crcOf(crc_kind, buf[off .. off + total - trailer_len])) break;
+
+                const abs = pos + @as(u32, @intCast(off));
+                const dist = (abs + part - from) % part;
+                if (dist != 0 and dist < append_dist) {
+                    const k = buf[off + header_len ..][0..klen];
+                    if (std.mem.eql(u8, k, key)) return true;
+                }
+                off += total;
+            }
+        }
+        return false;
+    }
+
+    /// 压缩一个分区：按**环序**从最旧扇区开始，把仍有存活价值的记录搬到追加点，再擦掉旧扇区。
+    /// `scratch` 需要 **2 个扇区**（一个读旧扇区、一个做环序查重）。
+    /// 搬家途中断电安全（搬的是副本，旧扇区未擦前原数据仍在）；返回搬移条数。
+    pub fn compact(self: *Self, p: u8, scratch: []u8) Error!usize {
+        const ssize = self.dev.sector_size;
+        if (scratch.len < 2 * ssize) return error.BufferTooSmall;
+        const sector_buf = scratch[0..ssize];
+        const probe_buf = scratch[ssize..][0..ssize];
+
+        const start = self.partitionStart(p);
+        const end = self.partitionEnd(p);
+        const total_sectors = self.part_size / ssize;
+
+        var moved: usize = 0;
+        var pos = self.tail_at[p];
+        if (pos == end) return 0; // 空分区
+        var n: u32 = 0;
+        while (n < total_sectors) : (n += 1) {
+            const head_sector = self.append_at[p] - (self.append_at[p] % ssize);
+            if (pos == head_sector) break; // 不碰正在写入的扇区
+
+            try self.dev.read(pos, sector_buf);
+            if (sector_buf[0] == BLANK) {
+                // 已空白：只推进 tail
+            } else {
+                var off: usize = 0;
+                while (off + header_len + trailer_len <= ssize) {
+                    const b = sector_buf[off];
+                    if (b != OP_PUT and b != OP_DEL) break;
+                    const klen: usize = sector_buf[off + 1];
+                    const vlen: usize = std.mem.readInt(u16, sector_buf[off + 2 ..][0..2], .little);
+                    const total = header_len + klen + vlen + trailer_len;
+                    if (off + total > ssize) break;
+                    const want = std.mem.readInt(u32, sector_buf[off + total - trailer_len ..][0..4], .little);
+                    if (want != crcOf(crc_kind, sector_buf[off .. off + total - trailer_len])) break;
+
+                    const key = sector_buf[off + header_len ..][0..klen];
+                    const next_pos = pos + @as(u32, @intCast(off + total));
+                    if (!try self.hasNewer(p, next_pos, key, probe_buf)) {
+                        try self.rawAppend(p, sector_buf[off .. off + total]);
+                        moved += 1;
+                    }
+                    off += total;
+                }
+                try self.dev.erase(pos, ssize);
+            }
+
+            pos += ssize;
+            if (pos >= end) pos = start;
+        }
+
+        // 重算 tail：第一个非空扇区起点
+        self.tail_at[p] = try self.findTail(p, scratch[0..ssize]);
+        return moved;
+    }
+
+    fn findTail(self: *Self, p: u8, buf: []u8) Error!u32 {
+        const ssize = self.dev.sector_size;
+        const start = self.partitionStart(p);
+        const end = self.partitionEnd(p);
+        var pos = start;
+        while (pos < end) : (pos += ssize) {
+            try self.dev.read(pos, buf[0..ssize]);
+            if (buf[0] != BLANK) return pos;
+        }
+        return end;
+    }
+
+    /// 压缩所有分区（数据快满时调一次）。
+    pub fn compactAll(self: *Self, scratch: []u8) Error!usize {
+        var moved: usize = 0;
+        var p: u8 = 0;
+        while (p < self.cfg.partitions) : (p += 1) {
+            moved += try self.compact(p, scratch);
+        }
+        return moved;
     }
 
     /// 全擦（出厂/清库）。之后 Store 可继续使用。
@@ -272,6 +431,7 @@ pub fn StoreType(comptime max_parts: usize, comptime crc_kind: CrcKind) type {
         var p: u8 = 0;
         while (p < self.cfg.partitions) : (p += 1) {
             self.append_at[p] = self.partitionStart(p);
+            self.tail_at[p] = self.partitionEnd(p);
         }
     }
 
@@ -349,6 +509,54 @@ pub const RamDevice = struct {
 // ------------------------------- 测试 -------------------------------
 
 const testing = std.testing;
+
+test "m0: 压缩回收空间 + 环形回卷后数据与掉电重开都正确" {
+    var storage: [1024]u8 = undefined;
+    var dev = RamDevice.init(&storage);
+    const bd = dev.device(64); // 64B 扇区；2 分区 → 每分区 512B
+    var scratch: [64]u8 = undefined;
+    const cfg = Config{ .partitions = 2, .key_max = 8, .value_max = 24 };
+    var st = try TinyStore.open(bd, cfg, &scratch);
+
+    // 反复覆盖同一批 key 制造垃圾；写满后必须明确报 NoSpace（不静默丢数据）
+    var keybuf: [8]u8 = undefined;
+    var round: usize = 0;
+    var hit_full = false;
+    while (round < 500) : (round += 1) {
+        const k = try std.fmt.bufPrint(&keybuf, "k{d}", .{round % 3});
+        st.put(k, "0123456789", &scratch) catch |e| {
+            try testing.expectEqual(Error.NoSpace, e);
+            hit_full = true;
+            break;
+        };
+    }
+    try testing.expect(hit_full);
+
+    var out: [32]u8 = undefined;
+    try testing.expectEqualStrings("0123456789", (try st.get("k0", &out, &scratch)).?);
+
+    // 压缩：把存活记录搬到追加点、擦掉旧扇区
+    var cscratch: [128]u8 = undefined; // 需要 2 个扇区
+    _ = try st.compactAll(&cscratch);
+
+    // 压缩后三个 key 都在
+    try testing.expectEqualStrings("0123456789", (try st.get("k0", &out, &scratch)).?);
+    try testing.expectEqualStrings("0123456789", (try st.get("k1", &out, &scratch)).?);
+    try testing.expectEqualStrings("0123456789", (try st.get("k2", &out, &scratch)).?);
+
+    // 腾出的空间可以继续写（这里会走到环形回卷）
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        const k = try std.fmt.bufPrint(&keybuf, "n{d}", .{i});
+        try st.put(k, "new", &scratch);
+    }
+
+    // 掉电重开：环形日志跨扇区扫描仍能读对
+    var st2 = try TinyStore.open(bd, cfg, &scratch);
+    try testing.expectEqualStrings("0123456789", (try st2.get("k1", &out, &scratch)).?);
+    try testing.expectEqualStrings("new", (try st2.get("n3", &out, &scratch)).?);
+    try testing.expectEqualStrings("new", (try st2.get("n5", &out, &scratch)).?);
+}
 
 fn testStore(storage: []u8, cfg: Config) !struct { dev: RamDevice, store: Store, scratch: [512]u8 } {
     var dev = RamDevice.init(storage);
@@ -460,8 +668,7 @@ test "m0: 掉电撕裂尾（截断最后一条记录）后仍可读旧值并继�
     _ = used;
 }
 
-test "m0: 常驻 RAM 预算（Store + 1 扇区 + 1 记录缓冲）≤ 2KB" {
-    const cfg = Config{};
+test "m0: 常驻 RAM 预算（Store + 1 扇区 + 1 记录缓冲）≤ 2KB" {    const cfg = Config{};
     const store_bytes = @sizeOf(Store);
     const record_bytes = header_len + cfg.key_max + cfg.value_max + trailer_len;
     const zone = store_bytes + 512 + record_bytes;
