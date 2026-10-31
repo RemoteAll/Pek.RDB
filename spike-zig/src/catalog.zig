@@ -114,7 +114,10 @@ pub fn loadCatalog(io: std.Io, dir: std.Io.Dir, root: []const u8, alloc: std.mem
         while (it.next()) |raw| {
             const n = std.mem.trim(u8, raw, " \r\t");
             if (n.len == 0) continue;
-            try names.append(alloc, try alloc.dupe(u8, n));
+            // 分两步：写在内层会让 append 失败时丢掉刚 dupe 的内存
+            const owned = try alloc.dupe(u8, n);
+            errdefer alloc.free(owned);
+            try names.append(alloc, owned);
         }
     }
     return names.toOwnedSlice(alloc);

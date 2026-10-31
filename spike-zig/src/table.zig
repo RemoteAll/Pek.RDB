@@ -406,12 +406,14 @@ pub const Table = struct {
         const id = self.next_seg;
         const data_path = try self.alloc.print("{s}/seg/{d:0>6}.data", .{ self.base_path, id });
         defer self.alloc.free(data_path);
-        // 只在**归档尚未引用**它时清理半成品。
-        // archiveAppend 之后归档就有这条 record 了，再删文件会让下次 open 报 FileNotFound。
-        var orphan_maybe = true;
-        errdefer if (orphan_maybe) self.dir.deleteFile(self.io, data_path) catch {};
+        // **不要**在这条路上 errdefer 删 .data：`archiveAppend` 是「写 record → setLength → sync」，
+        // sync 失败时磁盘上已经有完整 record，只是 `index_valid_len` 没更新；
+        // 此时删掉文件就成了「归档 record 指向不存在的 .data」→ 下次 open 报 FileNotFound。
+        // 不删代价只是多一个文件，而且 `next_seg` 没递增、下次 flush 会用同一路径覆盖，天然自愈；
+        // 万一是「写成功但没回传」的情况，保留它反而能恢复到一致状态。
 
         var w = try segmod.Writer.create(self.io, self.dir, data_path, self.alloc, self.opts.bloom_bits);
+        defer w.deinit();
         var it = self.mem.iterator();
         while (it.next()) |e| {
             try w.push(e.key, e.seq, e.flags, e.value);
@@ -423,7 +425,6 @@ pub const Table = struct {
         errdefer self.alloc.free(fin.bytes);
         // 从「有效末尾」写：若上次追加留下崩溃残片，这里会把它覆盖掉
         self.index_valid_len = try segmod.archiveAppend(self.io, self.dir, self.index_path, @intCast(id), fin.bytes, self.index_valid_len);
-        orphan_maybe = false; // 归档已引用该段，不能再当孤儿删
 
         const seg = try segmod.Segment.fromBytes(self.io, self.dir, self.base_path, id, fin.bytes, self.alloc, true, self.opts.mmap_preheat);
         self.segs.append(self.alloc, seg) catch |e| {
@@ -509,12 +510,15 @@ pub const Table = struct {
         const id = self.next_seg;
         const data_path = try self.alloc.print("{s}/seg/{d:0>6}.data", .{ self.base_path, id });
         defer self.alloc.free(data_path);
-        // 合并中途失败时新段是半成品（旧段与归档未动，Table 仍可用）：删掉它。
-        // 但 archiveRewrite 之后归档就指向它了，**再删就是制造 FileNotFound**。
+        // 合并中途失败时新段是半成品：删掉它。
+        // 这里能删、`flushImpl` 里不能删，差别在**失败时权威记录有没有变**：
+        // `archiveRewrite` 是「写 tmp → sync → rename」，任何一步失败都意味着归档原封未动；
+        // 而 `archiveAppend` 在 sync 之前就已把 record 写进文件了。
         var orphan_maybe = true;
         errdefer if (orphan_maybe) self.dir.deleteFile(self.io, data_path) catch {};
 
         var w = try segmod.Writer.create(self.io, self.dir, data_path, self.alloc, self.opts.bloom_bits);
+        defer w.deinit();
         var rows: usize = 0;
         {
             var it = MergeIter{};
@@ -548,7 +552,7 @@ pub const Table = struct {
         // 磁盘已一致，现在才清理旧段与旧归档缓冲。
         // 这里**不允许再有可能失败的分配**：一旦在这之后返回错误，归档指向新段
         // 而内存 segs 已清空 → Table 变空表（上轮审计 P0-2 的那类状态）。
-        var del_buf: [512]u8 = undefined;
+        var del_buf: [std.fs.max_path_bytes]u8 = undefined;
         for (self.segs.items) |*s| {
             const old_id = s.id;
             s.close();

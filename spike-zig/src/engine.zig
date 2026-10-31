@@ -60,7 +60,10 @@ pub const Engine = struct {
             var sch = try catalog.loadSchema(io, dir, path, alloc);
             errdefer sch.deinit(alloc);
             const tbl = try tablemod.Table.open(io, dir, path, alloc, opts.table);
-            try tables.put(try alloc.dupe(u8, name), .{ .schema = sch, .table = tbl });
+            // 分两步：写在内层会让 put 失败时丢掉刚 dupe 的 name
+            const key = try alloc.dupe(u8, name);
+            errdefer alloc.free(key);
+            try tables.put(key, .{ .schema = sch, .table = tbl });
         }
 
         return .{
@@ -125,7 +128,10 @@ pub const Engine = struct {
         try catalog.saveSchema(self.io, self.dir, path, &sch, self.alloc);
 
         const tbl = try tablemod.Table.open(self.io, self.dir, path, self.alloc, self.opts.table);
-        try self.tables.put(try self.alloc.dupe(u8, def.name), .{ .schema = sch, .table = tbl });
+        // 分两步：写在内层会让 put 失败时丢掉刚 dupe 的 name
+        const key = try self.alloc.dupe(u8, def.name);
+        errdefer self.alloc.free(key);
+        try self.tables.put(key, .{ .schema = sch, .table = tbl });
         try self.saveCatalog();
         return true;
     }

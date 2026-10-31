@@ -73,17 +73,50 @@ pub const Writer = struct {
     min_seq: u64 = std.math.maxInt(u64),
     max_seq: u64 = 0,
     scratch: std.ArrayList(u8) = .empty,
+    /// 文件句柄是否还开着（`finishBytes` 关掉后置 false）
+    file_open: bool = true,
+    /// 四个缓冲是否还没释放（`finishBytes` 成功后置 false）
+    buffers_live: bool = true,
 
     pub fn create(io: std.Io, dir: std.Io.Dir, path: []const u8, alloc: std.mem.Allocator, bloom_bits: u8) !Writer {
         const f = try dir.createFile(io, path, .{ .read = true, .truncate = true });
         return .{ .io = io, .file = f, .alloc = alloc, .bloom_bits = bloom_bits };
     }
 
+    /// 释放缓冲并关闭文件，**幂等**。
+    ///
+    /// 调用方应该无条件写上 `defer w.deinit()`：`finishBytes` 只在**成功路径**
+    /// 自己释放；一旦 `push` / `flushBuf` / `sync` 失败，这 4 个缓冲与文件句柄就全漏了
+    /// （M1 起就存在，第四轮审计才发现）。成功路径下本函数是 no-op。
+    ///
+    /// 幂等靠两个标志位：`std.ArrayList.deinit` 会把自身置 `undefined`，
+    /// 不能靠「再 deinit 一次空表」来幂等 —— 那是在读 undefined。
+    pub fn deinit(self: *Writer) void {
+        if (self.file_open) {
+            self.file.close(self.io);
+            self.file_open = false;
+        }
+        if (self.buffers_live) self.releaseBuffers();
+    }
+
+    fn releaseBuffers(self: *Writer) void {
+        for (self.entries.items) |e| self.alloc.free(e.key);
+        self.entries.deinit(self.alloc);
+        self.hashes.deinit(self.alloc);
+        self.buf.deinit(self.alloc);
+        self.scratch.deinit(self.alloc);
+        self.buffers_live = false;
+    }
+
     pub fn push(self: *Writer, key: []const u8, seq: u64, flags: u8, value: []const u8) !void {
         if (self.rows % INDEX_STRIDE == 0) {
+            // 必须分两步：写成 `try append(.{ .key = try dupe(...) })` 时，
+            // append 一失败，刚 dupe 出来的 key 就丢了（`checkAllAllocationFailures` 抓到的真实泄漏）。
+            const k = try self.alloc.dupe(u8, key);
+            errdefer self.alloc.free(k);
             try self.entries.append(self.alloc, .{
                 .offset = self.buf_base + self.buf.items.len,
-                .key = try self.alloc.dupe(u8, key),
+                .key = k,
             });
         }
 
@@ -121,6 +154,7 @@ pub const Writer = struct {
         try self.flushBuf();
         try self.file.sync(self.io);
         self.file.close(self.io);
+        self.file_open = false;
 
         var idx: std.ArrayList(u8) = .empty;
         errdefer idx.deinit(self.alloc);
@@ -163,11 +197,7 @@ pub const Writer = struct {
             .max_seq = self.max_seq,
         };
 
-        for (self.entries.items) |e| self.alloc.free(e.key);
-        self.entries.deinit(self.alloc);
-        self.hashes.deinit(self.alloc);
-        self.buf.deinit(self.alloc);
-        self.scratch.deinit(self.alloc);
+        self.releaseBuffers();
 
         return .{ .bytes = try idx.toOwnedSlice(self.alloc), .meta = meta };
     }
@@ -734,6 +764,7 @@ test "segment idx 被翻位后必须报错（不静默返回错误结果）" {
 
     {
         var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc, 10);
+        defer w.deinit();
         try w.push("a", 1, 0, "va");
         try w.push("b", 2, 0, "vb");
         _ = try w.finish(dir, tmp ++ "/000001.idx");
@@ -766,6 +797,7 @@ test "segment write + point get + scan" {
 
     {
         var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc, 10);
+        defer w.deinit();
         try w.push("a", 1, 0, "va");
         try w.push("b", 2, 0, "vb2");
         try w.push("b", 1, 0, "vb1");
@@ -809,4 +841,54 @@ test "segment write + point get + scan" {
     try seg.scanRefs("a", "z", 2, &refs);
     try std.testing.expectEqual(@as(usize, 3), refs.items.len);
     try std.testing.expectEqualStrings("b", refs.items[1].key);
+}
+
+test "Writer.deinit 幂等：finishBytes 成功后再调不得二次释放" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-writer-deinit-idem";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+    try dir.createDirPath(io, tmp);
+
+    var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc, 10);
+    defer w.deinit();
+    try w.push("a", 1, 0, "va");
+    const f = try w.finishBytes();
+    defer alloc.free(f.bytes);
+
+    // `std.ArrayList.deinit` 会把字段置 undefined，所以「幂等」只能靠标志位。
+    // 没有标志位时这三行会是 double free / 读 undefined。
+    w.deinit();
+    w.deinit();
+    w.deinit();
+}
+
+fn writerAttempt(alloc: std.mem.Allocator) !void {
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-writer-allocfail";
+    try dir.createDirPath(io, tmp);
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc, 10);
+    defer w.deinit();
+    try w.push("aaaa", 1, 0, "va");
+    try w.push("bbbb", 2, 0, "vb");
+    try w.push("cccc", 3, 1, "");
+    const f = try w.finishBytes();
+    defer alloc.free(f.bytes);
+}
+
+test "Writer 在任意分配失败点都必须释放缓冲与句柄（不泄漏）" {
+    // checkAllAllocationFailures 会逐个分配点注入 OOM：每个失败点都要求
+    // ① 返回 error（不 abort/panic）② 无泄漏。没有 `defer w.deinit()` 时这条会挂。
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, writerAttempt, .{});
 }

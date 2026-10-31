@@ -192,13 +192,17 @@ fn buildProjection(alloc: std.mem.Allocator, s: *const schema_mod.Schema, items:
             .star => {
                 for (0..s.columns.len) |i| {
                     try indices.append(alloc, i);
-                    try columns.append(alloc, try alloc.dupe(u8, s.columns[i].name));
+                    const cn = try alloc.dupe(u8, s.columns[i].name);
+                    errdefer alloc.free(cn);
+                    try columns.append(alloc, cn);
                 }
             },
             .column => |name| {
                 const idx = s.indexOf(name) orelse return error.ColumnNotFound;
                 try indices.append(alloc, idx);
-                try columns.append(alloc, try alloc.dupe(u8, s.columns[idx].name));
+                const cn = try alloc.dupe(u8, s.columns[idx].name);
+                errdefer alloc.free(cn);
+                try columns.append(alloc, cn);
             },
         }
     }
