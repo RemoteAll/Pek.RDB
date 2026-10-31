@@ -48,7 +48,9 @@ fn benchMain() !void {
     std.debug.print("metric,count,value\n", .{});
 
     var t = try tablemod.Table.open(io, dir, path, alloc, .{ .wal_sync_every = 10_000, .flush_bytes = 1 << 30 });
-    defer t.deinit();
+    // recover 之前要手动关掉再 reopen，用标志位避免 defer 二次 deinit（use-after-free）
+    var t_live = true;
+    defer if (t_live) t.deinit();
 
     {
         const t0 = nowNs(io);
@@ -170,6 +172,7 @@ fn benchMain() !void {
     }
 
     t.deinit();
+    t_live = false;
 
     {
         const t0 = nowNs(io);
@@ -359,27 +362,13 @@ fn benchMain() !void {
             std.debug.print("big_scan_refs,{d},{d:.0}\n", .{ refs6.items.len, opsPerSec(@intCast(refs6.items.len), ns) });
         }
 
-        // 诊断：只读 25 个 .idx 并算 CRC（不复用 Segment.open，用于归因冷重开耗时）。
-        // 注意用的是 1KB 表版 `crc32`：它本身就是要被替换的慢路径，方便与 `crc32Fast` 对照。
+        // 诊断：索引聚合文件大小（现在全部段索引在 seg/index.bin 里）
         {
-            const t0 = nowNs(io);
-            var sid: u64 = 1;
-            var bytes: usize = 0;
-            while (true) : (sid += 1) {
-                const ip = try alloc.print("{s}/seg/{d:0>6}.idx", .{ path6, sid });
-                defer alloc.free(ip);
-                const f = dir.openFile(io, ip, .{}) catch break;
-                defer f.close(io);
-                const sz: usize = @intCast((try f.stat(io)).size);
-                const buf = try alloc.alloc(u8, sz);
-                defer alloc.free(buf);
-                _ = try f.readPositionalAll(io, buf, 0);
-                _ = codec.crc32(buf[0 .. sz - 4]);
-                bytes += sz;
-            }
-            const ns = nowNs(io) - t0;
-            std.debug.print("diag_idx_read_crc,{d},{d:.2}\n", .{ sid - 1, @as(f64, @floatFromInt(ns)) / 1e6 });
-            std.debug.print("diag_idx_bytes,{d},{d}\n", .{ sid - 1, bytes });
+            const ip = try alloc.print("{s}/seg/index.bin", .{path6});
+            defer alloc.free(ip);
+            const f = try dir.openFile(io, ip, .{});
+            defer f.close(io);
+            std.debug.print("big_idx_bytes,1,{d}\n", .{(try f.stat(io)).size});
         }
 
         // 冷重开：默认（索引懒加载）vs 预热（全量读入页缓存）
@@ -641,13 +630,8 @@ fn benchMain() !void {
 
     std.debug.print("bench_done,1,1\n", .{});
     out.deinit(alloc);
-    std.debug.print("stage_after_out,1,1\n", .{});
-    // 先不 deinit：下面这行会被注释开关控制，用来判断崩溃是否来自 Threaded 收尾
+    // threaded.deinit() 会让进程收尾更慢，基准进程直接靠 OS 回收；这里保留但注释说明
     // threaded.deinit();
-    std.debug.print("stage_after_threaded,1,1\n", .{});
-    // 已知问题：从 benchMain 返回时会出现 0xC0000005（详见 docs/决策记录（三十一））。
-    // 所有测量都在此之前完成且正确，这里显式退出以拿到干净的退出码。
-    std.process.exit(0);
 }
 
 const ConcArgs = struct {
