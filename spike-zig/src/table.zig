@@ -15,7 +15,16 @@ pub const Options = struct {
     /// 新段索引的 Bloom 位数/key（0 = 不生成）。
     /// Bloom 占索引体积 ~80%，只对「不存在的 key」有用；关闭后冷重开与索引 IO 同步变小。
     bloom_bits: u8 = 10,
+    /// 段数达到该值后，`flush` 结束时自动全量合并（**0 = 关闭，默认关闭**）。
+    ///
+    /// 只在 flush 之后检查，不起后台线程：写入抖动可预测（合并期间该次写变慢，
+    /// 不会让别的线程随时被卡），也不需要双写 + 引用计数。
+    /// 依据实测段数曲线（§16.1.6）：段数 ≤8 时点查衰减可忽略，≥16 后不命中点查开始明显变慢。
+    compact_after_segs: usize = 0,
 };
+
+/// 自动 compaction 连续失败上限：到顶就停手，避免每次 flush 都白跑一遍合并。
+const AUTO_COMPACT_MAX_FAILS: u8 = 5;
 
 /// 范围扫描结果：records 的 key/value 均指向 buf（一次性大缓冲），deinit 只释放 2 块。
 pub const RecordSet = struct {
@@ -138,6 +147,21 @@ pub const Table = struct {
     next_seg: u64 = 1,
     pending: usize = 0,
     opts: Options = .{},
+    /// `compact()` 正在执行：防止 flush 末尾的自动触发递归回来。
+    going_compact: bool = false,
+    /// 自动 compaction 最近一次失败的错误（成功后清空）。
+    /// 写路径不因自动合并失败而报错（数据此时已落盘），但错误不能丢，留给上层可查。
+    auto_compact_error: ?anyerror = null,
+    /// 自动 compaction 连续失败次数（手动/自动合并成功后清零）。
+    auto_compact_fails: u8 = 0,
+    /// 自动触发并成功的合并次数（累计，供基准/运维观测）。
+    auto_compact_count: u32 = 0,
+    /// 写入（flush）产生的段字节总数：即「用户数据量」的口径。
+    flush_bytes_total: u64 = 0,
+    /// 自动合并累计重写的字节数。
+    /// 写放大 = (flush_bytes_total + auto_compact_bytes) / flush_bytes_total，
+    /// 是**确定性量**：不受磁盘/CPU 噪声影响，比计时可靠得多。
+    auto_compact_bytes: u64 = 0,
 
     pub fn open(
         io: std.Io,
@@ -323,6 +347,31 @@ pub const Table = struct {
     }
 
     pub fn flush(self: *Table) !void {
+        try self.flushImpl();
+        self.maybeAutoCompact();
+    }
+
+    /// 段数达到 `compact_after_segs` 就自动全量合并。
+    /// 合并失败**不让本次写失败**（数据已经落盘、WAL 已同步），错误记到
+    /// `auto_compact_error` 供上层查询；连续失败到上限就停手，避免每次 flush 都白跑。
+    ///
+    /// 返回 void（内部 catch）：不把 compact 的错误集传染给写路径。
+    fn maybeAutoCompact(self: *Table) void {
+        if (self.opts.compact_after_segs == 0) return;
+        if (self.going_compact) return; // compact 内部的 flush 不得递归触发
+        if (self.segs.items.len < self.opts.compact_after_segs) return;
+        if (self.auto_compact_fails >= AUTO_COMPACT_MAX_FAILS) return;
+        _ = self.compact() catch |e| {
+            self.auto_compact_error = e;
+            self.auto_compact_fails +|= 1;
+            return;
+        };
+        self.auto_compact_count +|= 1;
+    }
+
+    /// 真正落盘。返回 `anyerror` 是**有意**的：`compact()` 也要先落盘，
+    /// 若两边都用推断错误集就会形成 `flush ↔ compact` 的依赖环（`error: dependency loop`）。
+    fn flushImpl(self: *Table) anyerror!void {
         if (self.mem.len() == 0) return;
         const id = self.next_seg;
         const data_path = try self.alloc.print("{s}/seg/{d:0>6}.data", .{ self.base_path, id });
@@ -333,6 +382,8 @@ pub const Table = struct {
         while (it.next()) |e| {
             try w.push(e.key, e.seq, e.flags, e.value);
         }
+        // 数据文件字节（buf_base = 已写出的，buf.items.len = 还没写的）
+        const data_bytes = w.buf_base + w.buf.items.len;
         // 索引：追加到聚合文件（一次小写），并直接接管内存字节，不重复读盘
         const fin = try w.finishBytes();
         errdefer self.alloc.free(fin.bytes);
@@ -348,6 +399,7 @@ pub const Table = struct {
             return e;
         };
         self.next_seg = id + 1;
+        self.flush_bytes_total += data_bytes + fin.bytes.len;
 
         self.mem.reset();
 
@@ -405,8 +457,16 @@ pub const Table = struct {
             return .{ .before = self.segs.items.len, .after = self.segs.items.len, .rows = 0 };
         }
 
+        // 防重入：下面会调 flush()，而 flush() 末尾可能触发自动合并 ——
+        // 不抑制就是无限递归（手动调 compact() 也一样）。
+        // 用 `was` 保留外层状态：自动触发 → compact → 内部 flush 期间标志必须仍为 true。
+        const was_going = self.going_compact;
+        self.going_compact = true;
+        defer self.going_compact = was_going;
+
         // 先把 memtable 落盘，避免「合并结果 + memtable」重复持有同一批 key
-        if (self.mem.len() > 0) try self.flush();
+        // （调 flushImpl 而非 flush：flush 末尾的自动触发会绕回 compact）
+        if (self.mem.len() > 0) try self.flushImpl();
         const before = self.segs.items.len;
 
         const id = self.next_seg;
@@ -424,8 +484,11 @@ pub const Table = struct {
                 rows += 1;
             }
         }
+        // 必须在 finishBytes() **之前**取：它会接管/释放 Writer 的缓冲
+        const data_bytes: u64 = @intCast(w.buf_base + w.buf.items.len);
         const fin = try w.finishBytes();
         errdefer self.alloc.free(fin.bytes);
+        const out_bytes: u64 = data_bytes + fin.bytes.len;
 
         // 关键次序：**先在内存里建好新段**（验证索引可解析），再改磁盘，最后才清理旧段。
         // 若反过来（先清旧段再建新段），中途失败会让 Table 变成空表，而磁盘上归档已指向新段。
@@ -455,7 +518,12 @@ pub const Table = struct {
         try self.segs.append(self.alloc, new_seg);
         self.next_seg = id + 1;
 
-        return .{ .before = before, .after = self.segs.items.len, .rows = rows };
+        // 合并成功：清除自动触发积累的失败状态
+        self.auto_compact_error = null;
+        self.auto_compact_fails = 0;
+        self.auto_compact_bytes += out_bytes;
+
+        return .{ .before = before, .after = self.segs.items.len, .rows = rows, .bytes = out_bytes };
     }
 };
 
@@ -463,6 +531,8 @@ pub const CompactResult = struct {
     before: usize,
     after: usize,
     rows: usize,
+    /// 本次合并写出的段字节数（算写放大用，确定性量、不受磁盘噪声影响）
+    bytes: u64 = 0,
 };
 
 /// memtable + 所有段的流式 k 路归并：按 (key asc, seq desc) 产出**可见**记录，
@@ -849,6 +919,132 @@ test "归档 magic 不匹配必须报错（不能把旧格式按新布局解析�
     }
 
     try std.testing.expectError(error.BadArchiveMagic, Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 }));
+}
+
+test "自动 compaction: 段数达到阈值后自动合并，数据一致" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-autocompact";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0, .compact_after_segs = 3 });
+    var live = true;
+    defer if (live) t.deinit();
+
+    // 前两次 flush 不足阈值：段数逐个累加
+    try t.put("k1", "v1a");
+    try t.flush();
+    try std.testing.expectEqual(@as(usize, 1), t.segs.items.len);
+    try t.put("k2", "v2a");
+    try t.flush();
+    try std.testing.expectEqual(@as(usize, 2), t.segs.items.len);
+
+    // 第三次 flush 后段数到 3 → 自动合并回 1 段
+    try t.put("k1", "v1b"); // 同 key 更新，合并后必须留最新值
+    try t.flush();
+    try std.testing.expectEqual(@as(usize, 1), t.segs.items.len);
+    try std.testing.expect(t.auto_compact_error == null);
+    try std.testing.expectEqualStrings("v1b", (try t.get("k1", &out)).?);
+    try std.testing.expectEqualStrings("v2a", (try t.get("k2", &out)).?);
+    try std.testing.expect((try t.get("k9", &out)) == null);
+
+    // 自动合并可以反复发生：1 → 2 → 3(触发) → 1
+    try t.put("k3", "v3");
+    try t.flush();
+    try std.testing.expectEqual(@as(usize, 2), t.segs.items.len);
+    try t.put("k4", "v4");
+    try t.flush();
+    try std.testing.expectEqual(@as(usize, 1), t.segs.items.len);
+
+    // 墓碑：删除后合并，重开仍返回 null
+    try t.delete("k2");
+    try t.flush();
+    try std.testing.expectEqual(@as(usize, 2), t.segs.items.len);
+    try std.testing.expect((try t.get("k2", &out)) == null);
+
+    t.deinit();
+    live = false;
+    {
+        var t2 = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0, .compact_after_segs = 3 });
+        defer t2.deinit();
+        try std.testing.expectEqual(@as(usize, 2), t2.segs.items.len);
+        try std.testing.expectEqualStrings("v1b", (try t2.get("k1", &out)).?);
+        try std.testing.expectEqualStrings("v4", (try t2.get("k4", &out)).?);
+        try std.testing.expect((try t2.get("k2", &out)) == null);
+    }
+}
+
+test "自动 compaction: compact_after_segs=0（默认）不触发" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-autocompact-off";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        var kb: [8]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kb, "k{d}", .{i});
+        try t.put(k, "v");
+        try t.flush();
+    }
+    // 默认关闭：段数原样保留（回归基准依赖这个默认值）
+    try std.testing.expectEqual(@as(usize, 4), t.segs.items.len);
+    try std.testing.expect(t.auto_compact_error == null);
+}
+
+test "自动 compaction: compact 内部的 flush 不得递归触发" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-autocompact-recursion";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    // 阈值 3：手动 compact 内部先落盘会把段数推到正好 3。
+    // compact() 内部调的是 flushImpl（不经过 flush），结构上已断开递归；
+    // going_compact 是第二道保险，这里同时验证两者都不会让结果错乱。
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0, .compact_after_segs = 3 });
+    defer t.deinit();
+
+    try t.put("a", "va");
+    try t.flush(); // 1 段（不足阈值）
+    try t.put("b", "vb");
+    try t.flush(); // 2 段（不足阈值）
+    try std.testing.expectEqual(@as(usize, 2), t.segs.items.len);
+
+    try t.put("c", "vc"); // 留在 memtable
+    const cr = try t.compact();
+    try std.testing.expectEqual(@as(usize, 3), cr.before); // 含 compact 内部 flush 出来的那段
+    try std.testing.expectEqual(@as(usize, 1), cr.after);
+    t.maybeAutoCompact(); // 已 1 段，再调一次不应有任何动作
+    try std.testing.expectEqual(@as(usize, 1), t.segs.items.len);
+    try std.testing.expect(t.auto_compact_error == null);
+
+    try std.testing.expectEqualStrings("va", (try t.get("a", &out)).?);
+    try std.testing.expectEqualStrings("vb", (try t.get("b", &out)).?);
+    try std.testing.expectEqualStrings("vc", (try t.get("c", &out)).?);
 }
 
 test "table scanRefs merges multiple segments" {

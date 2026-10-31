@@ -26,6 +26,24 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run-bench", "Run the spike benchmark");
     run_step.dependOn(&run_cmd.step);
 
+    // 自动 compaction 专项基准：只跑一个场景，从干净状态起跑。
+    // 整套 bench 里 ac 段的同配置波动实测到 84%，中位数不可信，故单独入口。
+    const ac_exe = b.addExecutable(.{
+        .name = "spike-bench-ac",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_ac.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "pek_rdb_spike", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(ac_exe);
+    const run_ac = b.addRunArtifact(ac_exe);
+    const ac_step = b.step("run-bench-ac", "Run the auto-compaction benchmark only");
+    ac_step.dependOn(&run_ac.step);
+
     const tests = b.addTest(.{
         .root_module = mod,
     });

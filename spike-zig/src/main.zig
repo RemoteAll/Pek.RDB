@@ -822,6 +822,9 @@ fn benchMain() !void {
             std.debug.print("cm_recover,{d},{d:.2}\n", .{ kn, @as(f64, @floatFromInt(nowNs(io) - t0)) / 1e6 });
         }
     }
+    // 自动 compaction 的基准已移到独立入口：zig build run-bench-ac（src/bench_ac.zig）。
+    // 放在整套 bench 末尾时，前面 big_* 留下的脏页与页缓存让同配置波动达 84%~435%，
+    // 中位数不可信；独立进程从干净状态起跑才测得准。
 
     std.debug.print("bench_done,1,1\n", .{});
     out.deinit(alloc);
