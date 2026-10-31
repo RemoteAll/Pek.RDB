@@ -1,14 +1,26 @@
-# 命令：zig build mcu -Dtarget=riscv32-freestanding -Doptimize=ReleaseSmall；工具：tools/elf-size.py
-section,.rodata,1056
-section,.eh_frame_hdr,92
-section,.eh_frame,316
-section,.text,1540
-section,.bss,16896
-total,text,1540
-total,rodata,1056
+# 命令：zig build mcu -Dtarget=<t> -Doptimize=ReleaseSmall；工具：tools/elf-size.py
+# target=riscv32-freestanding
+section,.rodata,24
+section,.eh_frame_hdr,76
+section,.eh_frame,228
+section,.text,1282
+section,.bss,544
+total,text,1282
+total,rodata,24
 total,data,0
-total,bss,16896
-total,other_alloc,408
-total,flash,3004
-total,ram_static,17304
-note,bss 含 16384B 伪 NOR Flash（mcu_probe.zig 里的 flash 数组），引擎自身静态 RAM = bss-16384
+total,bss,544
+total,other_alloc,304
+total,flash,1610
+total,ram_static,848
+# target=thumb-freestanding
+section,.ARM.exidx,112
+section,.rodata,52
+section,.text,1206
+section,.bss,552
+total,text,1206
+total,rodata,52
+total,data,0
+total,bss,552
+total,other_alloc,112
+total,flash,1370
+total,ram_static,664

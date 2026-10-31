@@ -53,11 +53,22 @@ pub const BlockDevice = struct {
 };
 
 pub const Config = struct {
-    /// 分区数（必须是 2 的幂，且 ≤ max_partitions）。越多分区 → 单次 get 读得越少、可用空间越碎。
+    /// 分区数（必须是 2 的幂，且 ≤ 实例化的 max_parts）。越多分区 → 单次 get 读得越少、可用空间越碎。
     partitions: u8 = 8,
     key_max: u8 = 32,
     value_max: u16 = 64,
 };
+
+/// CRC 实现必须是**编译期**选择：否则三个实现（含 1KB 表）会被全部链进固件。
+pub const CrcKind = enum { table, nibble, bitwise };
+
+fn crcOf(comptime kind: CrcKind, bytes: []const u8) u32 {
+    return switch (kind) {
+        .table => codec.crc32(bytes),
+        .nibble => codec.crc32Nibble(bytes),
+        .bitwise => codec.crc32Bitwise(bytes),
+    };
+}
 
 /// 记录：`[op u8][klen u8][vlen u16][key][value][crc32 u32]`
 const OP_PUT: u8 = 0x01;
@@ -66,24 +77,26 @@ const BLANK: u8 = 0xFF;
 const header_len: usize = 4;
 const trailer_len: usize = 4;
 
-pub const Store = struct {
-    pub const max_partitions: usize = 16;
+/// 按「编译期最大分区数 + CRC 实现」实例化：`StoreType(2, .bitwise)` 的常量区与 RAM 都最小。
+pub fn StoreType(comptime max_parts: usize, comptime crc_kind: CrcKind) type {
+    return struct {
+        const Self = @This();
 
-    dev: BlockDevice,
-    cfg: Config,
-    /// 每个分区占用的字节数（cap / partitions，向下对齐到扇区）
-    part_size: u32,
-    /// 每个分区的下一个追加位置（绝对偏移）
-    append_at: [max_partitions]u32,
+        dev: BlockDevice,
+        cfg: Config,
+        /// 每个分区占用的字节数（cap / partitions，向下对齐到扇区）
+        part_size: u32,
+        /// 每个分区的下一个追加位置（绝对偏移）
+        append_at: [max_parts]u32,
 
     /// 打开：扫描各分区定位追加点。`scratch` 至少一个扇区，打开后可复用。
-    pub fn open(dev: BlockDevice, cfg: Config, scratch: []u8) Error!Store {
-        if (cfg.partitions == 0 or cfg.partitions > max_partitions) return error.BadPartitions;
+    pub fn open(dev: BlockDevice, cfg: Config, scratch: []u8) Error!Self {
+        if (cfg.partitions == 0 or cfg.partitions > max_parts) return error.BadPartitions;
         if (cfg.partitions & (cfg.partitions - 1) != 0) return error.BadPartitions;
         if (dev.sector_size == 0 or dev.capacity < dev.sector_size) return error.BadPartitions;
         if (scratch.len < dev.sector_size) return error.BufferTooSmall;
 
-        var self = Store{
+        var self = Self{
             .dev = dev,
             .cfg = cfg,
             .part_size = (dev.capacity / cfg.partitions) & ~(dev.sector_size - 1),
@@ -99,15 +112,15 @@ pub const Store = struct {
     }
 
     /// 分区起点
-    pub fn partitionStart(self: *const Store, p: u8) u32 {
+    pub fn partitionStart(self: *const Self, p: u8) u32 {
         return @as(u32, p) * self.part_size;
     }
 
-    pub fn partitionEnd(self: *const Store, p: u8) u32 {
+    pub fn partitionEnd(self: *const Self, p: u8) u32 {
         return @as(u32, p + 1) * self.part_size;
     }
 
-    fn partitionOf(self: *const Store, key: []const u8) u8 {
+    fn partitionOf(self: *const Self, key: []const u8) u8 {
         var h: u32 = 2166136261;
         for (key) |b| {
             h ^= b;
@@ -119,7 +132,7 @@ pub const Store = struct {
     /// 扫描整个分区，返回可安全追加的位置。
     /// 规则：扇区首字节是 0xFF → 数据到此为止；扇区内出现填充/撕裂记录 → 该扇区剩余不可用，
     /// 追加点移到下一个扇区边界（NOR Flash 只能 1→0，已被编程的字节不能再写）。
-    fn scanPartition(self: *Store, p: u8, scratch: []u8) Error!u32 {
+    fn scanPartition(self: *Self, p: u8, scratch: []u8) Error!u32 {
         const start = self.partitionStart(p);
         const end = self.partitionEnd(p);
         const ssize = self.dev.sector_size;
@@ -146,7 +159,7 @@ pub const Store = struct {
                     break;
                 }
                 const want = std.mem.readInt(u32, scratch[off + total - trailer_len ..][0..4], .little);
-                if (want != codec.crc32(scratch[off .. off + total - trailer_len])) {
+                if (want != crcOf(crc_kind, scratch[off .. off + total - trailer_len])) {
                     clean = false;
                     break;
                 }
@@ -164,7 +177,7 @@ pub const Store = struct {
 
     /// 取 key：只读它所属的分区，值拷进 `out`。
     /// 返回 `null` = 不存在（或被删除）。
-    pub fn get(self: *Store, key: []const u8, out: []u8, scratch: []u8) Error!?[]const u8 {
+    pub fn get(self: *Self, key: []const u8, out: []u8, scratch: []u8) Error!?[]const u8 {
         if (key.len > self.cfg.key_max) return error.KeyTooLong;
         if (scratch.len < self.dev.sector_size) return error.BufferTooSmall;
 
@@ -186,7 +199,7 @@ pub const Store = struct {
                 const total = header_len + klen + vlen + trailer_len;
                 if (off + total > ssize) break;
                 const want = std.mem.readInt(u32, scratch[off + total - trailer_len ..][0..4], .little);
-                if (want != codec.crc32(scratch[off .. off + total - trailer_len])) break;
+                if (want != crcOf(crc_kind, scratch[off .. off + total - trailer_len])) break;
 
                 const k = scratch[off + header_len ..][0..klen];
                 if (std.mem.eql(u8, k, key)) {
@@ -206,16 +219,16 @@ pub const Store = struct {
     }
 
     /// 写 key（覆盖语义：同 key 后写为准）。
-    pub fn put(self: *Store, key: []const u8, value: []const u8, scratch: []u8) Error!void {
+    pub fn put(self: *Self, key: []const u8, value: []const u8, scratch: []u8) Error!void {
         return self.append(OP_PUT, key, value, scratch);
     }
 
     /// 删 key（写墓碑，语义上覆盖之前的 put）。
-    pub fn del(self: *Store, key: []const u8, scratch: []u8) Error!void {
+    pub fn del(self: *Self, key: []const u8, scratch: []u8) Error!void {
         return self.append(OP_DEL, key, &.{}, scratch);
     }
 
-    fn append(self: *Store, op: u8, key: []const u8, value: []const u8, scratch: []u8) Error!void {
+    fn append(self: *Self, op: u8, key: []const u8, value: []const u8, scratch: []u8) Error!void {
         if (key.len == 0 or key.len > self.cfg.key_max) return error.KeyTooLong;
         if (value.len > self.cfg.value_max) return error.ValueTooLong;
         const total = header_len + key.len + value.len + trailer_len;
@@ -240,7 +253,7 @@ pub const Store = struct {
         @memcpy(scratch[header_len..][0..key.len], key);
         @memcpy(scratch[header_len + key.len ..][0..value.len], value);
         const body = total - trailer_len;
-        std.mem.writeInt(u32, scratch[body..][0..4], codec.crc32(scratch[0..body]), .little);
+        std.mem.writeInt(u32, scratch[body..][0..4], crcOf(crc_kind, scratch[0..body]), .little);
 
         // 扇区填充标记：把新扇区的第一个字节之外的内容保持 0xFF，扫描遇到非记录字节就跳下一扇区。
         // 跨扇区时，先把旧扇区剩余的首字节写 0x00，避免扫描把它当成「全空白」。
@@ -254,7 +267,7 @@ pub const Store = struct {
     }
 
     /// 全擦（出厂/清库）。之后 Store 可继续使用。
-    pub fn eraseAll(self: *Store) Error!void {
+    pub fn eraseAll(self: *Self) Error!void {
         try self.dev.erase(0, self.dev.capacity);
         var p: u8 = 0;
         while (p < self.cfg.partitions) : (p += 1) {
@@ -263,7 +276,7 @@ pub const Store = struct {
     }
 
     /// 已用字节（所有分区累加），供上层做「快满了」判断。
-    pub fn usedBytes(self: *const Store) u32 {
+    pub fn usedBytes(self: *const Self) u32 {
         var sum: u32 = 0;
         var p: u8 = 0;
         while (p < self.cfg.partitions) : (p += 1) {
@@ -271,7 +284,14 @@ pub const Store = struct {
         }
         return sum;
     }
-};
+    };
+}
+
+/// 默认实例：最多 8 个分区 + 全表 CRC（桌面/大 RAM 设备）。
+pub const Store = StoreType(8, .table);
+
+/// 极小实例：2 个分区 + 无表 CRC（8 位/16 位 MCU 档）。
+pub const TinyStore = StoreType(2, .bitwise);
 
 // ------------------------- 测试用 RAM 块设备 -------------------------
 
@@ -448,4 +468,29 @@ test "m0: 常驻 RAM 预算（Store + 1 扇区 + 1 记录缓冲）≤ 2KB" {
     // 实测项（不含调用方栈）——目标 8KB 设备留足余量
     try testing.expect(zone <= 2048);
     std.debug.print("m0_ram,store={d},record={d},sector=512,total={d}\n", .{ store_bytes, record_bytes, zone });
+}
+
+test "m0: 极小档（2 分区 / 32B 扇区 / 无表 CRC）在 512B 存储上可用" {
+    var storage: [512]u8 = undefined;
+    var dev = RamDevice.init(&storage);
+    const bd = dev.device(32);
+    var scratch: [32]u8 = undefined;
+    const cfg = Config{ .partitions = 2, .key_max = 8, .value_max = 8 };
+    var st = try TinyStore.open(bd, cfg, &scratch);
+
+    try st.put("k1", "v1", &scratch);
+    try st.put("k2", "v2", &scratch);
+    var out: [16]u8 = undefined;
+    try testing.expectEqualStrings("v1", (try st.get("k1", &out, &scratch)).?);
+
+    // 重开（掉电重启）后仍可读
+    var st2 = try TinyStore.open(bd, cfg, &scratch);
+    try testing.expectEqualStrings("v2", (try st2.get("k2", &out, &scratch)).?);
+    try st2.del("k1", &scratch);
+    try testing.expect((try st2.get("k1", &out, &scratch)) == null);
+
+    // 预算：结构体 + 扇区 + 记录缓冲（实测项，不含栈）
+    const budget = @sizeOf(TinyStore) + 32 + (header_len + cfg.key_max + cfg.value_max + trailer_len);
+    std.debug.print("m0_tiny_ram,store={d},budget={d}\n", .{ @sizeOf(TinyStore), budget });
+    try testing.expect(budget <= 256);
 }

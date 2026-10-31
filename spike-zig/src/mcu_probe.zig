@@ -6,20 +6,23 @@
 const std = @import("std");
 const m0 = @import("pek_rdb_spike").m0;
 
-const sector: u32 = 512;
-/// 用 .bss 里的一段内存冒充 NOR Flash（真实设备换成 SPI Flash 的 read/write/erase 即可）
-var flash: [16384]u8 = undefined;
-var scratch: [512]u8 = undefined;
-var out: [128]u8 = undefined;
+/// 极小档：32B “扇区”（模拟页访问器）、2 分区、key/value 各 8B、无表 CRC
+const sector: u32 = 32;
+var flash: [512]u8 = undefined;
+var scratch: [32]u8 = undefined;
+var out: [8]u8 = undefined;
 
 export fn _start() callconv(.c) noreturn {
     var dev = m0.RamDevice.init(&flash);
     const bd = dev.device(sector);
 
-    var store = m0.Store.open(bd, .{ .partitions = 8, .key_max = 16, .value_max = 32 }, &scratch) catch spin();
+    var store = m0.TinyStore.open(
+        bd,
+        .{ .partitions = 2, .key_max = 8, .value_max = 8 },
+        &scratch,
+    ) catch spin();
 
     store.put("boot", "ok", &scratch) catch spin();
-    store.put("ver", "1", &scratch) catch spin();
     const got = store.get("boot", &out, &scratch) catch spin();
     if (got == null) spin();
     spin();

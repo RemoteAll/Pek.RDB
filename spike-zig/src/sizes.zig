@@ -41,8 +41,10 @@ pub fn main() void {
 
     // M0 极小资源档（8KB RAM 目标）
     row("m0.Store", @sizeOf(spike.m0.Store));
+    row("m0.TinyStore", @sizeOf(spike.m0.TinyStore));
     row("m0.BlockDevice", @sizeOf(spike.m0.BlockDevice));
     row("m0.Config", @sizeOf(spike.m0.Config));
+    row("codec.CRC_NIBBLE_TABLE_BYTES", spike.codec.CRC_NIBBLE_TABLE_BYTES);
 
     // 关键预算项（按 8KB 目标核算用）：每 key 的常驻 RAM = Node + key + value 拷贝
     const sk = spike.skiplist.Skiplist;

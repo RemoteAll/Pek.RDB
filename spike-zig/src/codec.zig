@@ -19,6 +19,45 @@ const crc_table: [256]u32 = blk: {
 /// 查表占用的常量区字节数（供 size 报告使用；C 档可换 16 项半字节表降到 64B）。
 pub const CRC_TABLE_BYTES: usize = @sizeOf(@TypeOf(crc_table));
 
+/// 16 项半字节表（64B）：比全表慢约 2×，但常量区从 1KB 降到 64B。
+const crc_nibble_table: [16]u32 = blk: {
+    var t: [16]u32 = undefined;
+    for (0..16) |i| {
+        var c: u32 = @intCast(i);
+        for (0..4) |_| {
+            c = if ((c & 1) != 0) (c >> 1) ^ 0xEDB88320 else c >> 1;
+        }
+        t[i] = c;
+    }
+    break :blk t;
+};
+
+pub const CRC_NIBBLE_TABLE_BYTES: usize = @sizeOf(@TypeOf(crc_nibble_table));
+
+/// 半字节表 CRC32（常量区 64B）。
+pub fn crc32Nibble(bytes: []const u8) u32 {
+    var c: u32 = 0xFFFFFFFF;
+    for (bytes) |b| {
+        c ^= b;
+        c = (c >> 4) ^ crc_nibble_table[@as(u4, @truncate(c))];
+        c = (c >> 4) ^ crc_nibble_table[@as(u4, @truncate(c))];
+    }
+    return ~c;
+}
+
+/// 无表 CRC32（零常量区，约比全表慢 6~8×）。flash 极小时用。
+pub fn crc32Bitwise(bytes: []const u8) u32 {
+    var c: u32 = 0xFFFFFFFF;
+    for (bytes) |b| {
+        c ^= b;
+        var k: u8 = 0;
+        while (k < 8) : (k += 1) {
+            c = if ((c & 1) != 0) (c >> 1) ^ 0xEDB88320 else c >> 1;
+        }
+    }
+    return ~c;
+}
+
 pub fn crc32(bytes: []const u8) u32 {
     var c: u32 = 0xFFFFFFFF;
     for (bytes) |b| {
