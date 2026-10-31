@@ -347,9 +347,12 @@ pub fn StoreType(comptime max_parts: usize, comptime crc_kind: CrcKind) type {
         return false;
     }
 
-    /// 压缩一个分区：按**环序**从最旧扇区开始，把仍有存活价值的记录搬到追加点，再擦掉旧扇区。
-    /// `scratch` 需要 **2 个扇区**（一个读旧扇区、一个做环序查重）。
-    /// 搬家途中断电安全（搬的是副本，旧扇区未擦前原数据仍在）；返回搬移条数。
+    /// 压缩一个分区：**原地前移**（游标跟随读位置），不需要额外空闲空间。
+    ///
+    /// `scratch` 布局：`[0,ssize)` 读缓冲；`[ssize,2*ssize)` 查重缓冲；
+    /// `[2*ssize,...)` 可选的「存活索引」区（每 `idx_stride` 字节一个槽位）。
+    /// - 有索引区且能装下本分区所有 key → 存活判定 O(1)，整体 O(记录数 + 扇区数)；
+    /// - 否则退回「逐条向前扫描」的精确判定（慢，但零额外 RAM）；两条路径结果一致。
     pub fn compact(self: *Self, p: u8, scratch: []u8) Error!usize {
         const ssize = self.dev.sector_size;
         if (scratch.len < 2 * ssize) return error.BufferTooSmall;
@@ -361,14 +364,23 @@ pub fn StoreType(comptime max_parts: usize, comptime crc_kind: CrcKind) type {
         const total_sectors = self.part_size / ssize;
         if (self.tail_at[p] == end) return 0; // 空分区
 
-        const old_append = self.append_at[p];
+        // 索引路径：key ≤ 8B 且槽位 ≥ 8 才启用
+        const area: ?[]u8 = blk: {
+            const rest = scratch[2 * ssize ..];
+            const slots = rest.len / idx_stride;
+            if (slots < 8 or self.cfg.key_max > idx_key_max) break :blk null;
+            break :blk rest[0 .. slots * idx_stride];
+        };
+        var indexed = false;
+        if (area) |a| indexed = try self.buildLiveIndex(p, sbuf, a);
+        last_compact_indexed = indexed;
+        const slots: usize = if (area) |a| a.len / idx_stride else 0;
 
-        // 游标式原地压缩：读位置从 tail 走一整圈，写位置紧跟在后面（永不越过读位置）。
-        // 每个扇区「先读进缓冲 → 擦掉 → 把存活记录写到写游标」，因此不需要额外空闲空间。
         var read_pos = self.tail_at[p];
         var write_pos = read_pos;
         var moved: usize = 0;
         var n: u32 = 0;
+        const tail = self.tail_at[p];
         while (n < total_sectors) : (n += 1) {
             try self.dev.read(read_pos, sbuf);
             if (sbuf[0] != BLANK) {
@@ -386,7 +398,12 @@ pub fn StoreType(comptime max_parts: usize, comptime crc_kind: CrcKind) type {
 
                     const key = sbuf[off + header_len ..][0..klen];
                     const abs = read_pos + @as(u32, @intCast(off));
-                    if (!try self.hasNewerFrom(p, abs, self.tail_at[p], key, probe)) {
+                    const dist = (abs + self.part_size - tail) % self.part_size;
+                    const live = if (indexed)
+                        isLiveInIndex(area.?, slots, key, dist)
+                    else
+                        !try self.hasNewerFrom(p, abs, tail, key, probe);
+                    if (live) {
                         write_pos = try self.writeAtCursor(p, write_pos, sbuf[off .. off + total]);
                         moved += 1;
                     }
@@ -400,8 +417,45 @@ pub fn StoreType(comptime max_parts: usize, comptime crc_kind: CrcKind) type {
 
         self.append_at[p] = write_pos;
         self.tail_at[p] = if (moved == 0) end else self.tail_at[p];
-        _ = old_append;
         return moved;
+    }
+
+    /// 一趟建索引：记录每个 key 在环序上的**最新**距离。返回 false = 槽位不够（调用方退回扫描路径）。
+    fn buildLiveIndex(self: *Self, p: u8, sbuf: []u8, area: []u8) Error!bool {
+        const slots = area.len / idx_stride;
+        @memset(area, 0);
+        const ssize = self.dev.sector_size;
+        const start = self.partitionStart(p);
+        const end = self.partitionEnd(p);
+        const part = self.part_size;
+        const tail = self.tail_at[p];
+        const window = (self.append_at[p] + part - tail) % part;
+
+        var pos = start;
+        while (pos < end) : (pos += ssize) {
+            try self.dev.read(pos, sbuf);
+            var off: usize = 0;
+            while (off + header_len + trailer_len <= ssize) {
+                const b = sbuf[off];
+                if (b != OP_PUT and b != OP_DEL) break;
+                const klen: usize = sbuf[off + 1];
+                const vlen: usize = std.mem.readInt(u16, sbuf[off + 2 ..][0..2], .little);
+                const total = header_len + klen + vlen + trailer_len;
+                if (off + total > ssize) break;
+                const want = std.mem.readInt(u32, sbuf[off + total - trailer_len ..][0..4], .little);
+                if (want != crcOf(crc_kind, sbuf[off .. off + total - trailer_len])) break;
+
+                if (klen > idx_key_max) return false;
+                const abs = pos + @as(u32, @intCast(off));
+                const dist = (abs + part - tail) % part;
+                if (dist < window) {
+                    const key = sbuf[off + header_len ..][0..klen];
+                    if (!indexInsert(area, slots, key, dist)) return false;
+                }
+                off += total;
+            }
+        }
+        return true;
     }
 
     /// 环序窗口 (abs, append) 内是否有同 key 记录（忽略 scan_from 之前已处理过的区域）。
@@ -495,6 +549,65 @@ pub const Store = StoreType(8, .table);
 
 /// 极小实例：2 个分区 + 无表 CRC（8 位/16 位 MCU 档）。
 pub const TinyStore = StoreType(2, .bitwise);
+
+// ---------------------- 存活索引（压缩加速，可选） ----------------------
+
+/// 槽位大小：key[8] + dist(u32) + klen(u8) + used(u8) = 14 → 按 16 对齐
+const idx_stride: usize = 16;
+const idx_key_max: usize = 8;
+
+/// 上一次 `compact` 是否走了索引快路径（诊断/测试用，不占额外 RAM）。
+pub var last_compact_indexed: bool = false;
+
+fn keyHash(key: []const u8) u32 {
+    var h: u32 = 2166136261;
+    for (key) |b| {
+        h ^= b;
+        h *%= 16777619;
+    }
+    return h;
+}
+
+/// 插入/更新：同 key 只保留最大环序距离。表满返回 false（调用方退回扫描路径）。
+fn indexInsert(area: []u8, slots: usize, key: []const u8, dist: u32) bool {
+    if (key.len > idx_key_max) return false;
+    const h0 = keyHash(key) % slots;
+    var i: usize = 0;
+    while (i < slots) : (i += 1) {
+        const base = ((h0 + i) % slots) * idx_stride;
+        const e = area[base..][0..idx_stride];
+        if (e[13] == 0) {
+            @memset(e[0..idx_key_max], 0);
+            @memcpy(e[0..key.len], key);
+            e[12] = @intCast(key.len);
+            std.mem.writeInt(u32, e[8..12], dist, .little);
+            e[13] = 1;
+            return true;
+        }
+        if (e[12] == @as(u8, @intCast(key.len)) and std.mem.eql(u8, e[0..key.len], key)) {
+            const old = std.mem.readInt(u32, e[8..12], .little);
+            if (dist > old) std.mem.writeInt(u32, e[8..12], dist, .little);
+            return true;
+        }
+    }
+    return false;
+}
+
+/// 该 (key, dist) 是否是该 key 的最新版本（索引里没有的 key 保守判为存活）。
+fn isLiveInIndex(area: []u8, slots: usize, key: []const u8, dist: u32) bool {
+    if (key.len > idx_key_max) return true;
+    const h0 = keyHash(key) % slots;
+    var i: usize = 0;
+    while (i < slots) : (i += 1) {
+        const base = ((h0 + i) % slots) * idx_stride;
+        const e = area[base..][0..idx_stride];
+        if (e[13] == 0) return true;
+        if (e[12] == @as(u8, @intCast(key.len)) and std.mem.eql(u8, e[0..key.len], key)) {
+            return std.mem.readInt(u32, e[8..12], .little) == dist;
+        }
+    }
+    return true;
+}
 
 // ------------------------- 测试用 RAM 块设备 -------------------------
 
@@ -743,4 +856,62 @@ test "m0: 极小档（2 分区 / 32B 扇区 / 无表 CRC）在 512B 存储上可
     const budget = @sizeOf(TinyStore) + 32 + (header_len + cfg.key_max + cfg.value_max + trailer_len);
     std.debug.print("m0_tiny_ram,store={d},budget={d}\n", .{ @sizeOf(TinyStore), budget });
     try testing.expect(budget <= 256);
+}
+
+test "m0: 压缩走索引快路径，且与扫描路径结果一致" {
+    var storage: [16384]u8 = undefined;
+    var dev = RamDevice.init(&storage);
+    const bd = dev.device(256); // 256B 扇区；2 分区 → 每分区 8KB
+    var small: [512]u8 = undefined; // 恰好 2 个扇区：没有索引区 → 扫描路径
+    var big: [512 + 16 * 32]u8 = undefined; // 2 扇区 + 32 个索引槽位 → 索引路径
+
+    const cfg = Config{ .partitions = 2, .key_max = 8, .value_max = 24 };
+    var st = TinyStore.open(bd, cfg, &small) catch unreachable;
+
+    // 写 16 个不同 key，每个覆盖 4 次，制造垃圾
+    var round: usize = 0;
+    var kb: [8]u8 = undefined;
+    while (round < 4) : (round += 1) {
+        var k: usize = 0;
+        while (k < 16) : (k += 1) {
+            const key = try std.fmt.bufPrint(&kb, "k{d}", .{k});
+            st.put(key, "0123456789", &small) catch break;
+        }
+    }
+
+    // 索引路径
+    _ = try st.compactAll(&big);
+    try testing.expect(last_compact_indexed);
+
+    var out: [32]u8 = undefined;
+    var k2: usize = 0;
+    while (k2 < 16) : (k2 += 1) {
+        const key = try std.fmt.bufPrint(&kb, "k{d}", .{k2});
+        const v = try st.get(key, &out, &small);
+        try testing.expect(v != null);
+        try testing.expectEqualStrings("0123456789", v.?);
+    }
+
+    // 再写一轮，然后用最小 scratch 压缩（扫描路径），结果必须一致
+    k2 = 0;
+    while (k2 < 8) : (k2 += 1) {
+        const key = try std.fmt.bufPrint(&kb, "k{d}", .{k2});
+        st.put(key, "abcdefghij", &small) catch break;
+    }
+    _ = try st.compactAll(&small);
+    try testing.expect(!last_compact_indexed);
+
+    k2 = 0;
+    while (k2 < 8) : (k2 += 1) {
+        const key = try std.fmt.bufPrint(&kb, "k{d}", .{k2});
+        const v = try st.get(key, &out, &small);
+        try testing.expect(v != null);
+        try testing.expectEqualStrings("abcdefghij", v.?);
+    }
+
+    // 掉电重开仍然正确
+    var st2 = TinyStore.open(bd, cfg, &small) catch unreachable;
+    const vk = try st2.get("k3", &out, &small);
+    try testing.expect(vk != null);
+    try testing.expectEqualStrings("abcdefghij", vk.?);
 }
