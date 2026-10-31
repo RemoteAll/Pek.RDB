@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
 // 个人使用免费；商业使用需商业授权，或同样以 AGPL-3.0 开源（见 LICENSE）。
 const std = @import("std");
 const sql = @import("sql.zig");
@@ -330,23 +330,61 @@ pub fn selectRows(
     }
 
     var hi: [16]u8 = @splat(0xFF);
-    var refs: std.ArrayList(segmod.Segment.RefRecord) = .empty;
-    defer refs.deinit(alloc);
-    try t.scanRefs(&[_]u8{}, &hi, &refs);
-
-    // 过滤：只解码到复用的 scratch，不分配行
     var keep: std.ArrayList(segmod.Segment.RefRecord) = .empty;
     defer keep.deinit(alloc);
-    if (sel.where) |w| {
-        const widx = s.indexOf(w.column) orelse return error.ColumnNotFound;
-        const scratch = try alloc.alloc(sql.Value, s.columns.len);
-        defer alloc.free(scratch);
-        for (refs.items) |rec| {
-            try s.decodeRowInto(scratch, rec.value);
-            if (evalWhere(scratch[widx], w.op, w.value)) try keep.append(alloc, rec);
+
+    // ------------------------------------------------------------------
+    // 提前终止：没有 ORDER BY 时扫描结果天然按主键升序，而 LIMIT/OFFSET 只要前
+    // `offset + limit` 行 —— 凑够就能停。
+    //
+    // 改之前的行为是「扫全表 → 全量解码 → 最后才截断」：100 万行的表跑
+    // `SELECT * FROM t LIMIT 10` 也要扫完 100 万行、解码 100 万个值再丢掉 99.999%，
+    // 属于「白做的工作」，不是靠调优能弥补的量级差。
+    // ------------------------------------------------------------------
+    const need: ?usize = if (sel.order_by.len == 0 and sel.limit != null)
+        @as(usize, sel.offset orelse 0) + @as(usize, sel.limit.?)
+    else
+        null;
+
+    if (need) |want| {
+        var it = tablemod.MergeIter{};
+        try it.init(t, &.{}, &hi);
+        defer it.deinit(); // 只放 cursors，段数据归 Table，ref 在 deinit 后仍有效
+
+        var scratch: ?[]sql.Value = null;
+        defer if (scratch) |sc| alloc.free(sc);
+        var widx: usize = 0;
+        if (sel.where) |w| {
+            widx = s.indexOf(w.column) orelse return error.ColumnNotFound;
+            scratch = try alloc.alloc(sql.Value, s.columns.len);
+        }
+
+        while (keep.items.len < want) {
+            const rec = it.next() orelse break;
+            if (sel.where) |w| {
+                try s.decodeRowInto(scratch.?, rec.value);
+                if (!evalWhere(scratch.?[widx], w.op, w.value)) continue;
+            }
+            try keep.append(alloc, rec);
         }
     } else {
-        try keep.appendSlice(alloc, refs.items);
+        // 有 ORDER BY 时必须看完全部候选才能排序；无 LIMIT 时必须返回全部。
+        var refs: std.ArrayList(segmod.Segment.RefRecord) = .empty;
+        defer refs.deinit(alloc);
+        try t.scanRefs(&[_]u8{}, &hi, &refs);
+
+        // 过滤：只解码到复用的 scratch，不分配行
+        if (sel.where) |w| {
+            const widx = s.indexOf(w.column) orelse return error.ColumnNotFound;
+            const scratch = try alloc.alloc(sql.Value, s.columns.len);
+            defer alloc.free(scratch);
+            for (refs.items) |rec| {
+                try s.decodeRowInto(scratch, rec.value);
+                if (evalWhere(scratch[widx], w.op, w.value)) try keep.append(alloc, rec);
+            }
+        } else {
+            try keep.appendSlice(alloc, refs.items);
+        }
     }
 
     var m = try decodeAll(alloc, s, keep.items);
@@ -482,3 +520,62 @@ test "update + delete" {
     }
 }
 
+
+test "select LIMIT 提前终止：只读 offset+limit 行，不扫全表" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-exec-limit-early";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    const cols = [_]schema_mod.Column{
+        .{ .name = "id", .col_type = .integer, .primary_key = true },
+        .{ .name = "age", .col_type = .integer },
+    };
+    var s = try schema_mod.Schema.init(alloc, "t", &cols);
+    defer s.deinit(alloc);
+
+    var t = try tablemod.Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+
+    // 200 行，age 全部 30，便于构造 WHERE 全匹配/全不匹配
+    {
+        var sqlbuf: std.ArrayList(u8) = .empty;
+        defer sqlbuf.deinit(alloc);
+        try sqlbuf.appendSlice(alloc, "INSERT INTO t (id, age) VALUES ");
+        var i: usize = 0;
+        while (i < 200) : (i += 1) {
+            if (i > 0) try sqlbuf.appendSlice(alloc, ", ");
+            var num_buf: [32]u8 = undefined;
+            try sqlbuf.appendSlice(alloc, try std.fmt.bufPrint(&num_buf, "({d}, 30)", .{i}));
+        }
+        var p = try sql.parse(alloc, sqlbuf.items);
+        defer p.deinit();
+        _ = try insertRows(&t, &s, p.stmt.insert, alloc);
+    }
+
+    const cases = [_]struct { q: []const u8, want: usize, read: u64 }{
+        .{ .q = "SELECT * FROM t LIMIT 5", .want = 5, .read = 5 },
+        .{ .q = "SELECT * FROM t LIMIT 5 OFFSET 7", .want = 5, .read = 12 },
+        // WHERE 全不匹配时必须扫完（否则会错报 0 行是因为「提前停了」还是「真的没有」）
+        .{ .q = "SELECT * FROM t WHERE age = 99 LIMIT 5", .want = 0, .read = 200 },
+        // WHERE 全匹配时只需凑够 5 行
+        .{ .q = "SELECT * FROM t WHERE age = 30 LIMIT 5", .want = 5, .read = 5 },
+        // 有 ORDER BY 必须全扫（否则排序结果错），这是有意保留的全量路径
+        .{ .q = "SELECT * FROM t ORDER BY age DESC LIMIT 5", .want = 5, .read = 200 },
+    };
+
+    for (cases) |c| {
+        var p = try sql.parse(alloc, c.q);
+        defer p.deinit();
+        t.scan_rows_read = 0;
+        var rows = try selectRows(&t, &s, p.stmt.select, alloc);
+        defer rows.deinit();
+        try std.testing.expectEqual(c.want, rows.rows.len);
+        try std.testing.expectEqual(c.read, t.scan_rows_read);
+    }
+}

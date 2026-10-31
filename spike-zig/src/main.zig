@@ -132,7 +132,7 @@ fn benchMain() !void {
         std.debug.print("scan,{d},{d:.0}\n", .{ set.records.len, opsPerSec(@intCast(set.records.len), ns) });
     }
 
-    // 零拷贝扫描（mmap + 单段快路径）
+    // 零拷贝扫描（mmap + 单段快路径，1 万行）
     {
         var refs: std.ArrayList(spike.segment.Segment.RefRecord) = .empty;
         defer refs.deinit(alloc);
@@ -142,6 +142,29 @@ fn benchMain() !void {
         try t.scanRefs(&lo, &hi, &refs);
         const ns = nowNs(io) - t0;
         std.debug.print("scan_refs,{d},{d:.0}\n", .{ refs.items.len, opsPerSec(@intCast(refs.items.len), ns) });
+    }
+
+    // 大样本扫描（20 万行）：1 万行那两档样本太小，mmap 触页与启动开销占比过重，
+    // 波动可达 30%+，不足以判断「扫描能力」。这里扫 20 万行（≈13MB）把固定开销摊掉；
+    // 不用 100 万行是为了避免 66MB 级大分配污染后续场景。
+    {
+        var refs: std.ArrayList(spike.segment.Segment.RefRecord) = .empty;
+        defer refs.deinit(alloc);
+        const lo0 = keyOf(0);
+        const hi0 = keyOf(200_000);
+        const t0 = nowNs(io);
+        try t.scanRefs(&lo0, &hi0, &refs);
+        const ns = nowNs(io) - t0;
+        std.debug.print("scan_refs_full,{d},{d:.0}\n", .{ refs.items.len, opsPerSec(@intCast(refs.items.len), ns) });
+    }
+    {
+        const lo0 = keyOf(0);
+        const hi0 = keyOf(200_000);
+        const t0 = nowNs(io);
+        var full = try t.scanRange(&lo0, &hi0);
+        const ns = nowNs(io) - t0;
+        defer full.deinit();
+        std.debug.print("scan_full,{d},{d:.0}\n", .{ full.records.len, opsPerSec(@intCast(full.records.len), ns) });
     }
 
     // 多段合并扫描（默认 64MB memtable 会中途自动 flush → 多段）
@@ -244,6 +267,33 @@ fn benchMain() !void {
         const ns_get = nowNs(io) - t_sql_get;
         std.debug.print("sql_get,{d},{d:.0}\n", .{ get_n, opsPerSec(get_n, ns_get) });
         std.debug.print("sql_get_hits,{d},{d}\n", .{ get_n, hits });
+
+        // 分页查询：100 万行表上 `SELECT * FROM t LIMIT 10`。
+        // 改之前要扫全表 + 全量解码再截断；现在凑够 10 行就停。
+        {
+            var items_l = [_]spike.sql.SelectItem{.{ .star = {} }};
+            const sel_l = spike.sql.Select{ .items = &items_l, .table = "bench_sql", .limit = 10 };
+            t4.scan_rows_read = 0;
+            const t0 = nowNs(io);
+            var rows = try spike.exec.selectRows(&t4, &s, sel_l, alloc);
+            const ns = nowNs(io) - t0;
+            defer rows.deinit();
+            std.debug.print("sql_limit10,{d},{d:.0}\n", .{ rows.rows.len, opsPerSec(rows.rows.len, ns) });
+            // 确定性指标：读了多少行（不是靠计时推断「省了多少」）
+            std.debug.print("sql_limit10_readrows,{d},0\n", .{t4.scan_rows_read});
+        }
+        // 对照：同样的表取全部（无 LIMIT）—— 证明上面的差距来自「少读」而不是缓存
+        {
+            var items_f = [_]spike.sql.SelectItem{.{ .star = {} }};
+            const sel_f = spike.sql.Select{ .items = &items_f, .table = "bench_sql" };
+            t4.scan_rows_read = 0;
+            const t0 = nowNs(io);
+            var rows = try spike.exec.selectRows(&t4, &s, sel_f, alloc);
+            const ns = nowNs(io) - t0;
+            defer rows.deinit();
+            std.debug.print("sql_full,{d},{d:.0}\n", .{ rows.rows.len, opsPerSec(@intCast(rows.rows.len), ns) });
+            std.debug.print("sql_full_readrows,{d},0\n", .{t4.scan_rows_read});
+        }
     }
 
     // 并发写（**跨表并行**：架构口径是「单表串行、跨表并行」）

@@ -332,6 +332,34 @@ fn main() -> rusqlite::Result<()> {
         let secs = t0.elapsed().as_secs_f64();
         println!("upd_get,{},{}", GET_N, GET_N as f64 / secs);
         println!("upd_get_hits,{},{}", GET_N, hits);
+
+        // 分页查询（与 Zig 侧 sql_limit10 / sql_full 同口径，同一张 100 万行表）
+        {
+            let t0 = Instant::now();
+            let mut n: usize = 0;
+            {
+                let mut stmt = c3.prepare("SELECT * FROM t LIMIT 10")?;
+                let mut rows = stmt.query([])?;
+                while rows.next()?.is_some() {
+                    n += 1;
+                }
+            }
+            let secs = t0.elapsed().as_secs_f64();
+            println!("sql_limit10,{},{}", n, n as f64 / secs);
+        }
+        {
+            let t0 = Instant::now();
+            let mut n: usize = 0;
+            {
+                let mut stmt = c3.prepare("SELECT * FROM t")?;
+                let mut rows = stmt.query([])?;
+                while rows.next()?.is_some() {
+                    n += 1;
+                }
+            }
+            let secs = t0.elapsed().as_secs_f64();
+            println!("sql_full,{},{}", n, n as f64 / secs);
+        }
         drop(c3);
     }
 

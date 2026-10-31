@@ -48,22 +48,14 @@ pub const RecordSet = struct {
 };
 
 fn recLess(_: void, a: RecordOwned, b: RecordOwned) bool {
-    const n = @min(a.key.len, b.key.len);
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        if (a.key[i] != b.key[i]) return a.key[i] < b.key[i];
-    }
-    if (a.key.len != b.key.len) return a.key.len < b.key.len;
+    const o = segmod.keyCmp(a.key, b.key);
+    if (o != .eq) return o == .lt;
     return a.seq > b.seq;
 }
 
 fn refLess(_: void, a: segmod.Segment.RefRecord, b: segmod.Segment.RefRecord) bool {
-    const n = @min(a.key.len, b.key.len);
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        if (a.key[i] != b.key[i]) return a.key[i] < b.key[i];
-    }
-    if (a.key.len != b.key.len) return a.key.len < b.key.len;
+    const o = segmod.keyCmp(a.key, b.key);
+    if (o != .eq) return o == .lt;
     return a.seq > b.seq;
 }
 
@@ -171,6 +163,9 @@ pub const Table = struct {
     /// 是**确定性量**：不受磁盘/CPU 噪声影响，比计时可靠得多。
     /// 失败的合并不计入（它没产出可用段）。
     compact_bytes_total: u64 = 0,
+    /// 扫描/归并**实际产出**的行数（累计）。
+    /// 确定性指标：用来证明「LIMIT 提前终止」真的没白读，而不是靠计时猜。
+    scan_rows_read: u64 = 0,
 
     pub fn open(
         io: std.Io,
@@ -632,6 +627,7 @@ pub const MergeIter = struct {
                 if (self.have_last and std.mem.eql(u8, rec.key, self.last_key)) continue;
                 self.last_key = rec.key;
                 self.have_last = true;
+                self.table.scan_rows_read += 1;
                 if (rec.flags == 0) return rec;
             }
             return null;
@@ -653,6 +649,7 @@ pub const MergeIter = struct {
             if (self.have_last and std.mem.eql(u8, rec.key, self.last_key)) continue;
             self.last_key = rec.key;
             self.have_last = true;
+            self.table.scan_rows_read += 1;
             if (rec.flags == 0) return rec;
         }
     }

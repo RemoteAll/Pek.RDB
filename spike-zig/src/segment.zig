@@ -25,7 +25,17 @@ pub const Meta = struct {
     max_seq: u64,
 };
 
-fn keyCmp(a: []const u8, b: []const u8) std.math.Order {
+/// 键比较（字节序即字典序）。
+///
+/// **8 字节 key 走单次 u64 比较**：`codec.encodeI64Key` 用大端编码，字节序就是数值序。
+/// 扫描热路径每行要比较 1~2 次，逐字节循环在这里是可见开销（实测占 ~20%）。
+/// `table.zig` 的 `recLess` / `refLess` 也复用它，不再各写一份。
+pub fn keyCmp(a: []const u8, b: []const u8) std.math.Order {
+    if (a.len == 8 and b.len == 8) {
+        const x = std.mem.readInt(u64, a[0..8], .big);
+        const y = std.mem.readInt(u64, b[0..8], .big);
+        return std.math.order(x, y);
+    }
     const n = @min(a.len, b.len);
     var i: usize = 0;
     while (i < n) : (i += 1) {
@@ -671,7 +681,8 @@ pub const Segment = struct {
         if (self.entries.items.len > 0) {
             pos = @intCast(self.entries.items[self.candidateIndex(start)].offset);
         }
-        return .{ .seg = self, .pos = pos, .start = start, .end = end, .snapshot = snapshot };
+        // 空 start = 无下界：直接标记已越过，省掉每行一次无谓的 key 比较
+        return .{ .seg = self, .pos = pos, .start = start, .end = end, .snapshot = snapshot, .passed_start = start.len == 0 };
     }
 
     /// 范围扫描（start 含、end 排他），只输出 seq <= snapshot 的记录（含墓碑）。
@@ -721,6 +732,9 @@ pub const RefCursor = struct {
     start: []const u8,
     end: []const u8,
     snapshot: u64,
+    /// 是否已越过 start。稀疏索引每 64 行一项，定位后最多再跳 63 行就到起点，
+    /// 之后不必每行都和 start 比（热路径上省一次 key 比较）。
+    passed_start: bool = false,
 
     pub fn next(self: *RefCursor) ?Segment.RefRecord {
         const data = self.seg.data;
@@ -742,7 +756,10 @@ pub const RefCursor = struct {
                     .lt => {},
                 }
             }
-            if (keyCmp(k, self.start) == .lt) continue;
+            if (!self.passed_start) {
+                if (keyCmp(k, self.start) == .lt) continue;
+                self.passed_start = true;
+            }
             if (seq > self.snapshot) continue;
             return .{ .key = k, .seq = seq, .flags = flags, .value = v };
         }
