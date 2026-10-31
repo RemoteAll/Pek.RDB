@@ -107,8 +107,6 @@ fn buildOutput(
     defer alloc.free(proj.indices);
     const ncols = s.columns.len;
     const n = end - start;
-    const out_rows = try alloc.alloc([]sql.Value, n);
-    errdefer alloc.free(out_rows);
 
     var identity = proj.indices.len == ncols;
     if (identity) {
@@ -119,6 +117,25 @@ fn buildOutput(
             }
         }
     }
+
+    // 全量（无 LIMIT/OFFSET 截断）+ 恒等投影：**直接转移 hdrs 所有权**，
+    // 不再 memcpy 一份（100 万行那是 16MB 的切片头拷贝）。
+    // 只有 start==0 且 end==hdrs.len 时才能转移：部分切片的长度与分配长度不同，
+    // 而 `Rows.deinit` 是按 `len` 调 free 的，长度不匹配会出事。
+    // 注意这一段必须在分配 out_rows **之前**，否则那条路径会把 out_rows 漏掉。
+    if (identity and start == 0 and end == m.hdrs.len) {
+        const out = m.hdrs;
+        const flat = m.flat;
+        const buf = m.buf;
+        m.hdrs = &.{};
+        m.flat = &.{};
+        m.buf = &.{};
+        return .{ .alloc = alloc, .columns = proj.columns, .rows = out, .flat = flat, .buf = buf };
+    }
+
+    const out_rows = try alloc.alloc([]sql.Value, n);
+    errdefer alloc.free(out_rows);
+
     if (identity) {
         @memcpy(out_rows, m.hdrs[start..end]);
         const flat = m.flat;
@@ -330,6 +347,8 @@ pub fn selectRows(
     }
 
     var hi: [16]u8 = @splat(0xFF);
+    var refs: std.ArrayList(segmod.Segment.RefRecord) = .empty;
+    defer refs.deinit(alloc);
     var keep: std.ArrayList(segmod.Segment.RefRecord) = .empty;
     defer keep.deinit(alloc);
 
@@ -345,6 +364,9 @@ pub fn selectRows(
         @as(usize, sel.offset orelse 0) + @as(usize, sel.limit.?)
     else
         null;
+
+    // `src` 指向 refs 或 keep（两者都在函数作用域内，defer 到函数末尾才释放）
+    var src: []const segmod.Segment.RefRecord = &.{};
 
     if (need) |want| {
         var it = tablemod.MergeIter{};
@@ -367,10 +389,9 @@ pub fn selectRows(
             }
             try keep.append(alloc, rec);
         }
+        src = keep.items;
     } else {
         // 有 ORDER BY 时必须看完全部候选才能排序；无 LIMIT 时必须返回全部。
-        var refs: std.ArrayList(segmod.Segment.RefRecord) = .empty;
-        defer refs.deinit(alloc);
         try t.scanRefs(&[_]u8{}, &hi, &refs);
 
         // 过滤：只解码到复用的 scratch，不分配行
@@ -382,12 +403,15 @@ pub fn selectRows(
                 try s.decodeRowInto(scratch, rec.value);
                 if (evalWhere(scratch[widx], w.op, w.value)) try keep.append(alloc, rec);
             }
+            src = keep.items;
         } else {
-            try keep.appendSlice(alloc, refs.items);
+            // 无 WHERE：**直接引用 refs，不再复制一份**。
+            // 100 万行时那是 48MB 的纯拷贝（ref 数组），属于白做的工作。
+            src = refs.items;
         }
     }
 
-    var m = try decodeAll(alloc, s, keep.items);
+    var m = try decodeAll(alloc, s, src);
     defer m.deinit();
 
     if (sel.order_by.len > 0) {

@@ -194,6 +194,27 @@ fn benchMain() !void {
         std.debug.print("scan_refs_multi_segs,{d},0\n", .{t5.segs.items.len});
     }
 
+    // 100 万行**全表**裸扫描（含值），与 SQL 层 sql_full 同口径。
+    // 这一档是为了分清「SQL 层比 SQLite 慢 23%」到底差在存储扫描还是行解码/结果集构造：
+    // 前面 scan / scan_full 只扫 1 万 / 20 万行区间，不能与 sql_full（100 万行）直接比。
+    // 注意：本档会分配约 98MB（66MB buf + 32MB records），会挤占后续场景的页缓存，
+    // 所以放在 t 生命周期末尾。
+    {
+        const t0 = nowNs(io);
+        var full = try t.scanRange(&.{}, &.{});
+        const ns = nowNs(io) - t0;
+        defer full.deinit();
+        std.debug.print("scan_full1m,{d},{d:.0}\n", .{ full.records.len, opsPerSec(@intCast(full.records.len), ns) });
+    }
+    {
+        var refsf: std.ArrayList(spike.segment.Segment.RefRecord) = .empty;
+        defer refsf.deinit(alloc);
+        const t0 = nowNs(io);
+        try t.scanRefs(&.{}, &.{}, &refsf);
+        const ns = nowNs(io) - t0;
+        std.debug.print("scan_refs_full1m,{d},{d:.0}\n", .{ refsf.items.len, opsPerSec(@intCast(refsf.items.len), ns) });
+    }
+
     t.deinit();
     t_live = false;
 
