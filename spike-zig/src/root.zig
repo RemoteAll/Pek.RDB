@@ -1,4 +1,6 @@
-﻿pub const codec = @import("codec.zig");
+﻿// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
+// 个人使用免费；商业使用需商业授权，或同样以 AGPL-3.0 开源（见 LICENSE）。
+pub const codec = @import("codec.zig");
 pub const skiplist = @import("skiplist.zig");
 pub const wal = @import("wal.zig");
 pub const segment = @import("segment.zig");

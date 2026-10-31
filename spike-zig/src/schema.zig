@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
+// 个人使用免费；商业使用需商业授权，或同样以 AGPL-3.0 开源（见 LICENSE）。
 const std = @import("std");
 const codec = @import("codec.zig");
 const sql = @import("sql.zig");
@@ -165,22 +167,21 @@ pub const Schema = struct {
         return out.toOwnedSlice(alloc);
     }
 
-    /// 解码行；text/blob 切片指向 `bytes`（调用方需保证其生命周期）。
-    pub fn decodeRow(self: *const Schema, alloc: std.mem.Allocator, bytes: []const u8) Error![]sql.Value {
+    /// 解码行到调用方提供的目标切片（零分配）；text/blob 切片指向 `bytes`（调用方需保证其生命周期）。
+    pub fn decodeRowInto(self: *const Schema, dst: []sql.Value, bytes: []const u8) Error!void {
         const n = self.columns.len;
+        if (dst.len != n) return error.TypeMismatch;
         const bitmap_len = (n + 7) / 8;
         if (bytes.len < bitmap_len) return error.CorruptRow;
         var r = codec.Reader{ .buf = bytes[bitmap_len..] };
-        const vals = try alloc.alloc(sql.Value, n);
-        errdefer alloc.free(vals);
 
         for (self.columns, 0..) |col, i| {
             const is_null = (bytes[i / 8] & (@as(u8, 1) << @intCast(i % 8))) != 0;
             if (is_null) {
-                vals[i] = .null;
+                dst[i] = .null;
                 continue;
             }
-            vals[i] = switch (col.col_type) {
+            dst[i] = switch (col.col_type) {
                 .integer, .bigint, .datetime => .{ .integer = @bitCast(try r.u64le()) },
                 .real, .double => .{ .real = @bitCast(try r.u64le()) },
                 .boolean => .{ .integer = @intFromBool(try r.u8v() != 0) },
@@ -191,6 +192,13 @@ pub const Schema = struct {
                 },
             };
         }
+    }
+
+    /// 解码行（返回新分配的值数组）；text/blob 切片指向 `bytes`。
+    pub fn decodeRow(self: *const Schema, alloc: std.mem.Allocator, bytes: []const u8) Error![]sql.Value {
+        const vals = try alloc.alloc(sql.Value, self.columns.len);
+        errdefer alloc.free(vals);
+        try self.decodeRowInto(vals, bytes);
         return vals;
     }
 };

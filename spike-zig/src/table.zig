@@ -1,4 +1,6 @@
-﻿const std = @import("std");
+﻿// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
+// 个人使用免费；商业使用需商业授权，或同样以 AGPL-3.0 开源（见 LICENSE）。
+const std = @import("std");
 const Skiplist = @import("skiplist.zig").Skiplist;
 const walmod = @import("wal.zig");
 const segmod = @import("segment.zig");
@@ -8,6 +10,19 @@ const RecordOwned = segmod.RecordOwned;
 pub const Options = struct {
     flush_bytes: usize = 64 << 20,
     wal_sync_every: usize = 10_000,
+};
+
+/// 范围扫描结果：records 的 key/value 均指向 buf（一次性大缓冲），deinit 只释放 2 块。
+pub const RecordSet = struct {
+    alloc: std.mem.Allocator,
+    buf: []u8 = &.{},
+    records: []RecordOwned = &.{},
+
+    pub fn deinit(self: *RecordSet) void {
+        self.alloc.free(self.buf);
+        self.alloc.free(self.records);
+        self.* = undefined;
+    }
 };
 
 fn recLess(_: void, a: RecordOwned, b: RecordOwned) bool {
@@ -245,57 +260,30 @@ pub const Table = struct {
         self: *Table,
         start: []const u8,
         end: []const u8,
-        out: *std.ArrayList(RecordOwned),
-    ) !void {
-        const snap = self.visible;
-        var tmp: std.ArrayList(RecordOwned) = .empty;
-        defer {
-            for (tmp.items) |r| {
-                self.alloc.free(r.key);
-                self.alloc.free(r.value);
-            }
-            tmp.deinit(self.alloc);
-        }
+    ) !RecordSet {
+        var refs: std.ArrayList(segmod.Segment.RefRecord) = .empty;
+        defer refs.deinit(self.alloc);
+        try self.scanRefs(start, end, &refs);
 
-        var it = self.mem.iteratorFrom(start);
-        while (it.next()) |e| {
-            if (e.key.len < end.len and std.mem.startsWith(u8, e.key, end)) break;
-            if (std.mem.order(u8, e.key, end) != .lt) break;
-            if (e.seq > snap) continue;
-            try tmp.append(self.alloc, .{
-                .key = try self.alloc.dupe(u8, e.key),
-                .seq = e.seq,
-                .flags = e.flags,
-                .value = try self.alloc.dupe(u8, e.value),
-            });
-        }
+        var total: usize = 0;
+        for (refs.items) |r| total += r.key.len + r.value.len;
 
-        for (self.segs.items) |*s| {
-            try s.scanRange(start, end, snap, &tmp);
-        }
+        const buf = try self.alloc.alloc(u8, total);
+        errdefer self.alloc.free(buf);
+        const records = try self.alloc.alloc(RecordOwned, refs.items.len);
+        errdefer self.alloc.free(records);
 
-        std.mem.sort(RecordOwned, tmp.items, {}, recLess);
-
-        var i: usize = 0;
-        while (i < tmp.items.len) {
-            const key = tmp.items[i].key;
-            var j = i;
-            var best: ?usize = null;
-            while (j < tmp.items.len and std.mem.eql(u8, tmp.items[j].key, key)) : (j += 1) {
-                if (best == null or tmp.items[j].seq > tmp.items[best.?].seq) best = j;
-            }
-            if (best) |b| {
-                if (tmp.items[b].flags == 0) {
-                    try out.append(self.alloc, .{
-                        .key = try self.alloc.dupe(u8, tmp.items[b].key),
-                        .seq = tmp.items[b].seq,
-                        .flags = 0,
-                        .value = try self.alloc.dupe(u8, tmp.items[b].value),
-                    });
-                }
-            }
-            i = j;
+        var off: usize = 0;
+        for (refs.items, 0..) |r, i| {
+            const k = buf[off..][0..r.key.len];
+            @memcpy(k, r.key);
+            off += r.key.len;
+            const v = buf[off..][0..r.value.len];
+            @memcpy(v, r.value);
+            off += r.value.len;
+            records[i] = .{ .key = k, .seq = r.seq, .flags = r.flags, .value = v };
         }
+        return .{ .alloc = self.alloc, .buf = buf, .records = records };
     }
     /// 通用 refs 扫描：memtable + 所有段的 k 路归并（值零拷贝借用；调用期间不得写）。
     pub fn scanRefs(self: *Table, start: []const u8, end: []const u8, out: *std.ArrayList(segmod.Segment.RefRecord)) !void {
@@ -356,14 +344,6 @@ pub const Table = struct {
     }
 };
 
-pub fn freeRecords(alloc: std.mem.Allocator, list: *std.ArrayList(RecordOwned)) void {
-    for (list.items) |r| {
-        alloc.free(r.key);
-        alloc.free(r.value);
-    }
-    list.deinit(alloc);
-}
-
 test "table put/get/flush/reopen" {
     const alloc = std.testing.allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
@@ -396,11 +376,10 @@ test "table put/get/flush/reopen" {
     try std.testing.expectEqualStrings("vb2", (try t2.get("b", &out)).?);
     try std.testing.expect((try t2.get("a", &out)) == null);
 
-    var rows: std.ArrayList(RecordOwned) = .empty;
-    defer freeRecords(alloc, &rows);
-    try t2.scanRange("a", "z", &rows);
-    try std.testing.expectEqual(@as(usize, 1), rows.items.len);
-    try std.testing.expectEqualStrings("b", rows.items[0].key);
+    var set = try t2.scanRange("a", "z");
+    defer set.deinit();
+    try std.testing.expectEqual(@as(usize, 1), set.records.len);
+    try std.testing.expectEqualStrings("b", set.records[0].key);
 }
 
 test "table scanRefs merges multiple segments" {

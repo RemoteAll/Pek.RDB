@@ -1,22 +1,25 @@
-﻿const std = @import("std");
+﻿// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
+// 个人使用免费；商业使用需商业授权，或同样以 AGPL-3.0 开源（见 LICENSE）。
+const std = @import("std");
 const sql = @import("sql.zig");
 const schema_mod = @import("schema.zig");
 const tablemod = @import("table.zig");
 const segmod = @import("segment.zig");
 
+/// 查询结果：行头数组 + 值扁平数组 + 值原文缓冲。三块一次性分配，deinit 只释放固定几块。
 pub const Rows = struct {
     alloc: std.mem.Allocator,
     columns: [][]const u8,
     rows: [][]sql.Value,
-    bufs: std.ArrayList([]u8) = .empty,
+    flat: []sql.Value = &.{},
+    buf: []u8 = &.{},
 
     pub fn deinit(self: *Rows) void {
         for (self.columns) |c| self.alloc.free(c);
         self.alloc.free(self.columns);
-        for (self.rows) |r| self.alloc.free(r);
         self.alloc.free(self.rows);
-        for (self.bufs.items) |b| self.alloc.free(b);
-        self.bufs.deinit(self.alloc);
+        self.alloc.free(self.flat);
+        self.alloc.free(self.buf);
         self.* = undefined;
     }
 };
@@ -48,40 +51,93 @@ fn rowLess(ctx: SortCtx, a: []sql.Value, b: []sql.Value) bool {
     return false;
 }
 
-/// 把值深拷贝一份（text/blob 放进独立缓冲），便于返回给调用方。
-fn copyRow(alloc: std.mem.Allocator, values: []const sql.Value) !struct { vals: []sql.Value, buf: []u8 } {
-    var total: usize = 0;
-    for (values) |v| {
-        switch (v) {
-            .text => |s| total += s.len,
-            .blob => |s| total += s.len,
-            else => {},
-        }
+/// 一批已过滤的 refs 一次性解码：值原文 memcpy 进单块缓冲，text/blob 切片指向该缓冲。
+const Materialized = struct {
+    alloc: std.mem.Allocator,
+    buf: []u8 = &.{},
+    flat: []sql.Value = &.{},
+    hdrs: [][]sql.Value = &.{},
+
+    fn deinit(self: *Materialized) void {
+        self.alloc.free(self.flat);
+        self.alloc.free(self.hdrs);
+        self.alloc.free(self.buf);
+        self.* = undefined;
     }
+};
+
+fn decodeAll(
+    alloc: std.mem.Allocator,
+    s: *const schema_mod.Schema,
+    refs: []const segmod.Segment.RefRecord,
+) !Materialized {
+    const ncols = s.columns.len;
+    var total: usize = 0;
+    for (refs) |r| total += r.value.len;
+
     const buf = try alloc.alloc(u8, total);
     errdefer alloc.free(buf);
-    const vals = try alloc.alloc(sql.Value, values.len);
-    errdefer alloc.free(vals);
+    const flat = try alloc.alloc(sql.Value, refs.len * ncols);
+    errdefer alloc.free(flat);
+    const hdrs = try alloc.alloc([]sql.Value, refs.len);
+    errdefer alloc.free(hdrs);
 
     var off: usize = 0;
-    for (values, 0..) |v, i| {
-        vals[i] = switch (v) {
-            .text => |s| blk: {
-                @memcpy(buf[off .. off + s.len], s);
-                const p = buf[off .. off + s.len];
-                off += s.len;
-                break :blk .{ .text = p };
-            },
-            .blob => |s| blk: {
-                @memcpy(buf[off .. off + s.len], s);
-                const p = buf[off .. off + s.len];
-                off += s.len;
-                break :blk .{ .blob = p };
-            },
-            else => v,
-        };
+    for (refs, 0..) |r, i| {
+        const raw = buf[off..][0..r.value.len];
+        @memcpy(raw, r.value);
+        off += r.value.len;
+        const vals = flat[i * ncols ..][0..ncols];
+        try s.decodeRowInto(vals, raw);
+        hdrs[i] = vals;
     }
-    return .{ .vals = vals, .buf = buf };
+    return .{ .alloc = alloc, .buf = buf, .flat = flat, .hdrs = hdrs };
+}
+
+/// 结果装配：按投影产出 Rows；恒等投影直接复用扁平数组（零拷贝）。
+/// 成功后 m 的 buf/flat 所有权转移给 Rows，hdrs 仍由调用方释放。
+fn buildOutput(
+    alloc: std.mem.Allocator,
+    s: *const schema_mod.Schema,
+    m: *Materialized,
+    proj: Projection,
+    start: usize,
+    end: usize,
+) !Rows {
+    defer alloc.free(proj.indices);
+    const ncols = s.columns.len;
+    const n = end - start;
+    const out_rows = try alloc.alloc([]sql.Value, n);
+    errdefer alloc.free(out_rows);
+
+    var identity = proj.indices.len == ncols;
+    if (identity) {
+        for (proj.indices, 0..) |ci, i| {
+            if (ci != i) {
+                identity = false;
+                break;
+            }
+        }
+    }
+    if (identity) {
+        @memcpy(out_rows, m.hdrs[start..end]);
+        const flat = m.flat;
+        const buf = m.buf;
+        m.flat = &.{};
+        m.buf = &.{};
+        return .{ .alloc = alloc, .columns = proj.columns, .rows = out_rows, .flat = flat, .buf = buf };
+    }
+
+    const pflat = try alloc.alloc(sql.Value, n * proj.indices.len);
+    errdefer alloc.free(pflat);
+    for (0..n) |i| {
+        const dst = pflat[i * proj.indices.len ..][0..proj.indices.len];
+        for (proj.indices, 0..) |ci, k| dst[k] = m.hdrs[start + i][ci];
+        out_rows[i] = dst;
+    }
+    const buf = m.buf;
+    m.buf = &.{};
+    return .{ .alloc = alloc, .columns = proj.columns, .rows = out_rows, .flat = pflat, .buf = buf };
 }
 
 pub fn insertRows(
@@ -151,7 +207,8 @@ fn buildProjection(alloc: std.mem.Allocator, s: *const schema_mod.Schema, items:
 
 /// PK 等值查询走点查（不扫全表）。
 fn selectByPk(t: *tablemod.Table, s: *const schema_mod.Schema, sel: sql.Select, pk: sql.Value, alloc: std.mem.Allocator) !Rows {
-    var vals = try alloc.alloc(sql.Value, s.columns.len);
+    const ncols = s.columns.len;
+    const vals = try alloc.alloc(sql.Value, ncols);
     defer alloc.free(vals);
     for (vals) |*v| v.* = .null;
     vals[s.pk_index] = pk;
@@ -160,48 +217,23 @@ fn selectByPk(t: *tablemod.Table, s: *const schema_mod.Schema, sel: sql.Select, 
     defer alloc.free(key);
 
     const proj = try buildProjection(alloc, s, sel.items);
-    defer alloc.free(proj.indices);
     errdefer {
         for (proj.columns) |c| alloc.free(c);
         alloc.free(proj.columns);
     }
 
-    var out_rows: std.ArrayList([]sql.Value) = .empty;
-    var bufs: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (out_rows.items) |r| alloc.free(r);
-        out_rows.deinit(alloc);
-        for (bufs.items) |b| alloc.free(b);
-        bufs.deinit(alloc);
-    }
+    var vbuf: std.ArrayList(u8) = .empty;
+    defer vbuf.deinit(alloc);
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(alloc);
-    if (try t.get(key, &buf)) |bytes| {
-        const decoded = try s.decodeRow(alloc, bytes);
-        defer alloc.free(decoded);
-        const copied = try copyRow(alloc, decoded);
-        try bufs.append(alloc, copied.buf);
-        const p = try alloc.alloc(sql.Value, proj.indices.len);
-        for (proj.indices, 0..) |ci, k| p[k] = copied.vals[ci];
-        alloc.free(copied.vals);
-        try out_rows.append(alloc, p);
-    }
-
-    return .{
-        .alloc = alloc,
-        .columns = proj.columns,
-        .rows = try out_rows.toOwnedSlice(alloc),
-        .bufs = bufs,
+    const raw = (try t.get(key, &vbuf)) orelse {
+        const empty = try alloc.alloc([]sql.Value, 0);
+        return .{ .alloc = alloc, .columns = proj.columns, .rows = empty };
     };
-}
 
-fn freeRecs(alloc: std.mem.Allocator, recs: *std.ArrayList(segmod.RecordOwned)) void {
-    for (recs.items) |r| {
-        alloc.free(r.key);
-        alloc.free(r.value);
-    }
-    recs.deinit(alloc);
+    const one = [_]segmod.Segment.RefRecord{.{ .key = key, .seq = 0, .flags = 0, .value = raw }};
+    var m = try decodeAll(alloc, s, &one);
+    defer m.deinit();
+    return buildOutput(alloc, s, &m, proj, 0, 1);
 }
 
 pub fn updateRows(
@@ -210,13 +242,12 @@ pub fn updateRows(
     upd: sql.Update,
     alloc: std.mem.Allocator,
 ) !usize {
-    var recs: std.ArrayList(segmod.RecordOwned) = .empty;
-    defer freeRecs(alloc, &recs);
     var hi: [16]u8 = @splat(0xFF);
-    try t.scanRange(&[_]u8{}, &hi, &recs);
+    var set = try t.scanRange(&[_]u8{}, &hi);
+    defer set.deinit();
 
     var count: usize = 0;
-    for (recs.items) |rec| {
+    for (set.records) |rec| {
         const vals = try s.decodeRow(alloc, rec.value);
         var matched = true;
         if (upd.where) |w| {
@@ -255,13 +286,12 @@ pub fn deleteRows(
     del: sql.Delete,
     alloc: std.mem.Allocator,
 ) !usize {
-    var recs: std.ArrayList(segmod.RecordOwned) = .empty;
-    defer freeRecs(alloc, &recs);
     var hi: [16]u8 = @splat(0xFF);
-    try t.scanRange(&[_]u8{}, &hi, &recs);
+    var set = try t.scanRange(&[_]u8{}, &hi);
+    defer set.deinit();
 
     var count: usize = 0;
-    for (recs.items) |rec| {
+    for (set.records) |rec| {
         if (del.where) |w| {
             const vals = try s.decodeRow(alloc, rec.value);
             const idx = s.indexOf(w.column) orelse {
@@ -276,31 +306,6 @@ pub fn deleteRows(
         count += 1;
     }
     return count;
-}
-
-fn appendDecoded(
-    alloc: std.mem.Allocator,
-    s: *const schema_mod.Schema,
-    sel: sql.Select,
-    bytes: []const u8,
-    full_rows: *std.ArrayList([]sql.Value),
-    bufs: *std.ArrayList([]u8),
-) !void {
-    const vals = try s.decodeRow(alloc, bytes);
-    if (sel.where) |w| {
-        const idx = s.indexOf(w.column) orelse {
-            alloc.free(vals);
-            return error.ColumnNotFound;
-        };
-        if (!evalWhere(vals[idx], w.op, w.value)) {
-            alloc.free(vals);
-            return;
-        }
-    }
-    const copied = try copyRow(alloc, vals);
-    alloc.free(vals);
-    try full_rows.append(alloc, copied.vals);
-    try bufs.append(alloc, copied.buf);
 }
 
 pub fn selectRows(
@@ -321,62 +326,44 @@ pub fn selectRows(
     }
 
     var hi: [16]u8 = @splat(0xFF);
-    var full_rows: std.ArrayList([]sql.Value) = .empty;
-    var bufs: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (full_rows.items) |r| alloc.free(r);
-        full_rows.deinit(alloc);
-        for (bufs.items) |b| alloc.free(b);
-        bufs.deinit(alloc);
-    }
-
     var refs: std.ArrayList(segmod.Segment.RefRecord) = .empty;
     defer refs.deinit(alloc);
     try t.scanRefs(&[_]u8{}, &hi, &refs);
-    for (refs.items) |rec| {
-        try appendDecoded(alloc, s, sel, rec.value, &full_rows, &bufs);
+
+    // 过滤：只解码到复用的 scratch，不分配行
+    var keep: std.ArrayList(segmod.Segment.RefRecord) = .empty;
+    defer keep.deinit(alloc);
+    if (sel.where) |w| {
+        const widx = s.indexOf(w.column) orelse return error.ColumnNotFound;
+        const scratch = try alloc.alloc(sql.Value, s.columns.len);
+        defer alloc.free(scratch);
+        for (refs.items) |rec| {
+            try s.decodeRowInto(scratch, rec.value);
+            if (evalWhere(scratch[widx], w.op, w.value)) try keep.append(alloc, rec);
+        }
+    } else {
+        try keep.appendSlice(alloc, refs.items);
     }
+
+    var m = try decodeAll(alloc, s, keep.items);
+    defer m.deinit();
 
     if (sel.order_by.len > 0) {
         const ctx = SortCtx{ .schema = s, .order = sel.order_by };
-        std.mem.sort([]sql.Value, full_rows.items, ctx, rowLess);
+        std.mem.sort([]sql.Value, m.hdrs, ctx, rowLess);
     }
 
     var start: usize = 0;
-    if (sel.offset) |o| start = @min(@as(usize, o), full_rows.items.len);
-    var end: usize = full_rows.items.len;
+    if (sel.offset) |o| start = @min(@as(usize, o), m.hdrs.len);
+    var end: usize = m.hdrs.len;
     if (sel.limit) |l| end = @min(end, start + @as(usize, l));
 
-    // 投影
     const proj = try buildProjection(alloc, s, sel.items);
-    defer alloc.free(proj.indices);
     errdefer {
         for (proj.columns) |c| alloc.free(c);
         alloc.free(proj.columns);
     }
-
-    var out_rows: std.ArrayList([]sql.Value) = .empty;
-    errdefer {
-        for (out_rows.items) |r| alloc.free(r);
-        out_rows.deinit(alloc);
-    }
-    for (full_rows.items[start..end]) |full| {
-        const p = try alloc.alloc(sql.Value, proj.indices.len);
-        for (proj.indices, 0..) |ci, k| p[k] = full[ci];
-        try out_rows.append(alloc, p);
-    }
-    for (full_rows.items) |r| alloc.free(r);
-    full_rows.deinit(alloc);
-
-    const rows_slice = try out_rows.toOwnedSlice(alloc);
-    const cols_slice = proj.columns;
-
-    return .{
-        .alloc = alloc,
-        .columns = cols_slice,
-        .rows = rows_slice,
-        .bufs = bufs,
-    };
+    return buildOutput(alloc, s, &m, proj, start, end);
 }
 
 test "insert + select with where/order/limit" {

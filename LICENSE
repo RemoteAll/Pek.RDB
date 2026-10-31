@@ -1,0 +1,115 @@
+Pek.RDB 双许可 1.0
+Dual License v1.0
+
+版权所有 (c) 2026 Pek.RDB 项目作者（GitHub: RemoteAll）
+Copyright (c) 2026 Pek.RDB authors (GitHub: RemoteAll)
+
+---
+
+## 一句话
+
+**个人使用免费；商用二选一 —— 要么取得商业授权，要么同样开源（AGPL-3.0）。**
+
+**Free for personal use. Commercial use requires either a commercial license
+OR releasing your derivative work under AGPL-3.0.**
+
+---
+
+## 一、个人 / 非商业使用（免费）
+
+在遵守本文件的前提下，任何人可以免费：
+
+- 阅读、编译、运行本软件；
+- 用于个人学习、研究、评估、试验；
+- 修改源码并自用（不对外分发、不对外提供网络服务）；
+- 在教学、论文、开源非商业项目中引用（需保留本许可与版权声明）。
+
+条件：保留本 `LICENSE`、版权声明，以及源码中所有许可与署名信息；
+不得移除、隐藏或伪造来源。
+
+## 二、商业使用（需授权，或开源）
+
+「商业使用」指包括但不限于下列任一情形：
+
+- 将本软件（含修改版、衍生物）嵌入、集成到商业产品中；
+- 以本软件为基础对外提供任何形式的有偿或引流服务：
+  数据库服务、SaaS、托管、云服务、API 服务、运维服务；
+- 用于企业内部的生产经营、业务流程、对客户交付的项目；
+- 销售、转售、分发本软件或其衍生物以获取对价；
+- 由商业实体（含其员工）为上述目的使用。
+
+商业使用 **必须满足下列两条之一**：
+
+### 路径 A：取得商业授权（推荐给不想开源的团队）
+
+向版权方申请书面商业授权。授权范围、期限、部署数量、支持条款以双方
+签署的授权协议为准。申请方式见 `COMMERCIAL.md`。
+
+### 路径 B：同样开源（AGPL-3.0）
+
+遵守 **GNU Affero General Public License v3.0（AGPL-3.0）** 的全部条款，
+其中包括（但不限于）：
+
+- 分发本软件或其衍生物时，必须以 AGPL-3.0 提供完整对应源码；
+- **通过网络向他人提供服务也视为分发**（AGPL-3.0 第 13 条）：
+  你对外提供的服务所运行的修改版，必须向使用者提供完整对应源码，
+  且同样以 AGPL-3.0 授权；
+- 保留版权与许可声明，并附上 AGPL-3.0 全文。
+
+AGPL-3.0 官方文本：<https://www.gnu.org/licenses/agpl-3.0.txt>
+（分发二进制或部署对外服务时，须随附该全文副本。）
+
+> 说明：AGPL-3.0 作为主许可时，「个人自用、不对外分发也不对外提供服务」
+> 的情形不产生任何开源义务 —— 这就是第一条所说的「个人使用免费」。
+> 商业使用若不愿承担 AGPL 的开源义务，则走路径 A。
+
+## 三、贡献与再许可
+
+- 向本项目提交贡献（PR / 补丁 / 文档），即表示你同意该贡献以本双许可
+  方式授权，并允许版权方在商业授权中一并再许可。
+- 你保证自己有权提交该贡献，未侵犯第三方权利。
+
+## 四、商标
+
+「Pek.RDB」名称与标识仅用于指称本项目本身。未经书面许可，不得在
+衍生产品或服务上使用该名称暗示官方背书。
+
+## 五、无担保与责任限制
+
+本软件按「现状」提供，不附带任何明示或默示担保（包括但不限于
+适销性、特定用途适用性、无侵权）。在任何情况下，作者或版权方均不对
+因使用本软件产生的任何直接、间接、附带、特殊或后果性损失负责，
+包括但不限于数据丢失、业务中断、利润损失。
+
+## 六、许可终止
+
+违反本许可任一条款，你依据本许可获得的全部权利立即自动终止。
+终止后如继续使用，须重新取得书面许可（路径 A）或完全遵守 AGPL-3.0（路径 B）。
+
+---
+
+## English Summary (non-binding)
+
+Pek.RDB is **dual-licensed**:
+
+1. **Personal / non-commercial use — free.** Read, build, run, modify for
+   personal study, research, evaluation, or private use, provided this
+   license and copyright notices are kept.
+2. **Commercial use — requires ONE of:**
+   - **(A) a commercial license** from the copyright holder (see
+     `COMMERCIAL.md`); or
+   - **(B) full compliance with AGPL-3.0**, including §13: if you let others
+     use your modified version over a network, you must offer them the
+     complete corresponding source under AGPL-3.0.
+
+Commercial use includes embedding into commercial products, offering paid or
+lead-generating services (DBaaS/SaaS/hosting/API/managed operations), internal
+production or business operations, and resale or distribution for
+consideration.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. IN NO EVENT
+SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING
+FROM THE USE OF THE SOFTWARE.
+
+The Chinese text above is the authoritative version; this English summary is
+provided for convenience only.

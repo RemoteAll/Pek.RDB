@@ -26,6 +26,18 @@
 4. **禁止静默吞错**：CRC 失败 / 段缺失 / 版本不匹配必须报 `文件:偏移 + 原因`，不得跳过当没事。
 5. **不在读路径做 IO 持锁**：读锁只用于取快照（`Arc<Memtable>` / `Vec<Arc<Segment>>`），块读取在锁外。
 
+## 许可（硬约束，2026-10-31 定）
+
+- 本项目**双许可**：个人非商业使用免费；**商业使用需取得商业授权，或同样开源（AGPL-3.0）**。
+  见 `LICENSE`、`COMMERCIAL.md`、`README.md`「许可」节。
+- 新增源文件首行加 SPDX 头：`SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial`
+  （Zig 用 `//`，Rust 用 `//`，Markdown/配置免加）。
+- **引入第三方依赖先核许可**：必须允许本项目的双许可形态（闭源商业授权场景可闭源分发）。
+  允许 MIT / Apache-2.0 / BSD-2/3 / ISC / Zlib / 0BSD / Unlicense / MPL-2.0（MPL 只触碰其自身文件）；
+  **禁止** GPL / AGPL（作为依赖）/ SSPL / Commons-Clause / 任何「限制商业使用」的条款。
+  `tools/bench-vs-sqlite` 仅为对照工具（rusqlite，MIT），不随产品分发。
+- 不得移除、篡改既有版权与许可声明。
+
 ## 构建与验证
 
 ```powershell

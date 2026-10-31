@@ -1,4 +1,6 @@
-﻿const std = @import("std");
+﻿// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
+// 个人使用免费；商业使用需商业授权，或同样以 AGPL-3.0 开源（见 LICENSE）。
+const std = @import("std");
 const spike = @import("pek_rdb_spike");
 const codec = spike.codec;
 const tablemod = spike.table;
@@ -114,14 +116,13 @@ pub fn main() !void {
     }
 
     {
-        var rows: std.ArrayList(spike.segment.RecordOwned) = .empty;
-        defer tablemod.freeRecords(alloc, &rows);
         const lo = keyOf(scan_lo);
         const hi = keyOf(scan_hi);
         const t0 = nowNs(io);
-        try t.scanRange(&lo, &hi, &rows);
+        var set = try t.scanRange(&lo, &hi);
         const ns = nowNs(io) - t0;
-        std.debug.print("scan,{d},{d:.0}\n", .{ rows.items.len, opsPerSec(@intCast(rows.items.len), ns) });
+        defer set.deinit();
+        std.debug.print("scan,{d},{d:.0}\n", .{ set.records.len, opsPerSec(@intCast(set.records.len), ns) });
     }
 
     // 零拷贝扫描（mmap + 单段快路径）
@@ -204,9 +205,15 @@ pub fn main() !void {
                 .rows = &row,
             };
             _ = try spike.exec.insertRows(&t4, &s, ins, alloc);
+            if (i % 100_000 == 0) {
+                std.debug.print("progress_sql_put,{d},{d},segs={d},mem={d}\n", .{
+                    i, (nowNs(io) - t_sql_put) / 1_000_000, t4.segs.items.len, t4.mem.len(),
+                });
+            }
         }
         const ns_put = nowNs(io) - t_sql_put;
         std.debug.print("sql_put,{d},{d:.0}\n", .{ n, opsPerSec(n, ns_put) });
+        std.debug.print("sql_put_segs,{d},0\n", .{t4.segs.items.len});
 
         const t_sql_get = nowNs(io);
         var hits: u64 = 0;
