@@ -291,7 +291,9 @@ pub fn main() !void {
             .wal_sync_every = 10_000,
             .flush_bytes = 8 << 20, // 8MB → 约 28 个段
         });
-        defer t6.deinit();
+        // 冷重开那一步要先手动关掉，所以用标志位避免 defer 二次 deinit（否则是 use-after-free）
+        var t6_live = true;
+        defer if (t6_live) t6.deinit();
 
         const t_big_put = nowNs(io);
         var i: u64 = 0;
@@ -360,6 +362,7 @@ pub fn main() !void {
         // 冷重开：默认（索引懒加载）vs 预热（全量读入页缓存）
         {
             t6.deinit();
+            t6_live = false;
             spike.segment.timing = .{};
             spike.segment.timing_enabled = true;
             const t0 = nowNs(io);
@@ -411,6 +414,91 @@ pub fn main() !void {
             const ns_pre = nowNs(io) - t2;
             std.debug.print("big_recover_preheat,{d},{d:.0}\n", .{ big_n, @as(f64, @floatFromInt(ns_pre)) / 1e6 });
             t8.deinit();
+        }
+    }
+
+    // 随机原地 UPDATE（§16.1 达标线里 SQLite 的强项）：在已落段的 100 万行表上随机改 10 万行。
+    // Zig 侧所有写都走 WAL 组提交（wal_sync_every=10000），口径对应 SQLite 的「单事务」形态。
+    {
+        const path8 = "bench-data-update";
+        dir.deleteTree(io, path8) catch {};
+        defer dir.deleteTree(io, path8) catch {};
+
+        var tu = try tablemod.Table.open(io, dir, path8, alloc, .{ .wal_sync_every = 10_000, .flush_bytes = 1 << 30 });
+        defer tu.deinit();
+
+        // 先建 100 万行并落成 1 段（模拟「已有数据的表」）
+        var ui: u64 = 0;
+        while (ui < n) : (ui += 1) {
+            const kb = keyOf(@intCast(ui));
+            try tu.put(&kb, &value);
+        }
+        try tu.flush();
+
+        const value2: [32]u8 = @splat('y');
+
+        // 随机更新 10 万行
+        {
+            const t0 = nowNs(io);
+            var x: u64 = 88172645463325252;
+            ui = 0;
+            while (ui < get_n) : (ui += 1) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                const kb = keyOf(@intCast(x % n));
+                try tu.put(&kb, &value2);
+            }
+            const ns = nowNs(io) - t0;
+            std.debug.print("upd_random,{d},{d:.0}\n", .{ get_n, opsPerSec(get_n, ns) });
+        }
+
+        // 更新后点查
+        {
+            const t0 = nowNs(io);
+            var x: u64 = 88172645463325252;
+            var hits: u64 = 0;
+            var saw_new: u64 = 0;
+            ui = 0;
+            while (ui < get_n) : (ui += 1) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                const kb = keyOf(@intCast(x % n));
+                if (try tu.get(&kb, &out)) |v| {
+                    hits += 1;
+                    if (v.len == value2.len and v[0] == 'y') saw_new += 1;
+                }
+            }
+            const ns = nowNs(io) - t0;
+            std.debug.print("upd_get,{d},{d:.0}\n", .{ get_n, opsPerSec(get_n, ns) });
+            std.debug.print("upd_get_hits,{d},{d}\n", .{ get_n, hits });
+            std.debug.print("upd_get_newvalues,{d},{d}\n", .{ get_n, saw_new });
+        }
+
+        // 把 10 万条新版本落成新段：LSM 的更新代价在这里体现（段数 + 读放大）
+        {
+            const t0 = nowNs(io);
+            try tu.flush();
+            const ns = nowNs(io) - t0;
+            std.debug.print("upd_flush_ms,{d},{d:.2}\n", .{ get_n, @as(f64, @floatFromInt(ns)) / 1e6 });
+            std.debug.print("upd_segs,{d},0\n", .{tu.segs.items.len});
+        }
+        {
+            const t0 = nowNs(io);
+            var x: u64 = 88172645463325252;
+            var hits: u64 = 0;
+            ui = 0;
+            while (ui < get_n) : (ui += 1) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                const kb = keyOf(@intCast(x % n));
+                if (try tu.get(&kb, &out) != null) hits += 1;
+            }
+            const ns = nowNs(io) - t0;
+            std.debug.print("upd_get_after_flush,{d},{d:.0}\n", .{ get_n, opsPerSec(get_n, ns) });
+            std.debug.print("upd_get_after_flush_hits,{d},{d}\n", .{ get_n, hits });
         }
     }
 }

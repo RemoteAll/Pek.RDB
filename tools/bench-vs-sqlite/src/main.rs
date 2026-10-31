@@ -273,5 +273,67 @@ fn main() -> rusqlite::Result<()> {
         let _ = std::fs::remove_file(format!("{path}-shm"));
     }
 
+    // ---------------- 随机原地 UPDATE（目标线 §16.1：SQLite 强项） ----------------
+    // 在已存在的 100 万行表 t 上随机改 10 万行的值；两种形态都测：
+    //   upd_random_auto = 逐条 autocommit；upd_random_txn = 单事务（SQLite 最佳形态，主对比口径）。
+    {
+        let c3 = open_conn()?;
+        let value2 = [b'y'; 32];
+
+        let t0 = Instant::now();
+        {
+            let mut stmt = c3.prepare("UPDATE t SET v = ?1 WHERE id = ?2")?;
+            let mut x: u64 = 88_172_645_463_325_252;
+            for _ in 0..GET_N {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let id = (x % N as u64) as i64;
+                stmt.execute(params![&value2[..], id])?;
+            }
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        println!("upd_random_auto,{},{}", GET_N, GET_N as f64 / secs);
+
+        let t0 = Instant::now();
+        c3.execute_batch("BEGIN")?;
+        {
+            let mut stmt = c3.prepare("UPDATE t SET v = ?1 WHERE id = ?2")?;
+            let mut x: u64 = 88_172_645_463_325_252;
+            for _ in 0..GET_N {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let id = (x % N as u64) as i64;
+                stmt.execute(params![&value2[..], id])?;
+            }
+        }
+        c3.execute_batch("COMMIT")?;
+        let secs = t0.elapsed().as_secs_f64();
+        println!("upd_random_txn,{},{}", GET_N, GET_N as f64 / secs);
+
+        // 更新后点查（与 Zig 侧 upd_get 同口径）
+        let t0 = Instant::now();
+        let mut hits: i64 = 0;
+        {
+            let mut stmt = c3.prepare("SELECT v FROM t WHERE id = ?1")?;
+            let mut x: u64 = 88_172_645_463_325_252;
+            for _ in 0..GET_N {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let id = (x % N as u64) as i64;
+                let v: Vec<u8> = stmt.query_row(params![id], |r| r.get(0))?;
+                if !v.is_empty() {
+                    hits += 1;
+                }
+            }
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        println!("upd_get,{},{}", GET_N, GET_N as f64 / secs);
+        println!("upd_get_hits,{},{}", GET_N, hits);
+        drop(c3);
+    }
+
     Ok(())
 }
