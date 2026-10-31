@@ -330,20 +330,11 @@ pub fn selectRows(
         bufs.deinit(alloc);
     }
 
-    var fast_refs: std.ArrayList(segmod.Segment.RefRecord) = .empty;
-    defer fast_refs.deinit(alloc);
-
-    if (try t.scanRefsFast(&[_]u8{}, &hi, &fast_refs)) {
-        for (fast_refs.items) |rec| {
-            try appendDecoded(alloc, s, sel, rec.value, &full_rows, &bufs);
-        }
-    } else {
-        var recs: std.ArrayList(segmod.RecordOwned) = .empty;
-        defer freeRecs(alloc, &recs);
-        try t.scanRange(&[_]u8{}, &hi, &recs);
-        for (recs.items) |rec| {
-            try appendDecoded(alloc, s, sel, rec.value, &full_rows, &bufs);
-        }
+    var refs: std.ArrayList(segmod.Segment.RefRecord) = .empty;
+    defer refs.deinit(alloc);
+    try t.scanRefs(&[_]u8{}, &hi, &refs);
+    for (refs.items) |rec| {
+        try appendDecoded(alloc, s, sel, rec.value, &full_rows, &bufs);
     }
 
     if (sel.order_by.len > 0) {

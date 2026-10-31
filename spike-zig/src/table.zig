@@ -20,6 +20,16 @@ fn recLess(_: void, a: RecordOwned, b: RecordOwned) bool {
     return a.seq > b.seq;
 }
 
+fn refLess(_: void, a: segmod.Segment.RefRecord, b: segmod.Segment.RefRecord) bool {
+    const n = @min(a.key.len, b.key.len);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        if (a.key[i] != b.key[i]) return a.key[i] < b.key[i];
+    }
+    if (a.key.len != b.key.len) return a.key.len < b.key.len;
+    return a.seq > b.seq;
+}
+
 /// 单表引擎（试验版）：memtable + WAL + 不可变段。
 pub const Table = struct {
     io: std.Io,
@@ -260,6 +270,46 @@ pub const Table = struct {
             i = j;
         }
     }
+    /// 通用 refs 扫描：memtable + 所有段，值零拷贝借用（调用期间不得 flush/写）。
+    /// 单段且 mem 为空时直接走段内快路径；否则合并后按 (key asc, seq desc) 排序去重。
+    pub fn scanRefs(self: *Table, start: []const u8, end: []const u8, out: *std.ArrayList(segmod.Segment.RefRecord)) !void {
+        if (self.mem.len() == 0 and self.segs.items.len == 1) {
+            try self.segs.items[0].scanRefs(start, end, self.visible, out);
+            return;
+        }
+
+        var it = self.mem.iteratorFrom(start);
+        while (it.next()) |e| {
+            if (std.mem.order(u8, e.key, end) != .lt) break;
+            if (e.seq > self.visible) continue;
+            try out.append(self.alloc, .{ .key = e.key, .seq = e.seq, .flags = e.flags, .value = e.value });
+        }
+        for (self.segs.items) |*s| {
+            try s.scanRefs(start, end, self.visible, out);
+        }
+
+        std.mem.sort(segmod.Segment.RefRecord, out.items, {}, refLess);
+
+        var w: usize = 0;
+        var i: usize = 0;
+        while (i < out.items.len) {
+            const key = out.items[i].key;
+            var j = i;
+            var best: ?usize = null;
+            while (j < out.items.len and std.mem.eql(u8, out.items[j].key, key)) : (j += 1) {
+                if (best == null or out.items[j].seq > out.items[best.?].seq) best = j;
+            }
+            if (best) |b| {
+                if (out.items[b].flags == 0) {
+                    out.items[w] = out.items[b];
+                    w += 1;
+                }
+            }
+            i = j;
+        }
+        out.shrinkRetainingCapacity(w);
+    }
+
     /// 快路径：内存表为空且只有一个段时，直接从 mmap 零拷贝扫描。
     /// 返回 false 表示不满足条件，调用方走通用路径。
     pub fn scanRefsFast(self: *Table, start: []const u8, end: []const u8, out: *std.ArrayList(segmod.Segment.RefRecord)) !bool {
@@ -315,5 +365,37 @@ test "table put/get/flush/reopen" {
     try t2.scanRange("a", "z", &rows);
     try std.testing.expectEqual(@as(usize, 1), rows.items.len);
     try std.testing.expectEqualStrings("b", rows.items[0].key);
+}
+
+test "table scanRefs merges multiple segments" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-refs";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+
+    try t.put("a", "va1");
+    try t.put("b", "vb1");
+    try t.flush();
+
+    try t.put("b", "vb2");
+    try t.put("c", "vc1");
+    try t.flush();
+
+    var refs: std.ArrayList(segmod.Segment.RefRecord) = .empty;
+    defer refs.deinit(alloc);
+    try t.scanRefs("", "z", &refs);
+    try std.testing.expectEqual(@as(usize, 3), refs.items.len);
+    try std.testing.expectEqualStrings("a", refs.items[0].key);
+    try std.testing.expectEqualStrings("b", refs.items[1].key);
+    try std.testing.expectEqualStrings("vb2", refs.items[1].value);
+    try std.testing.expectEqualStrings("c", refs.items[2].key);
 }
 

@@ -131,10 +131,36 @@ pub fn main() !void {
         const lo = keyOf(scan_lo);
         const hi = keyOf(scan_hi);
         const t0 = nowNs(io);
-        const fast = try t.scanRefsFast(&lo, &hi, &refs);
+        try t.scanRefs(&lo, &hi, &refs);
         const ns = nowNs(io) - t0;
         std.debug.print("scan_refs,{d},{d:.0}\n", .{ refs.items.len, opsPerSec(@intCast(refs.items.len), ns) });
-        std.debug.print("scan_refs_fast,1,{d}\n", .{@intFromBool(fast)});
+    }
+
+    // 多段合并扫描（默认 64MB memtable 会中途自动 flush → 多段）
+    {
+        const path5 = "bench-data-multi";
+        dir.deleteTree(io, path5) catch {};
+        var t5 = try tablemod.Table.open(io, dir, path5, alloc, .{ .wal_sync_every = 10_000 });
+        defer {
+            t5.deinit();
+            dir.deleteTree(io, path5) catch {};
+        }
+        var i: u64 = 0;
+        while (i < n) : (i += 1) {
+            const kb = keyOf(@intCast(i));
+            try t5.put(&kb, &value);
+        }
+        try t5.flush();
+
+        var refs5: std.ArrayList(spike.segment.Segment.RefRecord) = .empty;
+        defer refs5.deinit(alloc);
+        const lo5 = keyOf(scan_lo);
+        const hi5 = keyOf(scan_hi);
+        const t0 = nowNs(io);
+        try t5.scanRefs(&lo5, &hi5, &refs5);
+        const ns = nowNs(io) - t0;
+        std.debug.print("scan_refs_multi,{d},{d:.0}\n", .{ refs5.items.len, opsPerSec(@intCast(refs5.items.len), ns) });
+        std.debug.print("scan_refs_multi_segs,{d},0\n", .{t5.segs.items.len});
     }
 
     t.deinit();
