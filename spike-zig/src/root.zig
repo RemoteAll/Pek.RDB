@@ -12,8 +12,10 @@ pub const catalog = @import("catalog.zig");
 pub const engine = @import("engine.zig");
 pub const m0 = @import("m0.zig");
 pub const m0_spi = @import("m0_spi.zig");
+pub const m0_diag = @import("m0_diag.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
+    _ = @import("m0_diag_test.zig");
 }
 

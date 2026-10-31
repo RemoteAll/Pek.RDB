@@ -353,66 +353,109 @@ pub fn StoreType(comptime max_parts: usize, comptime crc_kind: CrcKind) type {
     pub fn compact(self: *Self, p: u8, scratch: []u8) Error!usize {
         const ssize = self.dev.sector_size;
         if (scratch.len < 2 * ssize) return error.BufferTooSmall;
-        const sector_buf = scratch[0..ssize];
-        const probe_buf = scratch[ssize..][0..ssize];
+        const sbuf = scratch[0..ssize];
+        const probe = scratch[ssize..][0..ssize];
 
         const start = self.partitionStart(p);
         const end = self.partitionEnd(p);
         const total_sectors = self.part_size / ssize;
+        if (self.tail_at[p] == end) return 0; // 空分区
 
+        const old_append = self.append_at[p];
+
+        // 游标式原地压缩：读位置从 tail 走一整圈，写位置紧跟在后面（永不越过读位置）。
+        // 每个扇区「先读进缓冲 → 擦掉 → 把存活记录写到写游标」，因此不需要额外空闲空间。
+        var read_pos = self.tail_at[p];
+        var write_pos = read_pos;
         var moved: usize = 0;
-        var pos = self.tail_at[p];
-        if (pos == end) return 0; // 空分区
         var n: u32 = 0;
         while (n < total_sectors) : (n += 1) {
-            const head_sector = self.append_at[p] - (self.append_at[p] % ssize);
-            if (pos == head_sector) break; // 不碰正在写入的扇区
-
-            try self.dev.read(pos, sector_buf);
-            if (sector_buf[0] == BLANK) {
-                // 已空白：只推进 tail
-            } else {
+            try self.dev.read(read_pos, sbuf);
+            if (sbuf[0] != BLANK) {
+                try self.dev.erase(read_pos, ssize);
                 var off: usize = 0;
                 while (off + header_len + trailer_len <= ssize) {
-                    const b = sector_buf[off];
+                    const b = sbuf[off];
                     if (b != OP_PUT and b != OP_DEL) break;
-                    const klen: usize = sector_buf[off + 1];
-                    const vlen: usize = std.mem.readInt(u16, sector_buf[off + 2 ..][0..2], .little);
+                    const klen: usize = sbuf[off + 1];
+                    const vlen: usize = std.mem.readInt(u16, sbuf[off + 2 ..][0..2], .little);
                     const total = header_len + klen + vlen + trailer_len;
                     if (off + total > ssize) break;
-                    const want = std.mem.readInt(u32, sector_buf[off + total - trailer_len ..][0..4], .little);
-                    if (want != crcOf(crc_kind, sector_buf[off .. off + total - trailer_len])) break;
+                    const want = std.mem.readInt(u32, sbuf[off + total - trailer_len ..][0..4], .little);
+                    if (want != crcOf(crc_kind, sbuf[off .. off + total - trailer_len])) break;
 
-                    const key = sector_buf[off + header_len ..][0..klen];
-                    const next_pos = pos + @as(u32, @intCast(off + total));
-                    if (!try self.hasNewer(p, next_pos, key, probe_buf)) {
-                        try self.rawAppend(p, sector_buf[off .. off + total]);
+                    const key = sbuf[off + header_len ..][0..klen];
+                    const abs = read_pos + @as(u32, @intCast(off));
+                    if (!try self.hasNewerFrom(p, abs, self.tail_at[p], key, probe)) {
+                        write_pos = try self.writeAtCursor(p, write_pos, sbuf[off .. off + total]);
                         moved += 1;
                     }
                     off += total;
                 }
-                try self.dev.erase(pos, ssize);
             }
 
-            pos += ssize;
-            if (pos >= end) pos = start;
+            read_pos += ssize;
+            if (read_pos >= end) read_pos = start;
         }
 
-        // 重算 tail：第一个非空扇区起点
-        self.tail_at[p] = try self.findTail(p, scratch[0..ssize]);
+        self.append_at[p] = write_pos;
+        self.tail_at[p] = if (moved == 0) end else self.tail_at[p];
+        _ = old_append;
         return moved;
     }
 
-    fn findTail(self: *Self, p: u8, buf: []u8) Error!u32 {
+    /// 环序窗口 (abs, append) 内是否有同 key 记录（忽略 scan_from 之前已处理过的区域）。
+    fn hasNewerFrom(self: *Self, p: u8, abs: u32, scan_from: u32, key: []const u8, buf: []u8) Error!bool {
         const ssize = self.dev.sector_size;
         const start = self.partitionStart(p);
         const end = self.partitionEnd(p);
+        const part = self.part_size;
+        const window = (self.append_at[p] + part - scan_from) % part;
+        const drec = (abs + part - scan_from) % part;
+        if (window == 0) return false;
+
         var pos = start;
         while (pos < end) : (pos += ssize) {
             try self.dev.read(pos, buf[0..ssize]);
-            if (buf[0] != BLANK) return pos;
+            var off: usize = 0;
+            while (off + header_len + trailer_len <= ssize) {
+                const b = buf[off];
+                if (b != OP_PUT and b != OP_DEL) break;
+                const klen: usize = buf[off + 1];
+                const vlen: usize = std.mem.readInt(u16, buf[off + 2 ..][0..2], .little);
+                const total = header_len + klen + vlen + trailer_len;
+                if (off + total > ssize) break;
+                const want = std.mem.readInt(u32, buf[off + total - trailer_len ..][0..4], .little);
+                if (want != crcOf(crc_kind, buf[off .. off + total - trailer_len])) break;
+
+                const a2 = pos + @as(u32, @intCast(off));
+                const d2 = (a2 + part - scan_from) % part;
+                if (d2 > drec and d2 < window) {
+                    const k = buf[off + header_len ..][0..klen];
+                    if (std.mem.eql(u8, k, key)) return true;
+                }
+                off += total;
+            }
         }
-        return end;
+        return false;
+    }
+
+    /// 游标写入：不跨扇区；越过分区尾则回卷（调用方保证不覆盖未读数据）。
+    fn writeAtCursor(self: *Self, p: u8, pos_in: u32, rec: []const u8) Error!u32 {
+        const ssize = self.dev.sector_size;
+        const start = self.partitionStart(p);
+        const end = self.partitionEnd(p);
+        var pos = pos_in;
+        if (pos % ssize + rec.len > ssize) {
+            pos += ssize - (pos % ssize);
+            if (pos >= end) pos = start;
+        }
+        if (pos + rec.len > end) {
+            pos = start;
+            if (rec.len > end - start) return error.NoSpace;
+        }
+        try self.dev.write(pos, rec);
+        return pos + @as(u32, @intCast(rec.len));
     }
 
     /// 压缩所有分区（数据快满时调一次）。
