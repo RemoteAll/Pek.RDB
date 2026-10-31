@@ -1,0 +1,9 @@
+vec_dim,768
+vec_n,100000
+vec_queries,20
+vec_total_ms,341
+vec_per_query_ms,17.07
+vec_qps,58.6
+vec_gbps,16.76
+vec_best_idx,57345
+vec_best_len,435.04752

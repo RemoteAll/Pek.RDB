@@ -80,6 +80,13 @@ $pairs = @(
     [pscustomobject]@{ Name = '范围扫描（仅 key）';       Zig = 'scan_refs';   Lite = 'scan';     Unit = '行/s';  Higher = $true },
     [pscustomobject]@{ Name = 'SQL 层插入';               Zig = 'sql_put';     Lite = 'put_txn';  Unit = '行/s';  Higher = $true },
     [pscustomobject]@{ Name = 'SQL 层点查';               Zig = 'sql_get';     Lite = 'get';      Unit = '次/s';  Higher = $true },
+    # 全表扫描三档（§16.1.10 / §16.1.11）。**必须分开列**，因为「做的工作」不同：
+    #   - 我们 sql_full = 全列解码 + 物化整个结果集；sql_each = 全列解码 + 不物化；
+    #   - SQLite sql_full = 只推进游标、不取列值（`OP_Column` 惰性，等于没解码）；
+    #     sql_full_touch = 两列都真取（零拷贝），才与 sql_each 同工作量。
+    [pscustomobject]@{ Name = 'SQL 全表扫描（我们物化 / SQLite 只推进游标）'; Zig = 'sql_full';       Lite = 'sql_full';       Unit = '行/s'; Higher = $true },
+    [pscustomobject]@{ Name = 'SQL 全表扫描（两边都解码两列：我们流式 / SQLite 取列值）'; Zig = 'sql_each'; Lite = 'sql_full_touch'; Unit = '行/s'; Higher = $true },
+    [pscustomobject]@{ Name = 'SQL 全表扫描（我们物化 vs SQLite 取列值）'; Zig = 'sql_full'; Lite = 'sql_full_touch'; Unit = '行/s'; Higher = $true },
     [pscustomobject]@{ Name = '冷重开（1M 行）';          Zig = 'recover';     Lite = 'recover';  Unit = 'ms';    Higher = $false },
     # 并发写（跨表并行；SQLite 侧每线程独立库文件）
     [pscustomobject]@{ Name = '并发写 1 线程（vs SQLite 事务）'; Zig = 'conc_put_1t'; Lite = 'conc_put_1t_txn'; Unit = '行/s'; Higher = $true },

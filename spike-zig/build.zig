@@ -44,6 +44,21 @@ pub fn build(b: *std.Build) void {
     const ac_step = b.step("run-bench-ac", "Run the auto-compaction benchmark only");
     ac_step.dependOn(&run_ac.step);
 
+    // AI 向量检索可行性原型：只测「暴力全扫 + SIMD 距离」的下限，不引入任何索引。
+    // 独立入口，因为它是 300MB 级分配、且与存储引擎无关。
+    const vec_exe = b.addExecutable(.{
+        .name = "spike-bench-vector",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_vector.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(vec_exe);
+    const run_vec = b.addRunArtifact(vec_exe);
+    const vec_step = b.step("run-bench-vector", "Run the vector search feasibility prototype");
+    vec_step.dependOn(&run_vec.step);
+
     const tests = b.addTest(.{
         .root_module = mod,
     });
