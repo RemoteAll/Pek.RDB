@@ -30,6 +30,33 @@ fn refLess(_: void, a: segmod.Segment.RefRecord, b: segmod.Segment.RefRecord) bo
     return a.seq > b.seq;
 }
 
+const MemCursor = struct {
+    it: Skiplist.Iterator,
+    end: []const u8,
+    snapshot: u64,
+
+    fn next(self: *MemCursor) ?segmod.Segment.RefRecord {
+        while (self.it.next()) |e| {
+            if (std.mem.order(u8, e.key, self.end) != .lt) return null;
+            if (e.seq > self.snapshot) continue;
+            return .{ .key = e.key, .seq = e.seq, .flags = e.flags, .value = e.value };
+        }
+        return null;
+    }
+};
+
+const ScanCursor = union(enum) {
+    mem: MemCursor,
+    seg: segmod.RefCursor,
+
+    fn next(self: *ScanCursor) ?segmod.Segment.RefRecord {
+        return switch (self.*) {
+            .mem => |*m| m.next(),
+            .seg => |*s| s.next(),
+        };
+    }
+};
+
 /// 单表引擎（试验版）：memtable + WAL + 不可变段。
 pub const Table = struct {
     io: std.Io,
@@ -270,53 +297,62 @@ pub const Table = struct {
             i = j;
         }
     }
-    /// 通用 refs 扫描：memtable + 所有段，值零拷贝借用（调用期间不得 flush/写）。
-    /// 单段且 mem 为空时直接走段内快路径；否则合并后按 (key asc, seq desc) 排序去重。
+    /// 通用 refs 扫描：memtable + 所有段的 k 路归并（值零拷贝借用；调用期间不得写）。
     pub fn scanRefs(self: *Table, start: []const u8, end: []const u8, out: *std.ArrayList(segmod.Segment.RefRecord)) !void {
-        if (self.mem.len() == 0 and self.segs.items.len == 1) {
-            try self.segs.items[0].scanRefs(start, end, self.visible, out);
+        var cursors: std.ArrayList(ScanCursor) = .empty;
+        defer cursors.deinit(self.alloc);
+
+        if (self.mem.len() > 0) {
+            try cursors.append(self.alloc, .{ .mem = .{
+                .it = self.mem.iteratorFrom(start),
+                .end = end,
+                .snapshot = self.visible,
+            } });
+        }
+        for (self.segs.items) |*s| {
+            try cursors.append(self.alloc, .{ .seg = s.cursor(start, end, self.visible) });
+        }
+        if (cursors.items.len == 0) return;
+
+        // 单游标（单段或仅 memtable）：直接顺序去重，省掉 k 路选择开销。
+        if (cursors.items.len == 1) {
+            var last_key: []const u8 = &.{};
+            var have_last = false;
+            while (cursors.items[0].next()) |rec| {
+                if (have_last and std.mem.eql(u8, rec.key, last_key)) continue;
+                last_key = rec.key;
+                have_last = true;
+                if (rec.flags == 0) try out.append(self.alloc, rec);
+            }
             return;
         }
 
-        var it = self.mem.iteratorFrom(start);
-        while (it.next()) |e| {
-            if (std.mem.order(u8, e.key, end) != .lt) break;
-            if (e.seq > self.visible) continue;
-            try out.append(self.alloc, .{ .key = e.key, .seq = e.seq, .flags = e.flags, .value = e.value });
-        }
-        for (self.segs.items) |*s| {
-            try s.scanRefs(start, end, self.visible, out);
-        }
+        const cur = try self.alloc.alloc(?segmod.Segment.RefRecord, cursors.items.len);
+        defer self.alloc.free(cur);
+        for (cursors.items, 0..) |*c, i| cur[i] = c.next();
 
-        std.mem.sort(segmod.Segment.RefRecord, out.items, {}, refLess);
-
-        var w: usize = 0;
-        var i: usize = 0;
-        while (i < out.items.len) {
-            const key = out.items[i].key;
-            var j = i;
+        var last_key: []const u8 = &.{};
+        var have_last = false;
+        while (true) {
             var best: ?usize = null;
-            while (j < out.items.len and std.mem.eql(u8, out.items[j].key, key)) : (j += 1) {
-                if (best == null or out.items[j].seq > out.items[best.?].seq) best = j;
-            }
-            if (best) |b| {
-                if (out.items[b].flags == 0) {
-                    out.items[w] = out.items[b];
-                    w += 1;
+            for (cur, 0..) |maybe, i| {
+                const r = maybe orelse continue;
+                if (best == null) {
+                    best = i;
+                    continue;
                 }
+                const b = cur[best.?].?;
+                if (refLess({}, r, b)) best = i;
             }
-            i = j;
-        }
-        out.shrinkRetainingCapacity(w);
-    }
+            const bi = best orelse break;
+            const rec = cur[bi].?;
+            cur[bi] = cursors.items[bi].next();
 
-    /// 快路径：内存表为空且只有一个段时，直接从 mmap 零拷贝扫描。
-    /// 返回 false 表示不满足条件，调用方走通用路径。
-    pub fn scanRefsFast(self: *Table, start: []const u8, end: []const u8, out: *std.ArrayList(segmod.Segment.RefRecord)) !bool {
-        if (self.mem.len() != 0) return false;
-        if (self.segs.items.len != 1) return false;
-        try self.segs.items[0].scanRefs(start, end, self.visible, out);
-        return true;
+            if (have_last and std.mem.eql(u8, rec.key, last_key)) continue;
+            last_key = rec.key;
+            have_last = true;
+            if (rec.flags == 0) try out.append(self.alloc, rec);
+        }
     }
 };
 
@@ -398,4 +434,5 @@ test "table scanRefs merges multiple segments" {
     try std.testing.expectEqualStrings("vb2", refs.items[1].value);
     try std.testing.expectEqualStrings("c", refs.items[2].key);
 }
+
 

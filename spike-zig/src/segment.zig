@@ -352,6 +352,15 @@ pub const Segment = struct {
         }
     }
 
+    /// 流式游标：按 (key asc, seq desc) 逐条产出可见记录（不去重）。
+    pub fn cursor(self: *Segment, start: []const u8, end: []const u8, snapshot: u64) RefCursor {
+        var pos: usize = self.data.len;
+        if (self.entries.items.len > 0) {
+            pos = @intCast(self.entries.items[self.candidateIndex(start)].offset);
+        }
+        return .{ .seg = self, .pos = pos, .start = start, .end = end, .snapshot = snapshot };
+    }
+
     /// 范围扫描（start 含、end 排他），只输出 seq <= snapshot 的记录（含墓碑）。
     pub fn scanRange(
         self: *Segment,
@@ -390,6 +399,38 @@ pub const Segment = struct {
                 .value = try self.alloc.dupe(u8, v),
             });
         }
+    }
+};
+
+pub const RefCursor = struct {
+    seg: *Segment,
+    pos: usize,
+    start: []const u8,
+    end: []const u8,
+    snapshot: u64,
+
+    pub fn next(self: *RefCursor) ?Segment.RefRecord {
+        const data = self.seg.data;
+        while (self.pos + 17 <= data.len) {
+            const klen: usize = @intCast(std.mem.readInt(u32, data[self.pos..][0..4], .little));
+            const vlen: usize = @intCast(std.mem.readInt(u32, data[self.pos + 4 ..][0..4], .little));
+            const seq = std.mem.readInt(u64, data[self.pos + 8 ..][0..8], .little);
+            const flags = data[self.pos + 16];
+            const total = 17 + klen + vlen;
+            if (self.pos + total > data.len) return null;
+            const k = data[self.pos + 17 ..][0..klen];
+            const v = data[self.pos + 17 + klen ..][0..vlen];
+            self.pos += total;
+
+            switch (keyCmp(k, self.end)) {
+                .gt, .eq => return null,
+                .lt => {},
+            }
+            if (keyCmp(k, self.start) == .lt) continue;
+            if (seq > self.snapshot) continue;
+            return .{ .key = k, .seq = seq, .flags = flags, .value = v };
+        }
+        return null;
     }
 };
 
