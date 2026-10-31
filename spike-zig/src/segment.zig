@@ -50,10 +50,8 @@ pub fn readWholeFile(io: std.Io, dir: std.Io.Dir, path: []const u8, alloc: std.m
     const buf = try alloc.alloc(u8, @intCast(size));
     errdefer alloc.free(buf);
     const n = try f.readPositionalAll(io, buf, 0);
-    if (n != buf.len) {
-        alloc.free(buf);
-        return error.UnexpectedEndOfFile;
-    }
+    // 注意：这里**不能**手动 free（errdefer 已经会释放），否则是 double free
+    if (n != buf.len) return error.UnexpectedEndOfFile;
     return buf;
 }
 
@@ -212,15 +210,23 @@ pub const ArchiveIter = struct {
         self.pos = off + len;
         return self.buf[off..][0..len];
     }
+
+    /// 最后一条**完整** record 的末尾偏移（= 下次追加应写的位置）。
+    /// 尾部若有崩溃残片，必须从这里覆盖，不能接在残片后面
+    /// （否则迭代器永远越过不了残片，新段会永久不可见 —— 已由用例守住）。
+    pub fn validEnd(self: *const ArchiveIter) u64 {
+        return @intCast(self.pos);
+    }
 };
 
-/// 追加一段索引（文件不存在则创建并写 magic），返回追加后的文件字节数。
-pub fn archiveAppend(io: std.Io, dir: std.Io.Dir, path: []const u8, payload: []const u8) !u64 {
-    // truncate=false：已存在则保留内容，从末尾追加
+/// 追加一段索引，从 `at` 处开始写（会覆盖该位置之后的残片），返回新的有效末尾。
+/// `at < 8` 视为新建，先写 magic。
+pub fn archiveAppend(io: std.Io, dir: std.Io.Dir, path: []const u8, payload: []const u8, at_in: u64) !u64 {
+    // truncate=false：已存在则保留内容
     const f = try dir.createFile(io, path, .{ .read = true, .truncate = false });
     defer f.close(io);
-    var at: u64 = (try f.stat(io)).size;
-    if (at == 0) {
+    var at = at_in;
+    if (at < 8) {
         try f.writePositionalAll(io, ARCHIVE_MAGIC, 0);
         at = 8;
     }
@@ -229,8 +235,12 @@ pub fn archiveAppend(io: std.Io, dir: std.Io.Dir, path: []const u8, payload: []c
     std.mem.writeInt(u64, hdr[4..12], codec.hashIdx(payload), .little);
     try f.writePositionalAll(io, &hdr, at);
     try f.writePositionalAll(io, payload, at + 12);
+    const new_end = at + 12 + payload.len;
+    // 截断到新末尾：若之前尾部有更长的崩溃残片，残留字节会被下一次读取当成
+    // 一条「看似合法」的 record（虽然 hash 会拒掉，但会让整个库打开失败）。
+    try f.setLength(io, new_end);
     try f.sync(io);
-    return at + 12 + payload.len;
+    return new_end;
 }
 
 // ---------------- 读取 ----------------
@@ -411,10 +421,13 @@ pub const Segment = struct {
 
     /// 首次访问数据视图时才 open + mmap（"按需打开"）。
     /// 单表串行执行模型下无需同步；**不要在多线程里同时首次访问同一个段**。
+    /// 失败时**不**置 mapped，允许下一个调用重试（否则会永久返回空视图）。
     fn dataView(self: *Segment) ![]const u8 {
         if (self.mapped) return self.data;
-        self.mapped = true;
-        if (self.base_path.len == 0) return self.data;
+        if (self.base_path.len == 0) {
+            self.mapped = true;
+            return self.data;
+        }
 
         var tmp: ?[]u8 = null;
         defer if (tmp) |p| self.alloc.free(p);
@@ -427,8 +440,13 @@ pub const Segment = struct {
         var t0: u64 = 0;
         if (timing_enabled) t0 = tick(self.io);
         const f = try self.dir.openFile(self.io, path, .{});
+        // 先 stat 再落字段：否则 stat 失败时 f 已存进 self.file，重试会把它覆盖掉（句柄泄漏）
+        const st = f.stat(self.io) catch |e| {
+            f.close(self.io);
+            return e;
+        };
         self.file = f;
-        self.file_size = (try f.stat(self.io)).size;
+        self.file_size = st.size;
         if (timing_enabled) {
             const t1 = tick(self.io);
             timing.data_open += t1 - t0;
@@ -445,6 +463,8 @@ pub const Segment = struct {
             self.data = mm.memory;
         }
         if (timing_enabled) timing.mmap += tick(self.io) - t0;
+        // 只有全邨成功才标记，失败的调用可以被重试
+        self.mapped = true;
         return self.data;
     }
 

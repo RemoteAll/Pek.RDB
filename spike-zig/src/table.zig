@@ -79,6 +79,7 @@ const ScanCursor = union(enum) {
 /// 从 `seg/index.bin`（索引聚合文件）打开全部段。
 /// 一次 IO 拿到所有段的索引；数据文件仍然懒打开（见 `Segment.dataView`）。
 /// `buf` 的所有权留在调用方（Table 持有），段里只存切片。
+/// 返回**有效末尾偏移**（下次追加要从这里写，覆盖崩溃残片）。
 fn openSegmentsFromArchive(
     io: std.Io,
     dir: std.Io.Dir,
@@ -87,7 +88,7 @@ fn openSegmentsFromArchive(
     alloc: std.mem.Allocator,
     preheat: bool,
     segs: *std.ArrayList(segmod.Segment),
-) !void {
+) !u64 {
     var it = segmod.ArchiveIter{ .buf = buf };
     var id: u64 = 1;
     while (it.next()) |payload| : (id += 1) {
@@ -106,6 +107,7 @@ fn openSegmentsFromArchive(
         };
         if (segmod.timing_enabled) segmod.timing.seg_append += segmod.tick(io) - ta;
     }
+    return it.validEnd();
 }
 
 /// 单表引擎（试验版）：memtable + WAL + 不可变段。
@@ -119,6 +121,8 @@ pub const Table = struct {
     index_path: []u8,
     /// 从 index.bin 一次读入的全部段索引（段的 idx 指向这里）
     idx_archive: []u8 = &.{},
+    /// index.bin 的有效末尾（下次追加从这里写，覆盖崩溃残片）
+    index_valid_len: u64 = 8,
     mem: Skiplist,
     segs: std.ArrayList(segmod.Segment) = .empty,
     wal: walmod.Wal,
@@ -210,7 +214,7 @@ pub const Table = struct {
             segs.deinit(alloc);
         }
 
-        try openSegmentsFromArchive(io, dir, path, arch, alloc, opts.mmap_preheat, &segs);
+        const valid_len = try openSegmentsFromArchive(io, dir, path, arch, alloc, opts.mmap_preheat, &segs);
         const id: u64 = @intCast(segs.items.len + 1);
         for (segs.items) |s| seq = @max(seq, s.max_seq);
 
@@ -227,6 +231,7 @@ pub const Table = struct {
             .wal_path = wal_path,
             .index_path = index_path,
             .idx_archive = arch,
+            .index_valid_len = valid_len,
             .mem = mem,
             .segs = segs,
             .wal = wal,
@@ -322,11 +327,14 @@ pub const Table = struct {
         // 索引：追加到聚合文件（一次小写），并直接接管内存字节，不重复读盘
         const fin = try w.finishBytes();
         errdefer self.alloc.free(fin.bytes);
-        _ = try segmod.archiveAppend(self.io, self.dir, self.index_path, fin.bytes);
+        // 从「有效末尾」写：若上次追加留下崩溃残片，这里会把它覆盖掉
+        self.index_valid_len = try segmod.archiveAppend(self.io, self.dir, self.index_path, fin.bytes, self.index_valid_len);
 
         const seg = try segmod.Segment.fromBytes(self.io, self.dir, self.base_path, id, fin.bytes, self.alloc, true, self.opts.mmap_preheat);
         self.segs.append(self.alloc, seg) catch |e| {
+            // 别在这里 free(fin.bytes)：交给上面的 errdefer，否则 double free
             var s = seg;
+            s.owns_idx = false;
             s.close();
             return e;
         };
@@ -516,6 +524,122 @@ test "table reopen: 懒加载 / 预热 / 并行 三种打开方式结果一致" 
         try t.scanRefs("k000_00", "k010_00", &refs);
         try std.testing.expectEqual(@as(usize, 200), refs.items.len);
         t.deinit();
+    }
+}
+
+test "index.bin 尾部残片后新增段必须仍可见（崩溃一致性）" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-torn-index";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    // 1) 写两段
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        try t.put("a", "va");
+        try t.flush();
+        try t.put("b", "vb");
+        try t.flush();
+        t.deinit();
+    }
+
+    // 2) 往 index.bin 尾部追加垃圾，模拟「追加 record 写到一半崩溃」留下的残片
+    {
+        const p = tmp ++ "/seg/index.bin";
+        const ro = try dir.openFile(io, p, .{});
+        const size = (try ro.stat(io)).size;
+        ro.close(io);
+        const w = try dir.createFile(io, p, .{ .read = true, .truncate = false });
+        try w.writePositionalAll(io, "\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a", size);
+        w.close(io);
+    }
+
+    // 3) 重开：两段仍可见，数据正确
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        try std.testing.expectEqual(@as(usize, 2), t.segs.items.len);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(alloc);
+        try std.testing.expectEqualStrings("vb", (try t.get("b", &out)).?);
+        // 4) 残片之后继续写第三段
+        try t.put("c", "vc");
+        try t.flush();
+        t.deinit();
+    }
+
+    // 5) 再重开：三段都必须可见（否则就是「崩溃后新数据永久丢失」）
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        defer t.deinit();
+        try std.testing.expectEqual(@as(usize, 3), t.segs.items.len);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(alloc);
+        try std.testing.expectEqualStrings("vc", (try t.get("c", &out)).?);
+    }
+}
+
+test "bloom_bits 0 与 10 的读写结果必须一致" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const cases = [_]struct { path: []const u8, bits: u8 }{
+        .{ .path = "test-table-bloom10", .bits = 10 },
+        .{ .path = "test-table-bloom0", .bits = 0 },
+    };
+    defer for (cases) |c| dir.deleteTree(io, c.path) catch {};
+
+    var i: u64 = 0;
+    for (cases) |c| {
+        dir.deleteTree(io, c.path) catch {};
+        var t = try Table.open(io, dir, c.path, alloc, .{ .wal_sync_every = 0, .bloom_bits = c.bits });
+        // 20 行，覆盖多个稀疏索引区间
+        i = 0;
+        while (i < 20) : (i += 1) {
+            var kb: [8]u8 = undefined;
+            var vb: [8]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kb, "k{d:0>3}", .{i});
+            const v = try std.fmt.bufPrint(&vb, "v{d:0>3}", .{i});
+            try t.put(k, v);
+        }
+        try t.flush();
+        t.deinit();
+
+        // 重开（读路径不依赖写入时的 bloom 配置）
+        var t2 = try Table.open(io, dir, c.path, alloc, .{ .wal_sync_every = 0 });
+        defer t2.deinit();
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(alloc);
+
+        // 全部命中且值正确
+        i = 0;
+        while (i < 20) : (i += 1) {
+            var kb: [8]u8 = undefined;
+            var vb: [8]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kb, "k{d:0>3}", .{i});
+            const want = try std.fmt.bufPrint(&vb, "v{d:0>3}", .{i});
+            try std.testing.expectEqualStrings(want, (try t2.get(k, &out)).?);
+        }
+        // 不存在的 key 必须返回 null（bloom=0 时靠二分+扫块判断）
+        try std.testing.expect((try t2.get("k999", &out)) == null);
+        try std.testing.expect((try t2.get("aaa", &out)) == null);
+        try std.testing.expect((try t2.get("zzz", &out)) == null);
+
+        // 范围扫描结果一致
+        var refs: std.ArrayList(segmod.Segment.RefRecord) = .empty;
+        defer refs.deinit(alloc);
+        try t2.scanRefs("k000", "k020", &refs);
+        try std.testing.expectEqual(@as(usize, 20), refs.items.len);
+        try std.testing.expectEqualStrings("k000", refs.items[0].key);
+        try std.testing.expectEqualStrings("v019", refs.items[19].value);
     }
 }
 
