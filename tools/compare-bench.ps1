@@ -14,7 +14,11 @@
 param(
     [Parameter(Mandatory = $true)][string]$Date,
     [string]$DataDir,
-    [string]$OutFile
+    [string]$OutFile,
+    # 可选：自定义输入 glob（默认 zig-<日期>-run*.csv / sqlite-<日期>-run*.csv）。
+    # 同一日期有多批数据时用它分批比对，避免新旧混在一起取中位数失真。
+    [string]$ZigGlob,
+    [string]$SqliteGlob
 )
 
 $ErrorActionPreference = 'Stop'
@@ -57,10 +61,12 @@ function Get-Metrics {
     return [pscustomobject]@{ Metrics = $out; Files = $used }
 }
 
-$zigFiles = @(Get-ChildItem -Path $DataDir -Filter "zig-$Date-run*.csv" | Sort-Object Name | ForEach-Object { $_.FullName })
-$sqliteFiles = @(Get-ChildItem -Path $DataDir -Filter "sqlite-$Date-run*.csv" | Sort-Object Name | ForEach-Object { $_.FullName })
-if ($zigFiles.Count -eq 0) { throw "找不到 zig-$Date-run*.csv（$DataDir）" }
-if ($sqliteFiles.Count -eq 0) { throw "找不到 sqlite-$Date-run*.csv（$DataDir）" }
+if (-not $ZigGlob) { $ZigGlob = "zig-$Date-run*.csv" }
+if (-not $SqliteGlob) { $SqliteGlob = "sqlite-$Date-run*.csv" }
+$zigFiles = @(Get-ChildItem -Path $DataDir -Filter $ZigGlob | Sort-Object Name | ForEach-Object { $_.FullName })
+$sqliteFiles = @(Get-ChildItem -Path $DataDir -Filter $SqliteGlob | Sort-Object Name | ForEach-Object { $_.FullName })
+if ($zigFiles.Count -eq 0) { throw "找不到 $ZigGlob（$DataDir）" }
+if ($sqliteFiles.Count -eq 0) { throw "找不到 $SqliteGlob（$DataDir）" }
 
 $zig = Get-Metrics -Files $zigFiles
 $lite = Get-Metrics -Files $sqliteFiles

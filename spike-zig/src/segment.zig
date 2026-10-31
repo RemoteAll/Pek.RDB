@@ -44,12 +44,17 @@ fn hashPair(key: []const u8) [2]u64 {
 fn readWholeFile(io: std.Io, dir: std.Io.Dir, path: []const u8, alloc: std.mem.Allocator, max: u64) ![]u8 {
     const f = try dir.openFile(io, path, .{});
     defer f.close(io);
+    // 先 stat 拿长度再一次性读：比「盲读 64KB 再扩容」少一次 read（实测后者慢 ~1ms / 25 段）。
     const size = (try f.stat(io)).size;
     if (size > max) return error.FileTooBig;
     const buf = try alloc.alloc(u8, @intCast(size));
     errdefer alloc.free(buf);
     const n = try f.readPositionalAll(io, buf, 0);
-    return buf[0..n];
+    if (n != buf.len) {
+        alloc.free(buf);
+        return error.UnexpectedEndOfFile;
+    }
+    return buf;
 }
 
 // ---------------- 写入 ----------------
@@ -167,74 +172,165 @@ pub const Writer = struct {
 
 // ---------------- 读取 ----------------
 
+/// 段内稀疏索引项：key 不单独分配，而是记录它在 `.idx` 整块缓冲里的偏移。
+/// 这样一个段只做 **1 次大分配 + 1 次 entries 数组分配**，而不是「每项一个 key」。
+pub const Entry = struct {
+    offset: u64,
+    key_off: u32,
+    key_len: u32,
+};
+
+/// 诊断：打开段的分阶段耗时（纳秒）。默认关，仅基准/排查时打开。
+/// **不是线程安全的**：开启时不能与 `Table.Options.parallel_open = true` 同用（累加会竞争，
+/// 且并行时累加得到的是各线程耗时之和而非墙钟）。
+pub const Timing = struct {
+    idx_open: u64 = 0,
+    idx_read: u64 = 0,
+    crc: u64 = 0,
+    parse: u64 = 0,
+    data_open: u64 = 0,
+    mmap: u64 = 0,
+};
+pub var timing_enabled: bool = false;
+pub var timing: Timing = .{};
+
+fn tick(io: std.Io) u64 {
+    return @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
+}
+
 pub const Segment = struct {
     io: std.Io,
     alloc: std.mem.Allocator,
+    dir: std.Io.Dir = undefined,
+    /// 数据文件路径（延迟打开用；close 时释放）
+    data_path: []u8 = &.{},
+    preheat: bool = false,
+    mapped: bool = false,
     data: []const u8 = &.{},
     mm: ?std.Io.File.MemoryMap = null,
     file: ?std.Io.File = null,
-    entries: std.ArrayList(IndexEntry) = .empty,
-    bits: []u8 = &.{},
+    /// 整个 `.idx` 文件内容（entries 的 key 与 Bloom 都指向这里）
+    idx: []u8 = &.{},
+    entries: std.ArrayList(Entry) = .empty,
+    bits_off: u32 = 0,
     bits_len: u64 = 0,
     rows: usize = 0,
     min_seq: u64 = 0,
     max_seq: u64 = 0,
     file_size: u64 = 0,
 
+    pub fn entryKey(self: *const Segment, i: usize) []const u8 {
+        const e = self.entries.items[i];
+        return self.idx[e.key_off..][0..e.key_len];
+    }
+
+    /// `preheat`：是否在打开时就把数据文件全部读进页缓存。
+    /// 默认 **false**（懒加载）——冷重开只加载索引，数据文件连 open/mmap 都推迟到首次读；
+    /// 点查里 Bloom 不通过的段根本不会打开数据文件。
     pub fn open(
         io: std.Io,
         dir: std.Io.Dir,
         data_path: []const u8,
         idx_path: []const u8,
         alloc: std.mem.Allocator,
+        preheat: bool,
     ) !Segment {
+        var t0: u64 = 0;
+        if (timing_enabled) t0 = tick(io);
         const idx_bytes = try readWholeFile(io, dir, idx_path, alloc, 64 << 20);
-        defer alloc.free(idx_bytes);
-        if (idx_bytes.len < 12 or std.mem.readInt(u32, idx_bytes[idx_bytes.len - 4 ..][0..4], .little) != codec.crc32(idx_bytes[0 .. idx_bytes.len - 4])) {
+        errdefer alloc.free(idx_bytes);
+        if (timing_enabled) {
+            const t1 = tick(io);
+            timing.idx_read += t1 - t0;
+            t0 = t1;
+        }
+        if (idx_bytes.len < 12 or std.mem.readInt(u32, idx_bytes[idx_bytes.len - 4 ..][0..4], .little) != codec.crc32Fast(idx_bytes[0 .. idx_bytes.len - 4])) {
             return error.BadIndexChecksum;
         }
         if (!std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC)) return error.BadIndexMagic;
 
+        if (timing_enabled) {
+            const t1 = tick(io);
+            timing.crc += t1 - t0;
+            t0 = t1;
+        }
+
         var r = codec.Reader{ .buf = idx_bytes[8..] };
-        var seg = Segment{ .io = io, .alloc = alloc };
+        var seg = Segment{ .io = io, .alloc = alloc, .idx = idx_bytes };
         seg.rows = @intCast(try r.u64le());
         seg.min_seq = try r.u64le();
         seg.max_seq = try r.u64le();
         const n: usize = @intCast(try r.u32le());
+        try seg.entries.ensureTotalCapacity(alloc, n);
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const off = try r.u64le();
             const klen: usize = @intCast(try r.u32le());
             const key = try r.bytes(klen);
-            try seg.entries.append(alloc, .{ .offset = off, .key = try alloc.dupe(u8, key) });
+            seg.entries.appendAssumeCapacity(.{
+                .offset = off,
+                .key_off = @intCast(@intFromPtr(key.ptr) - @intFromPtr(idx_bytes.ptr)),
+                .key_len = @intCast(klen),
+            });
         }
         seg.bits_len = try r.u64le();
         const k = try r.u8v();
         const bits_bytes = (seg.bits_len + 7) / 8;
-        seg.bits = try alloc.dupe(u8, try r.bytes(@intCast(bits_bytes)));
+        const bits = try r.bytes(@intCast(bits_bytes));
+        seg.bits_off = @intCast(@intFromPtr(bits.ptr) - @intFromPtr(idx_bytes.ptr));
 
         // k 未存进结构：固定 7（与写入一致）
         _ = k;
 
-        const df = try dir.openFile(io, data_path, .{});
-        seg.file = df;
-        seg.file_size = (try df.stat(io)).size;
-        if (seg.file_size > 0) {
-            var mm = try std.Io.File.MemoryMap.create(io, df, .{
-                .len = @intCast(seg.file_size),
-                .protection = .{ .read = true, .write = false },
-            });
-            try mm.read(io);
-            seg.mm = mm;
-            seg.data = mm.memory;
+        if (timing_enabled) {
+            const t1 = tick(io);
+            timing.parse += t1 - t0;
+            t0 = t1;
         }
+
+        // 数据文件延迟打开 + 延迟 mmap（冷重开只做索引）；preheat=true 时立即建视图。
+        seg.dir = dir;
+        seg.data_path = try alloc.dupe(u8, data_path);
+        seg.preheat = preheat;
+        if (preheat) _ = try seg.dataView();
         return seg;
     }
 
+    /// 首次访问数据视图时才 open + mmap（"按需打开"）。
+    /// 单表串行执行模型下无需同步；**不要在多线程里同时首次访问同一个段**。
+    fn dataView(self: *Segment) ![]const u8 {
+        if (self.mapped) return self.data;
+        self.mapped = true;
+        if (self.data_path.len == 0) return self.data;
+
+        var t0: u64 = 0;
+        if (timing_enabled) t0 = tick(self.io);
+        const f = try self.dir.openFile(self.io, self.data_path, .{});
+        self.file = f;
+        self.file_size = (try f.stat(self.io)).size;
+        if (timing_enabled) {
+            const t1 = tick(self.io);
+            timing.data_open += t1 - t0;
+            t0 = t1;
+        }
+        if (self.file_size > 0) {
+            var mm = try std.Io.File.MemoryMap.create(self.io, f, .{
+                .len = @intCast(self.file_size),
+                .protection = .{ .read = true, .write = false },
+            });
+            errdefer mm.destroy(self.io);
+            if (self.preheat) try mm.read(self.io);
+            self.mm = mm;
+            self.data = mm.memory;
+        }
+        if (timing_enabled) timing.mmap += tick(self.io) - t0;
+        return self.data;
+    }
+
     pub fn close(self: *Segment) void {
-        for (self.entries.items) |e| self.alloc.free(e.key);
         self.entries.deinit(self.alloc);
-        self.alloc.free(self.bits);
+        if (self.idx.len > 0) self.alloc.free(self.idx);
+        if (self.data_path.len > 0) self.alloc.free(self.data_path);
         if (self.mm) |*m| m.destroy(self.io);
         if (self.file) |f| f.close(self.io);
         self.* = undefined;
@@ -242,11 +338,12 @@ pub const Segment = struct {
 
     fn mayContain(self: *const Segment, key: []const u8) bool {
         if (self.bits_len == 0) return true;
+        const bits = self.idx[self.bits_off..];
         const hp = hashPair(key);
         var i: usize = 0;
         while (i < 7) : (i += 1) {
             const pos: usize = @intCast((hp[0] +% (@as(u64, i) *% hp[1])) % self.bits_len);
-            if ((self.bits[pos / 8] & (@as(u8, 1) << @intCast(pos % 8))) == 0) return false;
+            if ((bits[pos / 8] & (@as(u8, 1) << @intCast(pos % 8))) == 0) return false;
         }
         return true;
     }
@@ -256,7 +353,7 @@ pub const Segment = struct {
         var hi: usize = self.entries.items.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            if (keyCmp(self.entries.items[mid].key, key) == .gt) {
+            if (keyCmp(self.entryKey(mid), key) == .gt) {
                 hi = mid;
             } else {
                 lo = mid + 1;
@@ -274,12 +371,11 @@ pub const Segment = struct {
 
         const i = self.candidateIndex(key);
         const begin = self.entries.items[i].offset;
-        const end = if (i + 1 < self.entries.items.len) self.entries.items[i + 1].offset else self.file_size;
+        const view = try self.dataView();
+        const end: u64 = if (i + 1 < self.entries.items.len) self.entries.items[i + 1].offset else view.len;
         if (end <= begin) return null;
 
-        const n: usize = @intCast(end - begin);
-        _ = n;
-        const data = self.data[@intCast(begin)..@intCast(end)];
+        const data = view[@intCast(begin)..@intCast(end)];
 
         var pos: usize = 0;
         while (pos + 17 <= data.len) {
@@ -319,7 +415,7 @@ pub const Segment = struct {
     /// 同一 key 只输出一个可见版本（墓碑跳过）。
     pub fn scanRefs(self: *Segment, start: []const u8, end: []const u8, snapshot: u64, out: *std.ArrayList(RefRecord)) !void {
         if (self.entries.items.len == 0) return;
-        const data = self.data;
+        const data = try self.dataView();
         var pos: usize = @intCast(self.entries.items[self.candidateIndex(start)].offset);
         var cur_key: []const u8 = &.{};
         var have_cur = false;
@@ -355,8 +451,9 @@ pub const Segment = struct {
     }
 
     /// 流式游标：按 (key asc, seq desc) 逐条产出可见记录（不去重）。
-    pub fn cursor(self: *Segment, start: []const u8, end: []const u8, snapshot: u64) RefCursor {
-        var pos: usize = self.data.len;
+    pub fn cursor(self: *Segment, start: []const u8, end: []const u8, snapshot: u64) !RefCursor {
+        const view = try self.dataView();
+        var pos: usize = view.len;
         if (self.entries.items.len > 0) {
             pos = @intCast(self.entries.items[self.candidateIndex(start)].offset);
         }
@@ -375,7 +472,7 @@ pub const Segment = struct {
         const i = self.candidateIndex(start);
         const begin: usize = @intCast(self.entries.items[i].offset);
         var pos: usize = begin;
-        const data = self.data;
+        const data = try self.dataView();
 
         while (pos + 17 <= data.len) {
             const klen: usize = @intCast(std.mem.readInt(u32, data[pos..][0..4], .little));
@@ -460,7 +557,7 @@ test "segment write + point get + scan" {
         try std.testing.expectEqual(@as(u64, 2), meta.max_seq);
     }
 
-    var seg = try Segment.open(io, dir, tmp ++ "/000001.data", tmp ++ "/000001.idx", alloc);
+    var seg = try Segment.open(io, dir, tmp ++ "/000001.data", tmp ++ "/000001.idx", alloc, false);
     defer seg.close();
 
     var out: std.ArrayList(u8) = .empty;

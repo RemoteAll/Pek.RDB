@@ -334,17 +334,88 @@ pub fn main() !void {
             std.debug.print("big_scan_refs,{d},{d:.0}\n", .{ refs6.items.len, opsPerSec(@intCast(refs6.items.len), ns) });
         }
 
-        // 冷重开
+        // 诊断：只读 25 个 .idx 并算 CRC（不复用 Segment.open，用于归因冷重开耗时）。
+        // 注意用的是 1KB 表版 `crc32`：它本身就是要被替换的慢路径，方便与 `crc32Fast` 对照。
+        {
+            const t0 = nowNs(io);
+            var sid: u64 = 1;
+            var bytes: usize = 0;
+            while (true) : (sid += 1) {
+                const ip = try alloc.print("{s}/seg/{d:0>6}.idx", .{ path6, sid });
+                defer alloc.free(ip);
+                const f = dir.openFile(io, ip, .{}) catch break;
+                defer f.close(io);
+                const sz: usize = @intCast((try f.stat(io)).size);
+                const buf = try alloc.alloc(u8, sz);
+                defer alloc.free(buf);
+                _ = try f.readPositionalAll(io, buf, 0);
+                _ = codec.crc32(buf[0 .. sz - 4]);
+                bytes += sz;
+            }
+            const ns = nowNs(io) - t0;
+            std.debug.print("diag_idx_read_crc,{d},{d:.2}\n", .{ sid - 1, @as(f64, @floatFromInt(ns)) / 1e6 });
+            std.debug.print("diag_idx_bytes,{d},{d}\n", .{ sid - 1, bytes });
+        }
+
+        // 冷重开：默认（索引懒加载）vs 预热（全量读入页缓存）
         {
             t6.deinit();
+            spike.segment.timing = .{};
+            spike.segment.timing_enabled = true;
             const t0 = nowNs(io);
             var t7 = try tablemod.Table.open(io, dir, path6, alloc, .{
                 .wal_sync_every = 10_000,
                 .flush_bytes = 8 << 20,
             });
             const ns = nowNs(io) - t0;
-            defer t7.deinit();
+            spike.segment.timing_enabled = false;
+            const tm = spike.segment.timing;
             std.debug.print("big_recover,{d},{d:.0}\n", .{ big_n, @as(f64, @floatFromInt(ns)) / 1e6 });
+            std.debug.print("big_recover_breakdown_ms,idx_read,{d:.2}\n", .{@as(f64, @floatFromInt(tm.idx_read)) / 1e6});
+            std.debug.print("big_recover_breakdown_ms,crc,{d:.2}\n", .{@as(f64, @floatFromInt(tm.crc)) / 1e6});
+            std.debug.print("big_recover_breakdown_ms,parse,{d:.2}\n", .{@as(f64, @floatFromInt(tm.parse)) / 1e6});
+            std.debug.print("big_recover_breakdown_ms,data_open,{d:.2}\n", .{@as(f64, @floatFromInt(tm.data_open)) / 1e6});
+            std.debug.print("big_recover_breakdown_ms,mmap,{d:.2}\n", .{@as(f64, @floatFromInt(tm.mmap)) / 1e6});
+
+            // 重开后立刻点查：懒加载的缺页代价落到读路径上（先量，再决定要不要预热）
+            {
+                const t1 = nowNs(io);
+                var x: u64 = 88172645463325252;
+                var hits: u64 = 0;
+                i = 0;
+                while (i < get_n) : (i += 1) {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    const kb = keyOf(@intCast(x % big_n));
+                    if (try t7.get(&kb, &out) != null) hits += 1;
+                }
+                const ns2 = nowNs(io) - t1;
+                std.debug.print("big_get_after_reopen,{d},{d:.0}\n", .{ get_n, opsPerSec(get_n, ns2) });
+                std.debug.print("big_get_after_reopen_hits,{d},{d}\n", .{ get_n, hits });
+            }
+            t7.deinit();
+
+            const t2 = nowNs(io);
+            var t8 = try tablemod.Table.open(io, dir, path6, alloc, .{
+                .wal_sync_every = 10_000,
+                .flush_bytes = 8 << 20,
+                .mmap_preheat = true,
+            });
+            const ns_pre = nowNs(io) - t2;
+            std.debug.print("big_recover_preheat,{d},{d:.0}\n", .{ big_n, @as(f64, @floatFromInt(ns_pre)) / 1e6 });
+            t8.deinit();
+
+            // A/B：并行开段（同轮同机对比，避免跨轮环境差异）
+            const t3 = nowNs(io);
+            var t9 = try tablemod.Table.open(io, dir, path6, alloc, .{
+                .wal_sync_every = 10_000,
+                .flush_bytes = 8 << 20,
+                .parallel_open = true,
+            });
+            const ns_par = nowNs(io) - t3;
+            defer t9.deinit();
+            std.debug.print("big_recover_parallel,{d},{d:.0}\n", .{ big_n, @as(f64, @floatFromInt(ns_par)) / 1e6 });
         }
     }
 }

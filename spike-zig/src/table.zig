@@ -1,6 +1,7 @@
 ﻿// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
 // 个人使用免费；商业使用需商业授权，或同样以 AGPL-3.0 开源（见 LICENSE）。
 const std = @import("std");
+const builtin = @import("builtin");
 const Skiplist = @import("skiplist.zig").Skiplist;
 const walmod = @import("wal.zig");
 const segmod = @import("segment.zig");
@@ -10,6 +11,11 @@ const RecordOwned = segmod.RecordOwned;
 pub const Options = struct {
     flush_bytes: usize = 64 << 20,
     wal_sync_every: usize = 10_000,
+    /// 打开段时是否把整个数据文件读进页缓存（默认关：冷重开只加载索引，数据按需缺页）。
+    mmap_preheat: bool = false,
+    /// 是否并行打开段。默认 **false**：本机实测（25 段 / 索引共 3MB，同轮 A/B）
+    /// 并行 6ms vs 串行 7ms，差异在噪声内，而 IO 争用反而可能更低效；大库可手动打开。
+    parallel_open: bool = false,
 };
 
 /// 范围扫描结果：records 的 key/value 均指向 buf（一次性大缓冲），deinit 只释放 2 块。
@@ -45,8 +51,7 @@ fn refLess(_: void, a: segmod.Segment.RefRecord, b: segmod.Segment.RefRecord) bo
     return a.seq > b.seq;
 }
 
-const MemCursor = struct {
-    it: Skiplist.Iterator,
+const MemCursor = struct {    it: Skiplist.Iterator,
     end: []const u8,
     snapshot: u64,
 
@@ -71,6 +76,109 @@ const ScanCursor = union(enum) {
         };
     }
 };
+
+/// 并行开段的任务（段之间完全独立）。
+const OpenTask = struct {
+    io: std.Io,
+    dir: std.Io.Dir,
+    alloc: std.mem.Allocator,
+    base_path: []const u8,
+    id: u64,
+    preheat: bool,
+    seg: ?segmod.Segment = null,
+    err: ?anyerror = null,
+};
+
+fn openTaskRun(t: *OpenTask) void {
+    const dp = std.fmt.allocPrint(t.alloc, "{s}/seg/{d:0>6}.data", .{ t.base_path, t.id }) catch |e| {
+        t.err = e;
+        return;
+    };
+    defer t.alloc.free(dp);
+    const ip = std.fmt.allocPrint(t.alloc, "{s}/seg/{d:0>6}.idx", .{ t.base_path, t.id }) catch |e| {
+        t.err = e;
+        return;
+    };
+    defer t.alloc.free(ip);
+    t.seg = segmod.Segment.open(t.io, t.dir, dp, ip, t.alloc, t.preheat) catch |e| {
+        t.err = e;
+        return;
+    };
+}
+
+/// 枚举并打开全鄨9段（000001 起，遇缺号即停）。
+/// 段之间完全独立，索引读取是纯 IO + 校验，所以按批并行；单线程构建退化为串行。
+/// 返回「第一个不存在的段号」。
+fn openSegments(
+    io: std.Io,
+    dir: std.Io.Dir,
+    base_path: []const u8,
+    alloc: std.mem.Allocator,
+    preheat: bool,
+    parallel: bool,
+    segs: *std.ArrayList(segmod.Segment),
+) !u64 {
+    const BATCH = 8;
+    var next: u64 = 1;
+    while (true) {
+        var tasks: [BATCH]OpenTask = undefined;
+        var threads: [BATCH]std.Thread = undefined;
+        var launched: [BATCH]bool = @splat(false);
+
+        var k: usize = 0;
+        while (k < BATCH) : (k += 1) {
+            tasks[k] = .{
+                .io = io,
+                .dir = dir,
+                .alloc = alloc,
+                .base_path = base_path,
+                .id = next + k,
+                .preheat = preheat,
+            };
+            // 空库探测：第一段的第一个同步跑（库为空时省掉一批线程创建）
+            if (builtin.single_threaded or !parallel or (next == 1 and k == 0)) {
+                openTaskRun(&tasks[k]);
+            } else if (std.Thread.spawn(.{}, openTaskRun, .{&tasks[k]})) |th| {
+                threads[k] = th;
+                launched[k] = true;
+            } else |_| {
+                openTaskRun(&tasks[k]);
+            }
+        }
+        k = 0;
+        while (k < BATCH) : (k += 1) {
+            if (launched[k]) threads[k].join();
+        }
+
+        // 按 id 顺序合并：遇到缺号即停，缺号之后（含已打开的）全部丢弃
+        var miss_id: ?u64 = null;
+        k = 0;
+        while (k < BATCH) : (k += 1) {
+            if (miss_id != null) {
+                if (tasks[k].seg) |*s| s.close();
+                continue;
+            }
+            if (tasks[k].err) |e| {
+                if (tasks[k].seg) |*s| s.close();
+                if (e == error.FileNotFound) {
+                    miss_id = next + k;
+                    continue;
+                }
+                var j = k + 1;
+                while (j < BATCH) : (j += 1) {
+                    if (tasks[j].seg) |*s| s.close();
+                }
+                for (segs.items) |*s| s.close();
+                segs.clearRetainingCapacity();
+                return e;
+            }
+            try segs.append(alloc, tasks[k].seg.?);
+            tasks[k].seg = null;
+        }
+        if (miss_id) |m| return m;
+        next += BATCH;
+    }
+}
 
 /// 单表引擎（试验版）：memtable + WAL + 不可变段。
 pub const Table = struct {
@@ -129,19 +237,8 @@ pub const Table = struct {
             segs.deinit(alloc);
         }
 
-        var id: u64 = 1;
-        while (true) : (id += 1) {
-            const dp = try alloc.print("{s}/seg/{d:0>6}.data", .{ path, id });
-            defer alloc.free(dp);
-            const ip = try alloc.print("{s}/seg/{d:0>6}.idx", .{ path, id });
-            defer alloc.free(ip);
-            const s = segmod.Segment.open(io, dir, dp, ip, alloc) catch |err| switch (err) {
-                error.FileNotFound => break,
-                else => return err,
-            };
-            seq = @max(seq, s.max_seq);
-            try segs.append(alloc, s);
-        }
+        const id: u64 = try openSegments(io, dir, path, alloc, opts.mmap_preheat, opts.parallel_open, &segs);
+        for (segs.items) |s| seq = @max(seq, s.max_seq);
 
         return .{
             .io = io,
@@ -243,7 +340,7 @@ pub const Table = struct {
         }
         _ = try w.finish(self.dir, idx_path);
 
-        const seg = try segmod.Segment.open(self.io, self.dir, data_path, idx_path, self.alloc);
+        const seg = try segmod.Segment.open(self.io, self.dir, data_path, idx_path, self.alloc, self.opts.mmap_preheat);
         try self.segs.append(self.alloc, seg);
         self.next_seg = id + 1;
 
@@ -298,7 +395,7 @@ pub const Table = struct {
             } });
         }
         for (self.segs.items) |*s| {
-            try cursors.append(self.alloc, .{ .seg = s.cursor(start, end, self.visible) });
+            try cursors.append(self.alloc, .{ .seg = try s.cursor(start, end, self.visible) });
         }
         if (cursors.items.len == 0) return;
 
@@ -380,6 +477,59 @@ test "table put/get/flush/reopen" {
     defer set.deinit();
     try std.testing.expectEqual(@as(usize, 1), set.records.len);
     try std.testing.expectEqualStrings("b", set.records[0].key);
+}
+
+test "table reopen: 懒加载 / 预热 / 并行 三种打开方式结果一致" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-reopen-modes";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    // 写 10 个段（超过并行批大小 8，覆盖第二批与缺号终止）
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        defer t.deinit();
+        var seg_i: usize = 0;
+        while (seg_i < 10) : (seg_i += 1) {
+            var r: usize = 0;
+            while (r < 20) : (r += 1) {
+                var kb: [16]u8 = undefined;
+                var vb: [16]u8 = undefined;
+                const k = try std.fmt.bufPrint(&kb, "k{d:0>3}_{d:0>2}", .{ seg_i, r });
+                const v = try std.fmt.bufPrint(&vb, "v{d:0>3}_{d:0>2}", .{ seg_i, r });
+                try t.put(k, v);
+            }
+            try t.flush();
+        }
+        try std.testing.expectEqual(@as(usize, 10), t.segs.items.len);
+    }
+
+    const modes = [_]struct { name: []const u8, opts: Options }{
+        .{ .name = "lazy", .opts = .{ .wal_sync_every = 0 } },
+        .{ .name = "preheat", .opts = .{ .wal_sync_every = 0, .mmap_preheat = true } },
+        .{ .name = "parallel", .opts = .{ .wal_sync_every = 0, .parallel_open = true } },
+    };
+    for (modes) |m| {
+        var t = try Table.open(io, dir, tmp, alloc, m.opts);
+        try std.testing.expectEqual(@as(usize, 10), t.segs.items.len);
+        try std.testing.expectEqualStrings("v003_07", (try t.get("k003_07", &out)).?);
+        try std.testing.expectEqualStrings("v009_19", (try t.get("k009_19", &out)).?);
+        try std.testing.expect((try t.get("nope", &out)) == null);
+
+        var refs: std.ArrayList(segmod.Segment.RefRecord) = .empty;
+        defer refs.deinit(alloc);
+        try t.scanRefs("k000_00", "k010_00", &refs);
+        try std.testing.expectEqual(@as(usize, 200), refs.items.len);
+        t.deinit();
+    }
 }
 
 test "table scanRefs merges multiple segments" {

@@ -7,6 +7,7 @@
 | 文件 | 含义 |
 |---|---|
 | `zig-<日期>-run<N>.csv` | `spike-zig/zig-out/bin/spike-bench.exe` 的原始 stderr（每行 `metric,count,value`） |
+| `zig-<日期>-<批次>-run<N>.csv` | 同一日期的**分批重测**（如 `reopen` 只重测冷重开相关项），用 `-ZigGlob` 单独出表 |
 | `sqlite-<日期>-run<N>.csv` | `tools/bench-vs-sqlite` 的原始 stdout（同机、同数据集） |
 | `对比-<日期>.md` | 由 `tools/compare-bench.ps1` 从上面两类 CSV **自动生成**的中位数对比表（含 min–max） |
 | `嵌入式-<日期>.csv` | 极小资源档的 `size` 报告（flash/RAM 字节数，见 `docs/架构设计.md` §16.5） |
@@ -39,6 +40,10 @@ cargo build --release --manifest-path tools\bench-vs-sqlite\Cargo.toml
 # 3) 由原始 CSV 生成对比表
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\compare-bench.ps1 `
     -Date <日期> -OutFile docs\实测数据\对比-<日期>.md
+
+# 3b) 同一日期有多批数据（比如只改了冷重开）：用 glob 分批，避免新旧混算中位数
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\compare-bench.ps1 -Date <日期> `
+    -ZigGlob 'zig-<日期>-reopen-run*.csv' -OutFile docs\实测数据\对比-<日期>-reopen.md
 ```
 
 ## 纪律（硬性）

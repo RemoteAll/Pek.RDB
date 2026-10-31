@@ -21,6 +21,7 @@ pub fn main() void {
     row("wal.Op", @sizeOf(spike.wal.Op));
     row("wal.Batch", @sizeOf(spike.wal.Batch));
     row("segment.Segment", @sizeOf(spike.segment.Segment));
+    row("segment.Entry", @sizeOf(spike.segment.Entry));
     row("segment.IndexEntry", @sizeOf(spike.segment.IndexEntry));
     row("segment.RefRecord", @sizeOf(spike.segment.Segment.RefRecord));
     row("segment.RecordOwned", @sizeOf(spike.segment.RecordOwned));
@@ -37,6 +38,7 @@ pub fn main() void {
 
     // 常量区
     row("codec.CRC_TABLE_BYTES", spike.codec.CRC_TABLE_BYTES);
+    row("codec.CRC_FAST_TABLE_BYTES", spike.codec.CRC_FAST_TABLE_BYTES);
     row("codec.Reader", @sizeOf(spike.codec.Reader));
 
     // M0 极小资源档（8KB RAM 目标）
