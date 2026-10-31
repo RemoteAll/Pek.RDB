@@ -165,6 +165,8 @@ pub const Table = struct {
             }
         };
         errdefer if (arch.len > 0) alloc.free(arch);
+        // 归档格式必须对得上：宁可报错，也不能把旧格式按新布局解析出乱数据
+        try segmod.archiveCheckMagic(arch);
 
         if (!has_index) {
             // 新建库（或目录缺失）：把三层目录建好
@@ -399,11 +401,13 @@ pub const Table = struct {
     /// - 删除旧段数据文件
     /// 内存是流式的：不为全部结果分配缓冲（200 万行时那是 100MB+）。
     pub fn compact(self: *Table) !CompactResult {
-        const before = self.segs.items.len;
-        if (before <= 1) return .{ .before = before, .after = before, .rows = 0 };
+        if (self.segs.items.len <= 1) {
+            return .{ .before = self.segs.items.len, .after = self.segs.items.len, .rows = 0 };
+        }
 
         // 先把 memtable 落盘，避免「合并结果 + memtable」重复持有同一批 key
         if (self.mem.len() > 0) try self.flush();
+        const before = self.segs.items.len;
 
         const id = self.next_seg;
         const data_path = try self.alloc.print("{s}/seg/{d:0>6}.data", .{ self.base_path, id });
@@ -423,11 +427,20 @@ pub const Table = struct {
         const fin = try w.finishBytes();
         errdefer self.alloc.free(fin.bytes);
 
-        // 重建归档：只剩这一段（写入临时文件再原子替换）
-        const records = [_]segmod.ArchiveRecord{.{ .id = @intCast(id), .payload = fin.bytes }};
-        self.index_valid_len = try segmod.archiveRewrite(self.io, self.dir, self.index_path, &records);
+        // 关键次序：**先在内存里建好新段**（验证索引可解析），再改磁盘，最后才清理旧段。
+        // 若反过来（先清旧段再建新段），中途失败会让 Table 变成空表，而磁盘上归档已指向新段。
+        const new_seg = try segmod.Segment.fromBytes(self.io, self.dir, self.base_path, id, fin.bytes, self.alloc, true, self.opts.mmap_preheat);
+        errdefer {
+            var s = new_seg;
+            s.owns_idx = false; // 字节由上面的 errdefer 释放
+            s.close();
+        }
 
-        // 关闭旧段并删除它们的数据文件
+        // 重建归档（临时文件 + 原子 rename）：成功后磁盘才指向新段
+        const records = [_]segmod.ArchiveRecord{.{ .id = @intCast(id), .payload = fin.bytes }};
+        self.index_valid_len = try segmod.archiveRewrite(self.io, self.dir, self.index_path, &records, self.alloc);
+
+        // 磁盘已一致，现在才清理旧段与旧归档缓冲
         for (self.segs.items) |*s| {
             const old_id = s.id;
             s.close();
@@ -439,13 +452,7 @@ pub const Table = struct {
         if (self.idx_archive.len > 0) self.alloc.free(self.idx_archive);
         self.idx_archive = &.{};
 
-        const seg = try segmod.Segment.fromBytes(self.io, self.dir, self.base_path, id, fin.bytes, self.alloc, true, self.opts.mmap_preheat);
-        self.segs.append(self.alloc, seg) catch |e| {
-            var s = seg;
-            s.owns_idx = false;
-            s.close();
-            return e;
-        };
+        try self.segs.append(self.alloc, new_seg);
         self.next_seg = id + 1;
 
         return .{ .before = before, .after = self.segs.items.len, .rows = rows };
@@ -470,6 +477,8 @@ pub const MergeIter = struct {
     pub fn init(self: *MergeIter, table: *Table, start: []const u8, end: []const u8) !void {
         self.* = .{ .table = table };
         const alloc = table.alloc;
+        // init 中途失败时要自己清干净：调用方是在 init 成功后才注册 defer deinit 的
+        errdefer self.deinit();
         if (table.mem.len() > 0) {
             try self.cursors.append(alloc, .{ .mem = .{
                 .it = table.mem.iteratorFrom(start),
@@ -478,7 +487,8 @@ pub const MergeIter = struct {
             } });
         }
         for (table.segs.items) |*s| {
-            try self.cursors.append(alloc, .{ .seg = try s.cursor(start, end, table.visible) });
+            const c = try s.cursor(start, end, table.visible);
+            try self.cursors.append(alloc, .{ .seg = c });
         }
         if (self.cursors.items.len > 1) {
             self.cur = try alloc.alloc(?segmod.Segment.RefRecord, self.cursors.items.len);
@@ -810,6 +820,35 @@ test "compact 合并多段后数据一致（含更新与墓碑）" {
         try std.testing.expectEqualStrings("after", (try t.get("zzz", &out)).?);
         try std.testing.expectEqualStrings("UPDATED", (try t.get("k00_00", &out)).?);
     }
+}
+
+test "归档 magic 不匹配必须报错（不能把旧格式按新布局解析）" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-bad-archive";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        try t.put("a", "va");
+        try t.flush();
+        t.deinit();
+    }
+
+    // 把 magic 改成旧版本（模拟旧库 / 归档损坏）
+    {
+        const p = tmp ++ "/seg/index.bin";
+        const w = try dir.createFile(io, p, .{ .read = true, .truncate = false });
+        try w.writePositionalAll(io, "PEKZAG02", 0);
+        w.close(io);
+    }
+
+    try std.testing.expectError(error.BadArchiveMagic, Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 }));
 }
 
 test "table scanRefs merges multiple segments" {

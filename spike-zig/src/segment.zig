@@ -197,6 +197,14 @@ pub const Finished = struct {
 // 只追加不改写，所以 flush 的代价仍是一段索引的大小。
 pub const ARCHIVE_MAGIC = "PEKZAG03";
 
+/// 校验归档文件头。空文件（新建库）视为合法。
+pub fn archiveCheckMagic(bytes: []const u8) !void {
+    if (bytes.len == 0) return;
+    if (bytes.len < ARCHIVE_MAGIC.len or !std.mem.eql(u8, bytes[0..ARCHIVE_MAGIC.len], ARCHIVE_MAGIC)) {
+        return error.BadArchiveMagic;
+    }
+}
+
 pub const ArchiveRecord = struct {
     /// 段号（跟数据文件名里的数字一致）。
     /// **不能靠 record 在文件里的序号推断**：compaction 后新段的段号会比段数大得多。
@@ -240,9 +248,9 @@ fn writeRecord(f: std.Io.File, io: std.Io, at: u64, id: u32, payload: []const u8
 /// 重写整个归档（compaction 用）：写临时文件 → 原子 rename 覆盖目标。
 /// 这样「重写归档途中断电」不会留下半个文件导致整个库打不开。
 /// 返回新的有效末尾。
-pub fn archiveRewrite(io: std.Io, dir: std.Io.Dir, path: []const u8, records: []const ArchiveRecord) !u64 {
-    const tmp_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.tmp", .{path});
-    defer std.heap.page_allocator.free(tmp_path);
+pub fn archiveRewrite(io: std.Io, dir: std.Io.Dir, path: []const u8, records: []const ArchiveRecord, alloc: std.mem.Allocator) !u64 {
+    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
+    defer alloc.free(tmp_path);
 
     var at: u64 = 8;
     {
@@ -263,8 +271,12 @@ pub fn archiveAppend(io: std.Io, dir: std.Io.Dir, path: []const u8, id: u32, pay
     const f = try dir.createFile(io, path, .{ .read = true, .truncate = false });
     defer f.close(io);
     var at = at_in;
-    if (at < 8) {
+    // 用**文件实际长度**判断是否新建：不能只看 `at_in`，因为空库的 valid_len 初值就是 8，
+    // 那样首条 record 会写在没有 magic 的文件头（曾导致 archiveCheckMagic 报 BadArchiveMagic）。
+    if ((try f.stat(io)).size < ARCHIVE_MAGIC.len) {
         try f.writePositionalAll(io, ARCHIVE_MAGIC, 0);
+        at = 8;
+    } else if (at < 8) {
         at = 8;
     }
     const new_end = try writeRecord(f, io, at, id, payload);
