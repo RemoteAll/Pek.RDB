@@ -1,0 +1,12 @@
+# Rust
+/target/
+
+# Zig（0.17 默认产物目录）
+/.zig-cache/
+/zig-out/
+spike-zig/.zig-cache/
+spike-zig/zig-out/
+
+# 本地临时
+*.tmp
+*.log

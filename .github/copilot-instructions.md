@@ -37,6 +37,17 @@ cargo clippy --all-targets -- -D warnings          # 合入前零告警
 - 依赖下载走 `rsproxy`（`.cargo/config.toml` 已配 `[source.crates-io] replace-with`）。
 - 只 Windows 验证不够：涉及 `#[cfg(unix)]` 的改动要补 `cargo check --target x86_64-unknown-linux-musl`。
 
+## Zig 试验（`spike-zig/`，用户 2026-10-31 指定「先试试 Zig」）
+
+- 工具链：**Zig 0.17.0**（`zig version` 校验）；试验边界与退出标准见 `docs/Zig试验方案.md`。
+- **写 Zig 代码前必读**（项目级 skill，来源 `github.com/zigcc/skills` @ `2f9bf9d`，MIT）：
+  - `.github/skills/zig-0-17/SKILL.md`（0.17 API 变更与迁移）
+  - `.github/skills/zig-tiger-style/SKILL.md`（TigerStyle：安全 > 性能 > 开发体验）
+- 0.17 硬变更（已实测）：`std.Io` 统一 IO（`File`/`Dir`/`Mutex` 都要 `io` 参数）、`std.Thread.Mutex` 已移除、
+  `std.ArrayList` 为 unmanaged（`= .empty` + `append(alloc, x)`）、`@backingInt`/`@fromBackingInt`、`@splat`。
+- 构建：`cd spike-zig; zig build test` / `zig build run-bench`；产物目录 `spike-zig/.zig-cache`、`spike-zig/zig-out` 不入库。
+- 试验结论必须实测写入 `docs/决策记录.md`（含数据与命令），不靠印象。
+
 ## 每轮收尾（务必）
 
 ① `docs/决策记录.md` 新增一节（**含用户原话**）；② `tools/continuity/sync-memory.ps1` 同步记忆；
