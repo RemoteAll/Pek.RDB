@@ -1,0 +1,139 @@
+//! SQLite 对照基准（与 spike-zig 的 bench 同数据集、同口径）。
+//!
+//! 口径：
+//! - `journal_mode=WAL`、`synchronous=NORMAL`（SQLite 的常规推荐配置）；
+//! - 1,000,000 行，主键 i64 递增，值 32B；
+//! - `put` = 逐行 autocommit（对应 Zig 侧的逐行 put + 组提交）；
+//! - `put_txn` = 单事务批量插入（对照批量写）；
+//! - `get` = 10 万次随机主键点查（预编译语句）；
+//! - `scan` = 主键范围 1 万行；
+//! - `recover_ms` = 关闭后重开 + 首查耗时。
+
+use std::time::Instant;
+
+use rusqlite::{params, Connection};
+
+const N: i64 = 1_000_000;
+const GET_N: i64 = 100_000;
+const SCAN_LO: i64 = 500_000;
+const SCAN_HI: i64 = 510_000;
+
+fn sqlite_paths() -> (&'static str, &'static str, &'static str) {
+    ("bench-sqlite.db", "bench-sqlite.db-wal", "bench-sqlite.db-shm")
+}
+
+fn cleanup() {
+    let (db, wal, shm) = sqlite_paths();
+    for p in [db, wal, shm] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+fn open_conn() -> rusqlite::Result<Connection> {
+    let (db, _, _) = sqlite_paths();
+    let conn = Connection::open(db)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    Ok(conn)
+}
+
+fn main() -> rusqlite::Result<()> {
+    cleanup();
+
+    let conn = open_conn()?;
+    println!("sqlite_version,{}", rusqlite::version());
+    println!("journal_mode,{}", conn.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))?);
+
+    conn.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)")?;
+    let value = [b'x'; 32];
+
+    // 逐行 autocommit
+    let t0 = Instant::now();
+    {
+        let mut stmt = conn.prepare("INSERT INTO t(id, v) VALUES (?1, ?2)")?;
+        for i in 0..N {
+            stmt.execute(params![i, &value[..]])?;
+        }
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    println!("put,{},{}", N, N as f64 / secs);
+
+    // 单事务批量插入（独立表 t2）
+    conn.execute_batch("CREATE TABLE t2(id INTEGER PRIMARY KEY, v BLOB)")?;
+    let t0 = Instant::now();
+    {
+        conn.execute_batch("BEGIN")?;
+        {
+            let mut stmt = conn.prepare("INSERT INTO t2(id, v) VALUES (?1, ?2)")?;
+            for i in 0..N {
+                stmt.execute(params![i, &value[..]])?;
+            }
+        }
+        conn.execute_batch("COMMIT")?;
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    println!("put_txn,{},{}", N, N as f64 / secs);
+
+    // 点查
+    let t0 = Instant::now();
+    let mut hits: i64 = 0;
+    {
+        let mut stmt = conn.prepare("SELECT v FROM t WHERE id = ?1")?;
+        let mut x: u64 = 88_172_645_463_325_252;
+        for _ in 0..GET_N {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let id = (x % N as u64) as i64;
+            let v: Vec<u8> = stmt.query_row(params![id], |r| r.get(0))?;
+            if !v.is_empty() {
+                hits += 1;
+            }
+        }
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    println!("get,{},{}", GET_N, GET_N as f64 / secs);
+    println!("get_hits,{},{}", GET_N, hits);
+
+    // 范围扫描
+    let t0 = Instant::now();
+    let count: i64 = {
+        let mut stmt = conn.prepare("SELECT id FROM t WHERE id >= ?1 AND id < ?2")?;
+        let mut rows = stmt.query(params![SCAN_LO, SCAN_HI])?;
+        let mut c = 0i64;
+        while rows.next()?.is_some() {
+            c += 1;
+        }
+        c
+    };
+    let secs = t0.elapsed().as_secs_f64();
+    println!("scan,{},{}", count, count as f64 / secs);
+
+    // 范围扫描（带值，与 Zig 侧同口径）
+    let t0 = Instant::now();
+    let mut bytes: i64 = 0;
+    {
+        let mut stmt = conn.prepare("SELECT id, v FROM t WHERE id >= ?1 AND id < ?2")?;
+        let mut rows = stmt.query(params![SCAN_LO, SCAN_HI])?;
+        while let Some(row) = rows.next()? {
+            let _id: i64 = row.get(0)?;
+            let v: Vec<u8> = row.get(1)?;
+            bytes += v.len() as i64;
+        }
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    println!("scan_v,{},{}", bytes / 32, (bytes as f64 / 32.0) / secs);
+
+    drop(conn);
+
+    // 重开 + 首查
+    let t0 = Instant::now();
+    let conn2 = open_conn()?;
+    let _: Vec<u8> = conn2.query_row("SELECT v FROM t WHERE id = ?1", params![12345i64], |r| r.get(0))?;
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    println!("recover,{},{}", N, ms);
+    println!("recover_read,1,1");
+
+    drop(conn2);
+    Ok(())
+}

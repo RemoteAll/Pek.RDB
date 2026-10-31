@@ -16,6 +16,7 @@ pub const Wal = struct {
     io: std.Io,
     file: std.Io.File,
     written: u64 = 0,
+    buf: std.ArrayList(u8) = .empty,
     payload: std.ArrayList(u8) = .empty,
     alloc: std.mem.Allocator,
 
@@ -51,18 +52,29 @@ pub const Wal = struct {
         std.mem.writeInt(u32, hdr[0..4], codec.crc32(self.payload.items), .little);
         std.mem.writeInt(u32, hdr[4..8], @intCast(self.payload.items.len), .little);
 
-        try self.file.writePositionalAll(self.io, &hdr, self.written);
-        try self.file.writePositionalAll(self.io, self.payload.items, self.written + 8);
+        // 先入用户态缓冲，达到阈值或 sync 时批量落盘（组提交）。
+        try self.buf.appendSlice(self.alloc, &hdr);
+        try self.buf.appendSlice(self.alloc, self.payload.items);
         const n = 8 + self.payload.items.len;
-        self.written += n;
+        if (self.buf.items.len >= 256 * 1024) try self.flushBuf();
         return n;
     }
 
+    fn flushBuf(self: *Wal) !void {
+        if (self.buf.items.len == 0) return;
+        try self.file.writePositionalAll(self.io, self.buf.items, self.written);
+        self.written += self.buf.items.len;
+        self.buf.clearRetainingCapacity();
+    }
+
     pub fn sync(self: *Wal) !void {
+        try self.flushBuf();
         try self.file.sync(self.io);
     }
 
     pub fn close(self: *Wal) void {
+        self.flushBuf() catch {};
+        self.buf.deinit(self.alloc);
         self.payload.deinit(self.alloc);
         self.file.close(self.io);
         self.* = undefined;

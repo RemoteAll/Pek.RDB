@@ -166,9 +166,8 @@ pub const Writer = struct {
 // ---------------- 读取 ----------------
 
 pub const Segment = struct {
-    io: std.Io,
-    file: std.Io.File,
     alloc: std.mem.Allocator,
+    data: []u8 = &.{},
     entries: std.ArrayList(IndexEntry) = .empty,
     bits: []u8 = &.{},
     bits_len: u64 = 0,
@@ -176,7 +175,6 @@ pub const Segment = struct {
     min_seq: u64 = 0,
     max_seq: u64 = 0,
     file_size: u64 = 0,
-    read_buf: std.ArrayList(u8) = .empty,
 
     pub fn open(
         io: std.Io,
@@ -193,11 +191,7 @@ pub const Segment = struct {
         if (!std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC)) return error.BadIndexMagic;
 
         var r = codec.Reader{ .buf = idx_bytes[8..] };
-        var seg = Segment{
-            .io = io,
-            .file = undefined,
-            .alloc = alloc,
-        };
+        var seg = Segment{ .alloc = alloc };
         seg.rows = @intCast(try r.u64le());
         seg.min_seq = try r.u64le();
         seg.max_seq = try r.u64le();
@@ -217,8 +211,8 @@ pub const Segment = struct {
         // k 未存进结构：固定 7（与写入一致）
         _ = k;
 
-        seg.file = try dir.openFile(io, data_path, .{});
-        seg.file_size = (try seg.file.stat(io)).size;
+        seg.data = try readWholeFile(io, dir, data_path, alloc, std.math.maxInt(u64));
+        seg.file_size = seg.data.len;
         return seg;
     }
 
@@ -226,8 +220,7 @@ pub const Segment = struct {
         for (self.entries.items) |e| self.alloc.free(e.key);
         self.entries.deinit(self.alloc);
         self.alloc.free(self.bits);
-        self.read_buf.deinit(self.alloc);
-        self.file.close(self.io);
+        self.alloc.free(self.data);
         self.* = undefined;
     }
 
@@ -269,10 +262,8 @@ pub const Segment = struct {
         if (end <= begin) return null;
 
         const n: usize = @intCast(end - begin);
-        self.read_buf.clearRetainingCapacity();
-        try self.read_buf.resize(self.alloc, n);
-        const got = try self.file.readPositionalAll(self.io, self.read_buf.items, begin);
-        const data = self.read_buf.items[0..got];
+        _ = n;
+        const data = self.data[@intCast(begin)..@intCast(end)];
 
         var pos: usize = 0;
         while (pos + 17 <= data.len) {
@@ -311,50 +302,33 @@ pub const Segment = struct {
     ) !void {
         if (self.entries.items.len == 0) return;
         const i = self.candidateIndex(start);
-        var offset: u64 = self.entries.items[i].offset;
+        const begin: usize = @intCast(self.entries.items[i].offset);
+        var pos: usize = begin;
+        const data = self.data;
 
-        const chunk = try self.alloc.alloc(u8, 1 << 20);
-        defer self.alloc.free(chunk);
-        var carry: std.ArrayList(u8) = .empty;
-        defer carry.deinit(self.alloc);
+        while (pos + 17 <= data.len) {
+            const klen: usize = @intCast(std.mem.readInt(u32, data[pos..][0..4], .little));
+            const vlen: usize = @intCast(std.mem.readInt(u32, data[pos + 4 ..][0..4], .little));
+            const seq = std.mem.readInt(u64, data[pos + 8 ..][0..8], .little);
+            const flags = data[pos + 16];
+            const total = 17 + klen + vlen;
+            if (pos + total > data.len) break;
+            const k = data[pos + 17 ..][0..klen];
+            const v = data[pos + 17 + klen ..][0..vlen];
+            pos += total;
 
-        while (offset < self.file_size) {
-            const want: usize = @intCast(@min(@as(u64, chunk.len), self.file_size - offset));
-            const n = try self.file.readPositionalAll(self.io, chunk[0..want], offset);
-            if (n == 0) break;
-            offset += n;
-            try carry.appendSlice(self.alloc, chunk[0..n]);
-
-            var pos: usize = 0;
-            while (carry.items.len - pos >= 17) {
-                const klen: usize = @intCast(std.mem.readInt(u32, carry.items[pos..][0..4], .little));
-                const vlen: usize = @intCast(std.mem.readInt(u32, carry.items[pos + 4 ..][0..4], .little));
-                const seq = std.mem.readInt(u64, carry.items[pos + 8 ..][0..8], .little);
-                const flags = carry.items[pos + 16];
-                const total = 17 + klen + vlen;
-                if (carry.items.len - pos < total) break;
-                const k = carry.items[pos + 17 ..][0..klen];
-                const v = carry.items[pos + 17 + klen ..][0..vlen];
-                pos += total;
-
-                switch (keyCmp(k, end)) {
-                    .gt, .eq => return,
-                    .lt => {},
-                }
-                if (keyCmp(k, start) == .lt) continue;
-                if (seq > snapshot) continue;
-                try out.append(self.alloc, .{
-                    .key = try self.alloc.dupe(u8, k),
-                    .seq = seq,
-                    .flags = flags,
-                    .value = try self.alloc.dupe(u8, v),
-                });
+            switch (keyCmp(k, end)) {
+                .gt, .eq => return,
+                .lt => {},
             }
-            if (pos > 0) {
-                const remain = carry.items.len - pos;
-                std.mem.copyForwards(u8, carry.items[0..remain], carry.items[pos..]);
-                carry.shrinkRetainingCapacity(remain);
-            }
+            if (keyCmp(k, start) == .lt) continue;
+            if (seq > snapshot) continue;
+            try out.append(self.alloc, .{
+                .key = try self.alloc.dupe(u8, k),
+                .seq = seq,
+                .flags = flags,
+                .value = try self.alloc.dupe(u8, v),
+            });
         }
     }
 };

@@ -49,6 +49,9 @@ pub fn main() !void {
         while (i < n) : (i += 1) {
             const kb = keyOf(@intCast(i));
             try t.put(&kb, &value);
+            if (i % 100_000 == 0) {
+                std.debug.print("progress_put,{d},{d}\n", .{ i, (nowNs(io) - t0) / 1_000_000 });
+            }
         }
         try t.wal.sync();
         const ns = nowNs(io) - t0;
@@ -60,6 +63,37 @@ pub fn main() !void {
         try t.flush();
         const ns = nowNs(io) - t0;
         std.debug.print("flush,{d},{d:.0}\n", .{ n, opsPerSec(n, ns) });
+    }
+
+    // 批量写：与 SQLite 单事务批量插入同口径（1M 行一次提交）
+    {
+        const path2 = "bench-data-batch";
+        dir.deleteTree(io, path2) catch {};
+        var t3 = try tablemod.Table.open(io, dir, path2, alloc, .{ .wal_sync_every = 0 });
+        defer {
+            t3.deinit();
+            dir.deleteTree(io, path2) catch {};
+        }
+
+        const keys = try alloc.alloc([]const u8, @intCast(n));
+        defer {
+            for (keys) |k| alloc.free(k);
+            alloc.free(keys);
+        }
+        const vals = try alloc.alloc([]const u8, @intCast(n));
+        defer alloc.free(vals);
+        for (0..@intCast(n)) |i| {
+            const kb = try alloc.alloc(u8, 8);
+            const enc = keyOf(@intCast(i));
+            @memcpy(kb, &enc);
+            keys[i] = kb;
+            vals[i] = &value;
+        }
+
+        const t0 = nowNs(io);
+        try t3.putBatch(keys, vals);
+        const ns = nowNs(io) - t0;
+        std.debug.print("put_batch,{d},{d:.0}\n", .{ n, opsPerSec(n, ns) });
     }
 
     {
@@ -101,5 +135,60 @@ pub fn main() !void {
         const kb = keyOf(12345);
         const v = try t2.get(&kb, &out);
         std.debug.print("recover_read,1,{d}\n", .{@intFromBool(v != null)});
+    }
+
+    // SQL 层同层基准：INSERT 逐行 / PK 点查（解析只做一次，等价于预编译语句）
+    {
+        const path4 = "bench-data-sql";
+        dir.deleteTree(io, path4) catch {};
+        const cols = [_]spike.schema.Column{
+            .{ .name = "id", .col_type = .integer, .primary_key = true },
+            .{ .name = "v", .col_type = .text },
+        };
+        var s = try spike.schema.Schema.init(alloc, "bench_sql", &cols);
+        defer s.deinit(alloc);
+        var t4 = try tablemod.Table.open(io, dir, path4, alloc, .{ .wal_sync_every = 10_000 });
+        defer {
+            t4.deinit();
+            dir.deleteTree(io, path4) catch {};
+        }
+
+        const text_val: []const u8 = &value;
+        const t_sql_put = nowNs(io);
+        var i: u64 = 0;
+        while (i < n) : (i += 1) {
+            var row_vals = [_]spike.sql.Value{ .{ .integer = @intCast(i) }, .{ .text = text_val } };
+            var row = [_][]spike.sql.Value{&row_vals};
+            const ins = spike.sql.Insert{
+                .table = "bench_sql",
+                .columns = &.{ "id", "v" },
+                .rows = &row,
+            };
+            _ = try spike.exec.insertRows(&t4, &s, ins, alloc);
+        }
+        const ns_put = nowNs(io) - t_sql_put;
+        std.debug.print("sql_put,{d},{d:.0}\n", .{ n, opsPerSec(n, ns_put) });
+
+        const t_sql_get = nowNs(io);
+        var hits: u64 = 0;
+        var x: u64 = 88172645463325252;
+        i = 0;
+        while (i < get_n) : (i += 1) {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            var items = [_]spike.sql.SelectItem{ .{ .column = "id" }, .{ .column = "v" } };
+            const sel = spike.sql.Select{
+                .items = &items,
+                .table = "bench_sql",
+                .where = .{ .column = "id", .op = .eq, .value = .{ .integer = @intCast(x % n) } },
+            };
+            var rows = try spike.exec.selectRows(&t4, &s, sel, alloc);
+            if (rows.rows.len > 0) hits += 1;
+            rows.deinit();
+        }
+        const ns_get = nowNs(io) - t_sql_get;
+        std.debug.print("sql_get,{d},{d:.0}\n", .{ get_n, opsPerSec(get_n, ns_get) });
+        std.debug.print("sql_get_hits,{d},{d}\n", .{ get_n, hits });
     }
 }

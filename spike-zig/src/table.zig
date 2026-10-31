@@ -87,6 +87,7 @@ pub const Table = struct {
                 error.FileNotFound => break,
                 else => return err,
             };
+            seq = @max(seq, s.max_seq);
             try segs.append(alloc, s);
         }
 
@@ -138,6 +139,25 @@ pub const Table = struct {
         self.visible = seq;
     }
 
+    /// 批量写：一批一个 WAL 提交（对应 SQLite 的单事务批量插入）。
+    pub fn putBatch(self: *Table, keys: []const []const u8, values: []const []const u8) !void {
+        std.debug.assert(keys.len == values.len);
+        self.seq += 1;
+        const seq = self.seq;
+        var ops: std.ArrayList(walmod.Op) = .empty;
+        defer ops.deinit(self.alloc);
+        try ops.ensureTotalCapacity(self.alloc, keys.len);
+        for (keys, values) |k, v| {
+            ops.appendAssumeCapacity(.{ .flags = 0, .key = k, .value = v });
+        }
+        _ = try self.wal.append(seq, ops.items);
+        for (keys, values) |k, v| {
+            try self.mem.insert(k, seq, 0, v);
+        }
+        self.visible = seq;
+        try self.wal.sync();
+    }
+
     pub fn get(self: *Table, key: []const u8, out: *std.ArrayList(u8)) !?[]const u8 {
         if (self.mem.get(key, self.visible)) |e| {
             if (e.flags != 0) return null;
@@ -177,6 +197,7 @@ pub const Table = struct {
 
         self.mem.reset();
 
+        try self.wal.sync();
         self.wal.close();
         self.dir.deleteFile(self.io, self.wal_path) catch {};
         self.wal = try walmod.Wal.create(self.io, self.dir, self.wal_path, self.alloc);

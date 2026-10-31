@@ -98,20 +98,24 @@ pub const Skiplist = struct {
         pred: *[MAX_HEIGHT]u32,
         succ: *[MAX_HEIGHT]u32,
     ) void {
+        // 关键：从最高层逐层下滑，下一层从上一层停下的节点继续，
+        // 否则每层都从 head 重扫 → 插入退化成 O(n)。
+        var cur: u32 = NIL;
         var lvl: usize = self.height;
         while (lvl > 0) {
             lvl -= 1;
-            var prev: u32 = NIL;
-            var cur: u32 = self.head[lvl];
-            while (cur != NIL) {
-                const n = &self.nodes.items[cur];
+            var p = cur;
+            var c: u32 = if (p == NIL) self.head[lvl] else self.nodes.items[p].next[lvl];
+            while (c != NIL) {
+                const n = &self.nodes.items[c];
                 if (before(self.keyOf(n), n.seq, key, seq)) {
-                    prev = cur;
-                    cur = n.next[lvl];
+                    p = c;
+                    c = n.next[lvl];
                 } else break;
             }
-            pred[lvl] = prev;
-            succ[lvl] = cur;
+            pred[lvl] = p;
+            succ[lvl] = c;
+            cur = p;
         }
     }
 
