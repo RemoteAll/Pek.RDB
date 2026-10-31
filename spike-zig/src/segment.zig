@@ -79,7 +79,18 @@ pub const Writer = struct {
     buf_base: u64 = 0,
     rows: usize = 0,
     entries: std.ArrayList(IndexEntry) = .empty,
-    hashes: std.ArrayList(u64) = .empty,
+    /// Bloom 位图，**创建时按预估行数一次性分配、push 时在线置位**。
+    ///
+    /// 旧做法是「先把每行 hash 收进 `ArrayList(u64)`，收尾时再统一置位」——
+    /// 200 万行时那个数组要 **16MB**，比位图本身（10 bit/key ≈ 2.4MB）还大 6 倍，
+    /// 而且收尾时还要再遍历一遍（缓存完全不友好）。
+    ///
+    /// 在线置位的前提是「位图大小先定」，所以 `create` 要一个 `expected_rows` 上界。
+    /// 估大了只是位图偏大（误报率更低，无副作用）；估小了**仍然正确**——
+    /// 位置按 `bits_len` 取模，行数超过预估只会抬高误报率，不会产生假阴性。
+    bloom: std.ArrayList(u8) = .empty,
+    /// 位图总位数（写进索引头，读取侧按同一个值算位置）。`bloom_bits == 0` 时为 0。
+    bits_len: usize = 0,
     min_seq: u64 = std.math.maxInt(u64),
     max_seq: u64 = 0,
     scratch: std.ArrayList(u8) = .empty,
@@ -88,9 +99,27 @@ pub const Writer = struct {
     /// 四个缓冲是否还没释放（`finishBytes` 成功后置 false）
     buffers_live: bool = true,
 
-    pub fn create(io: std.Io, dir: std.Io.Dir, path: []const u8, alloc: std.mem.Allocator, bloom_bits: u8) !Writer {
+    /// `expected_rows`：本段将写入的行数**上界**，只用于定 Bloom 位图大小。
+    /// `flushImpl` 传 memtable 行数（精确），`compact` 传各段行数之和（上界，去重后更少）。
+    pub fn create(
+        io: std.Io,
+        dir: std.Io.Dir,
+        path: []const u8,
+        alloc: std.mem.Allocator,
+        bloom_bits: u8,
+        expected_rows: usize,
+    ) !Writer {
         const f = try dir.createFile(io, path, .{ .read = true, .truncate = true });
-        return .{ .io = io, .file = f, .alloc = alloc, .bloom_bits = bloom_bits };
+        var w = Writer{ .io = io, .file = f, .alloc = alloc, .bloom_bits = bloom_bits };
+        if (bloom_bits > 0) {
+            w.bits_len = @max(@as(usize, 64), expected_rows * @as(usize, bloom_bits));
+            const bytes_len = (w.bits_len + 7) / 8;
+            // errdefer 连文件一起关：下面 alloc 失败的话，createFile 建的句柄会漏。
+            errdefer f.close(io);
+            try w.bloom.resize(alloc, bytes_len);
+            @memset(w.bloom.items, 0);
+        }
+        return w;
     }
 
     /// 释放缓冲并关闭文件，**幂等**。
@@ -112,7 +141,7 @@ pub const Writer = struct {
     fn releaseBuffers(self: *Writer) void {
         for (self.entries.items) |e| self.alloc.free(e.key);
         self.entries.deinit(self.alloc);
-        self.hashes.deinit(self.alloc);
+        self.bloom.deinit(self.alloc);
         self.buf.deinit(self.alloc);
         self.scratch.deinit(self.alloc);
         self.buffers_live = false;
@@ -139,16 +168,27 @@ pub const Writer = struct {
         try self.scratch.appendSlice(self.alloc, value);
         try self.buf.appendSlice(self.alloc, self.scratch.items);
 
-        if (self.bloom_bits > 0) {
-            const hp = hashPair(key);
-            try self.hashes.append(self.alloc, hp[0]);
-        }
+        if (self.bits_len > 0) self.bloomSet(key);
 
         self.rows += 1;
         self.min_seq = @min(self.min_seq, seq);
         self.max_seq = @max(self.max_seq, seq);
 
         if (self.buf.items.len >= FLUSH_BYTES) try self.flushBuf();
+    }
+
+    /// 在线置位（k = 7）。位置算法与读取侧 `mayContain` 必须逐位一致。
+    fn bloomSet(self: *Writer, key: []const u8) void {
+        const hp = hashPair(key);
+        const h1 = hp[0];
+        const h2 = hp[1];
+        std.debug.assert(self.bits_len > 0);
+        var i: usize = 0;
+        while (i < 7) : (i += 1) {
+            const step: u64 = @as(u64, @intCast(i)) *% h2;
+            const pos: usize = @intCast((h1 +% step) % @as(u64, self.bits_len));
+            self.bloom.items[pos / 8] |= @as(u8, 1) << @intCast(pos % 8);
+        }
     }
 
     fn flushBuf(self: *Writer) !void {
@@ -179,26 +219,11 @@ pub const Writer = struct {
             try idx.appendSlice(self.alloc, e.key);
         }
 
-        // Bloom：默认 10 bit/key、k=7；bloom_bits=0 时 bits_len=0，读取侧 mayContain 直接返回 true
-        const bits_len: usize = if (self.bloom_bits == 0) 0 else @max(@as(usize, 64), self.rows * @as(usize, self.bloom_bits));
-        try codec.putU64le(&idx, self.alloc, bits_len);
+        // Bloom：默认 10 bit/key、k=7；bloom_bits=0 时 bits_len=0，读取侧 mayContain 直接返回 true。
+        // 位图已在 push 期间填好，这里只是把 ownership 挪进索引字节。
+        try codec.putU64le(&idx, self.alloc, self.bits_len);
         try idx.append(self.alloc, 7);
-        if (bits_len > 0) {
-            const bytes_len = (bits_len + 7) / 8;
-            const bits = try self.alloc.alloc(u8, bytes_len);
-            defer self.alloc.free(bits);
-            @memset(bits, 0);
-            for (self.hashes.items) |h1| {
-                const h2 = (h1 *% 0x9E3779B97F4A7C15) | 1;
-                var i: usize = 0;
-                while (i < 7) : (i += 1) {
-                    const step: u64 = @as(u64, @intCast(i)) *% h2;
-                    const pos: usize = @intCast((h1 +% step) % @as(u64, bits_len));
-                    bits[pos / 8] |= @as(u8, 1) << @intCast(pos % 8);
-                }
-            }
-            try idx.appendSlice(self.alloc, bits);
-        }
+        if (self.bits_len > 0) try idx.appendSlice(self.alloc, self.bloom.items);
         try codec.putU64le(&idx, self.alloc, codec.hashIdx(idx.items));
 
         const meta = Meta{
@@ -780,7 +805,7 @@ test "segment idx 被翻位后必须报错（不静默返回错误结果）" {
     try dir.createDirPath(io, tmp);
 
     {
-        var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc, 10);
+        var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc, 10, 2);
         defer w.deinit();
         try w.push("a", 1, 0, "va");
         try w.push("b", 2, 0, "vb");
@@ -813,7 +838,7 @@ test "segment write + point get + scan" {
     defer dir.deleteTree(io, tmp) catch {};
 
     {
-        var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc, 10);
+        var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc, 10, 4);
         defer w.deinit();
         try w.push("a", 1, 0, "va");
         try w.push("b", 2, 0, "vb2");
@@ -872,7 +897,7 @@ test "Writer.deinit 幂等：finishBytes 成功后再调不得二次释放" {
     defer dir.deleteTree(io, tmp) catch {};
     try dir.createDirPath(io, tmp);
 
-    var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc, 10);
+    var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc, 10, 1);
     defer w.deinit();
     try w.push("a", 1, 0, "va");
     const f = try w.finishBytes();
@@ -895,7 +920,7 @@ fn writerAttempt(alloc: std.mem.Allocator) !void {
     try dir.createDirPath(io, tmp);
     defer dir.deleteTree(io, tmp) catch {};
 
-    var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc, 10);
+    var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc, 10, 3);
     defer w.deinit();
     try w.push("aaaa", 1, 0, "va");
     try w.push("bbbb", 2, 0, "vb");
@@ -908,4 +933,67 @@ test "Writer 在任意分配失败点都必须释放缓冲与句柄（不泄漏�
     // checkAllAllocationFailures 会逐个分配点注入 OOM：每个失败点都要求
     // ① 返回 error（不 abort/panic）② 无泄漏。没有 `defer w.deinit()` 时这条会挂。
     try std.testing.checkAllAllocationFailures(std.testing.allocator, writerAttempt, .{});
+}
+
+test "Bloom 在线累积：位图大小由预估行数定，行数超预估也不产生假阴性" {
+    // 在线置位（push 时写位图）省掉了「先收 200 万行 hash 再统一置位」的 16MB 数组，
+    // 代价是位图大小必须**提前**确定 → create 要一个 expected_rows。这里守两条：
+    //   ① 位图大小 = max(64, expected_rows * bloom_bits)，证明预估真的生效；
+    //   ② 实际行数远超预估时**仍无假阴性**（Bloom 只有假阳性没有假阴性）——
+    //      位置按 bits_len 取模，写多了只抬高误报率，不会让存在的 key 查不到。
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-seg-bloom-tmp";
+    dir.deleteTree(io, tmp) catch {};
+    try dir.createDirPath(io, tmp);
+    defer dir.deleteTree(io, tmp) catch {};
+
+    const n: usize = 50;
+    {
+        // 预估只有 2 行 -> bits_len = 64；实际写 50 行，位图严重偏小
+        var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc, 10, 2);
+        defer w.deinit();
+        try std.testing.expectEqual(@as(usize, 64), w.bits_len);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            var k: [8]u8 = undefined;
+            std.mem.writeInt(u64, &k, @as(u64, @intCast(i)), .big);
+            try w.push(&k, @intCast(i + 1), 0, "v");
+        }
+        _ = try w.finish(dir, tmp ++ "/000001.idx");
+    }
+
+    var seg = try Segment.open(io, dir, tmp ++ "/000001.data", tmp ++ "/000001.idx", alloc, false);
+    defer seg.close();
+    try std.testing.expectEqual(@as(usize, n), seg.rows);
+    try std.testing.expectEqual(@as(u64, 64), seg.bits_len);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        var k: [8]u8 = undefined;
+        std.mem.writeInt(u64, &k, @as(u64, @intCast(i)), .big);
+        if ((try seg.get(&k, @intCast(i + 1), &out)) == null) {
+            std.debug.print("假阴性：i={d}\n", .{i});
+            return error.BloomFalseNegative;
+        }
+    }
+
+    // 反向验证：bloom_bits = 0 时不分配位图，bits_len 写 0（读取侧 mayContain 恒 true）
+    {
+        var w = try Writer.create(io, dir, tmp ++ "/000002.data", alloc, 0, 4);
+        defer w.deinit();
+        try std.testing.expectEqual(@as(usize, 0), w.bits_len);
+        try std.testing.expectEqual(@as(usize, 0), w.bloom.items.len);
+        try w.push("a", 1, 0, "va");
+        _ = try w.finish(dir, tmp ++ "/000002.idx");
+    }
+    var seg2 = try Segment.open(io, dir, tmp ++ "/000002.data", tmp ++ "/000002.idx", alloc, false);
+    defer seg2.close();
+    try std.testing.expectEqual(@as(u64, 0), seg2.bits_len);
 }

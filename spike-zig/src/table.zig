@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
+﻿// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
 // 个人使用免费；商业使用需商业授权，或同样以 AGPL-3.0 开源（见 LICENSE）。
 const std = @import("std");
 const Skiplist = @import("skiplist.zig").Skiplist;
@@ -407,7 +407,7 @@ pub const Table = struct {
         // 不删代价只是多一个文件，而且 `next_seg` 没递增、下次 flush 会用同一路径覆盖，天然自愈；
         // 万一是「写成功但没回传」的情况，保留它反而能恢复到一致状态。
 
-        var w = try segmod.Writer.create(self.io, self.dir, data_path, self.alloc, self.opts.bloom_bits);
+        var w = try segmod.Writer.create(self.io, self.dir, data_path, self.alloc, self.opts.bloom_bits, self.mem.len());
         defer w.deinit();
         var it = self.mem.iterator();
         while (it.next()) |e| {
@@ -512,7 +512,12 @@ pub const Table = struct {
         var orphan_maybe = true;
         errdefer if (orphan_maybe) self.dir.deleteFile(self.io, data_path) catch {};
 
-        var w = try segmod.Writer.create(self.io, self.dir, data_path, self.alloc, self.opts.bloom_bits);
+        // Bloom 位图要预先定大小，这里给一个上界：各段行数之和（去重后只会更少）。
+        // 估大只会让位图偏大（误报率更低）；估小也不出错，见 `Writer.create` 的说明。
+        var expected_rows: usize = 0;
+        for (self.segs.items) |s| expected_rows +|= s.rows;
+
+        var w = try segmod.Writer.create(self.io, self.dir, data_path, self.alloc, self.opts.bloom_bits, expected_rows);
         defer w.deinit();
         var rows: usize = 0;
         {

@@ -432,6 +432,106 @@ pub fn selectRows(
     return buildOutput(alloc, s, &m, proj, start, end);
 }
 
+/// 流式查询：逐行解码到**复用的 scratch**，回调消费，**不物化结果集**。
+///
+/// 这是 SQLite `sqlite3_step` 的等价物（PostgreSQL 的 slot、DuckDB 的 chunk 同理）。
+/// 成熟数据库一律不把结果集攒在内存里，而是「游标 + 复用槽位」：
+/// `sqlite3_step` 每步只重填 `ncols` 个 `Mem`，整个查询期间结果集侧的分配是 **0**。
+///
+/// 对比一下我们的 `selectRows`：100 万行 × 2 列要分配
+/// `flat` 48MB + `buf` 32MB + `hdrs` 16MB ≈ 96MB，而真实数据只有 32MB。
+/// 这段差距不是「算法慢」，是**接口逼着物化**——在 `selectRows` 里再怎么调优也填不平。
+///
+/// 回调收到的一行**只在回调期间有效**：text/blob 直接指向段 mmap / memtable 缓冲。
+/// 要保留必须自己复制。这是省掉 96MB 的代价，也是这个 API 唯一的坑。
+///
+/// 有 ORDER BY 时无法流式（排序天然要看完全部候选），内部回退到 `selectRows`。
+pub fn forEachRow(
+    t: *tablemod.Table,
+    s: *const schema_mod.Schema,
+    sel: sql.Select,
+    alloc: std.mem.Allocator,
+    ctx: anytype,
+    cb: anytype,
+) !usize {
+    // PK 等值 / ORDER BY 这两条路本来就只需一行或必须全量，物化代价可忽略，
+    // 直接复用 `selectRows` 的既有逻辑再回放，避免两处各写一份语义。
+    const must_materialize = blk: {
+        if (sel.order_by.len > 0) break :blk true;
+        if (sel.where) |w| {
+            if (w.op == .eq) {
+                if (s.indexOf(w.column)) |idx| {
+                    if (idx == s.pk_index) break :blk true;
+                }
+            }
+        }
+        break :blk false;
+    };
+    if (must_materialize) {
+        var rows = try selectRows(t, s, sel, alloc);
+        defer rows.deinit();
+        for (rows.rows) |r| try cb(ctx, r);
+        return rows.rows.len;
+    }
+
+    const proj = try buildProjection(alloc, s, sel.items);
+    defer {
+        for (proj.columns) |c| alloc.free(c);
+        alloc.free(proj.columns);
+        alloc.free(proj.indices);
+    }
+
+    // 全列复用槽位：每行都写回这一份，绝不按行分配。
+    const scratch = try alloc.alloc(sql.Value, s.columns.len);
+    defer alloc.free(scratch);
+
+    var identity = proj.indices.len == s.columns.len;
+    if (identity) {
+        for (proj.indices, 0..) |ci, i| {
+            if (ci != i) {
+                identity = false;
+                break;
+            }
+        }
+    }
+    // 非恒等投影：复用同一个小缓冲，每行只搬选中的列（不按行分配）。
+    const pbuf = try alloc.alloc(sql.Value, proj.indices.len);
+    defer alloc.free(pbuf);
+
+    const widx: ?usize = if (sel.where) |w| s.indexOf(w.column) orelse return error.ColumnNotFound else null;
+    const off: usize = sel.offset orelse 0;
+    const lim: ?usize = if (sel.limit) |l| @as(usize, l) else null;
+
+    var seen: usize = 0;
+    var emitted: usize = 0;
+
+    var hi: [16]u8 = @splat(0xFF);
+    var it = tablemod.MergeIter{};
+    try it.init(t, &.{}, &hi);
+    defer it.deinit();
+
+    while (it.next()) |rec| {
+        // 先判 LIMIT 再解码：凑够了就停，不多解一行（与 `selectRows` 的提前终止同口径）。
+        if (lim) |l| {
+            if (emitted >= l) break;
+        }
+        try s.decodeRowInto(scratch, rec.value);
+        if (sel.where) |w| {
+            if (!evalWhere(scratch[widx.?], w.op, w.value)) continue;
+        }
+        seen += 1;
+        if (seen <= off) continue;
+        if (identity) {
+            try cb(ctx, scratch);
+        } else {
+            for (proj.indices, 0..) |ci, k| pbuf[k] = scratch[ci];
+            try cb(ctx, pbuf);
+        }
+        emitted += 1;
+    }
+    return emitted;
+}
+
 test "insert + select with where/order/limit" {
     const alloc = std.testing.allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
@@ -601,5 +701,116 @@ test "select LIMIT 提前终止：只读 offset+limit 行，不扫全表" {
         defer rows.deinit();
         try std.testing.expectEqual(c.want, rows.rows.len);
         try std.testing.expectEqual(c.read, t.scan_rows_read);
+    }
+}
+
+
+const Collect = struct {
+    rows: std.ArrayList([]sql.Value) = .empty,
+    alloc: std.mem.Allocator,
+
+    /// **必须深拷贝 text/blob**：流式 API 的回调参数只在回调期间有效
+    /// （text 指向段 mmap / memtable / 物化回退的临时 buf）。只存 Value 数组会留下野指针。
+    fn add(self: *Collect, row: []const sql.Value) !void {
+        const dup = try self.alloc.alloc(sql.Value, row.len);
+        errdefer self.alloc.free(dup);
+        var filled: usize = 0;
+        errdefer for (dup[0..filled]) |v| switch (v) {
+            .text => |s| self.alloc.free(s),
+            .blob => |s| self.alloc.free(s),
+            else => {},
+        };
+        for (row, 0..) |v, i| {
+            dup[i] = switch (v) {
+                .text => |s| .{ .text = try self.alloc.dupe(u8, s) },
+                .blob => |s| .{ .blob = try self.alloc.dupe(u8, s) },
+                else => v,
+            };
+            filled += 1;
+        }
+        try self.rows.append(self.alloc, dup);
+    }
+
+    fn deinit(self: *Collect) void {
+        for (self.rows.items) |r| {
+            for (r) |v| switch (v) {
+                .text => |s| self.alloc.free(s),
+                .blob => |s| self.alloc.free(s),
+                else => {},
+            };
+            self.alloc.free(r);
+        }
+        self.rows.deinit(self.alloc);
+    }
+};
+
+test "forEachRow 与 selectRows 结果逐行一致（where/limit/offset/投影/排序/PK 等值）" {
+    // 流式 API 省掉整个结果集物化，但如果结果和物化路径不一致就是灾难。
+    // 两条路径在同一张表上跑同一批语句，逐行逐列比对。
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-exec-each-tmp";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    const cols = [_]schema_mod.Column{
+        .{ .name = "id", .col_type = .integer, .primary_key = true },
+        .{ .name = "n", .col_type = .integer },
+        .{ .name = "s", .col_type = .text },
+    };
+    var s = try schema_mod.Schema.init(alloc, "t", &cols);
+    defer s.deinit(alloc);
+    var t = try tablemod.Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+
+    var i: i64 = 0;
+    while (i < 200) : (i += 1) {
+        var vals = [_]sql.Value{ .{ .integer = i }, .{ .integer = @mod(i, 7) }, .{ .text = "x" } };
+        var row = [_][]sql.Value{&vals};
+        _ = try insertRows(&t, &s, .{ .table = "t", .columns = &.{ "id", "n", "s" }, .rows = &row }, alloc);
+    }
+
+    var star = [_]sql.SelectItem{.{ .star = {} }};
+    var only_id = [_]sql.SelectItem{.{ .column = "id" }};
+    var two = [_]sql.SelectItem{ .{ .column = "n" }, .{ .column = "id" } };
+    var order_desc = [_]sql.OrderItem{.{ .column = "id", .desc = true }};
+    const w_n3 = sql.Expr{ .column = "n", .op = .eq, .value = .{ .integer = 3 } };
+    const w_id42 = sql.Expr{ .column = "id", .op = .eq, .value = .{ .integer = 42 } };
+
+    const cases = [_]sql.Select{
+        .{ .items = &star, .table = "t" },
+        .{ .items = &star, .table = "t", .where = w_n3 },
+        .{ .items = &star, .table = "t", .limit = 7 },
+        .{ .items = &star, .table = "t", .offset = 5, .limit = 7 },
+        .{ .items = &only_id, .table = "t", .limit = 11 },
+        .{ .items = &two, .table = "t", .offset = 3, .limit = 9 },
+        .{ .items = &star, .table = "t", .order_by = &order_desc, .limit = 5 },
+        .{ .items = &star, .table = "t", .where = w_id42 },
+        .{ .items = &star, .table = "t", .limit = 0 },
+    };
+
+    for (cases, 0..) |sel, ci| {
+        var mat = try selectRows(&t, &s, sel, alloc);
+        defer mat.deinit();
+        var col = Collect{ .alloc = alloc };
+        defer col.deinit();
+        const n = try forEachRow(&t, &s, sel, alloc, &col, Collect.add);
+        if (n != mat.rows.len or n != col.rows.items.len) {
+            std.debug.print("case {d}: 行数不一致 each={d} mat={d} got={d}\n", .{ ci, n, mat.rows.len, col.rows.items.len });
+            return error.RowCountMismatch;
+        }
+        for (mat.rows, col.rows.items) |want, got| {
+            if (want.len != got.len) return error.ColCountMismatch;
+            for (want, got) |w, g| {
+                if (schema_mod.valueCmp(w, g) != .eq) {
+                    std.debug.print("case {d}: 值不一致\n", .{ci});
+                    return error.ValueMismatch;
+                }
+            }
+        }
     }
 }

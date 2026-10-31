@@ -14,6 +14,12 @@ fn nowNs(io: std.Io) u64 {
     return @intCast(ts.nanoseconds);
 }
 
+/// 流式基准的消费回调：只数行，不保留任何东西。
+/// 真实系统里对应「边读边算 / 边读边发」——这正是 SQLite `while rows.next()` 的用法。
+fn countRow(cnt: *usize, row: []const spike.sql.Value) anyerror!void {
+    if (row.len > 0) cnt.* += 1;
+}
+
 fn keyOf(v: i64) [8]u8 {
     var b: [8]u8 = undefined;
     codec.encodeI64Key(&b, v);
@@ -314,6 +320,21 @@ fn benchMain() !void {
             defer rows.deinit();
             std.debug.print("sql_full,{d},{d:.0}\n", .{ rows.rows.len, opsPerSec(@intCast(rows.rows.len), ns) });
             std.debug.print("sql_full_readrows,{d},0\n", .{t4.scan_rows_read});
+        }
+        // 流式（不物化）：SQLite `while rows.next()` 的等价物。
+        // 与上面的 sql_full 跑同一条语句、同一张表，唯一差别是**消费方式**：
+        // 物化要 flat 48MB + buf 32MB + hdrs 16MB，流式只有几个复用槽位。
+        // 这一对数字才是「同一件事」的对比 —— 之前拿我们的物化比 SQLite 的流式，本身就不对等。
+        {
+            var items_e = [_]spike.sql.SelectItem{.{ .star = {} }};
+            const sel_e = spike.sql.Select{ .items = &items_e, .table = "bench_sql" };
+            var cnt: usize = 0;
+            t4.scan_rows_read = 0;
+            const t0 = nowNs(io);
+            _ = try spike.exec.forEachRow(&t4, &s, sel_e, alloc, &cnt, countRow);
+            const ns = nowNs(io) - t0;
+            std.debug.print("sql_each,{d},{d:.0}\n", .{ cnt, opsPerSec(@intCast(cnt), ns) });
+            std.debug.print("sql_each_readrows,{d},0\n", .{t4.scan_rows_read});
         }
     }
 

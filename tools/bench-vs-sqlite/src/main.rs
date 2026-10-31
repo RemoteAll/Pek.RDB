@@ -1,4 +1,4 @@
-//! SQLite 对照基准（与 spike-zig 的 bench 同数据集、同口径）。
+﻿//! SQLite 对照基准（与 spike-zig 的 bench 同数据集、同口径）。
 //!
 //! 口径：
 //! - `journal_mode=WAL`、`synchronous=NORMAL`（SQLite 的常规推荐配置）；
@@ -11,7 +11,7 @@
 
 use std::time::Instant;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, types::ValueRef, Connection};
 
 const N: i64 = 1_000_000;
 const GET_N: i64 = 100_000;
@@ -359,6 +359,30 @@ fn main() -> rusqlite::Result<()> {
             }
             let secs = t0.elapsed().as_secs_f64();
             println!("sql_full,{},{}", n, n as f64 / secs);
+        }
+        // 上面的 sql_full 只推进游标、**不取列值**。SQLite 的 `OP_Column` 是惰性的：
+        // 不调用 `column_*` 就根本不解码，所以那个数字只代表「游标推进」。
+        // 这一档把两列都真读出来（都用零拷贝，不 malloc）：
+        //   id -> i64 值拷贝；v -> `get_ref` 取切片，与 Zig 侧「text 指向 mmap 不复制」同口径。
+        // 这才是与 `sql_each`（我们每行都完整解码两列）对等的比较。
+        {
+            let t0 = Instant::now();
+            let mut n: usize = 0;
+            let mut acc: i64 = 0;
+            {
+                let mut stmt = c3.prepare("SELECT * FROM t")?;
+                let mut rows = stmt.query([])?;
+                while let Some(r) = rows.next()? {
+                    acc = acc.wrapping_add(r.get::<_, i64>(0)?);
+                    if let Ok(ValueRef::Blob(b)) = r.get_ref(1) {
+                        acc = acc.wrapping_add(b.len() as i64);
+                    }
+                    n += 1;
+                }
+            }
+            let secs = t0.elapsed().as_secs_f64();
+            println!("sql_full_touch,{},{}", n, n as f64 / secs);
+            println!("sql_full_touch_acc,{},{}", n, acc);
         }
         drop(c3);
     }
