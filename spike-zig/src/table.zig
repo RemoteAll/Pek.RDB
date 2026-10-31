@@ -12,6 +12,9 @@ pub const Options = struct {
     wal_sync_every: usize = 10_000,
     /// 打开段时是否把整个数据文件读进页缓存（默认关：冷重开只加载索引，数据按需缺页）。
     mmap_preheat: bool = false,
+    /// 新段索引的 Bloom 位数/key（0 = 不生成）。
+    /// Bloom 占索引体积 ~80%，只对「不存在的 key」有用；关闭后冷重开与索引 IO 同步变小。
+    bloom_bits: u8 = 10,
 };
 
 /// 范围扫描结果：records 的 key/value 均指向 buf（一次性大缓冲），deinit 只释放 2 块。
@@ -90,9 +93,7 @@ fn openSegmentsFromArchive(
     while (it.next()) |payload| : (id += 1) {
         var ta: u64 = 0;
         if (segmod.timing_enabled) ta = segmod.tick(io);
-        const dp = try std.fmt.allocPrint(alloc, "{s}/seg/{d:0>6}.data", .{ base_path, id });
-        defer alloc.free(dp);
-        const seg = try segmod.Segment.fromBytes(io, dir, dp, payload, alloc, false, preheat);
+        const seg = try segmod.Segment.fromBytes(io, dir, base_path, id, payload, alloc, false, preheat);
         if (segmod.timing_enabled) {
             const tb = segmod.tick(io);
             segmod.timing.mkseg += tb - ta;
@@ -137,13 +138,33 @@ pub const Table = struct {
         var t0: u64 = 0;
         if (segmod.timing_enabled) t0 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
 
-        try dir.createDirPath(io, path);
-        const wal_dir = try alloc.print("{s}/wal", .{path});
-        defer alloc.free(wal_dir);
-        try dir.createDirPath(io, wal_dir);
-        const seg_dir = try alloc.print("{s}/seg", .{path});
-        defer alloc.free(seg_dir);
-        try dir.createDirPath(io, seg_dir);
+        const index_path = try alloc.print("{s}/seg/index.bin", .{path});
+        errdefer alloc.free(index_path);
+
+        // 索引文件读得到 ⇒ 库已初始化 ⇒ 目录一定存在，直接跳过 3 次 createDirPath
+        // （实测 createDirPath × 3 在冷重开里占 0.2–0.8ms）。
+        var arch: []u8 = &.{};
+        const has_index = blk: {
+            if (segmod.readWholeFile(io, dir, index_path, alloc, 16 << 30)) |a| {
+                arch = a;
+                break :blk true;
+            } else |e| switch (e) {
+                error.FileNotFound => break :blk false,
+                else => return e,
+            }
+        };
+        errdefer if (arch.len > 0) alloc.free(arch);
+
+        if (!has_index) {
+            // 新建库（或目录缺失）：把三层目录建好
+            try dir.createDirPath(io, path);
+            const wal_dir = try alloc.print("{s}/wal", .{path});
+            defer alloc.free(wal_dir);
+            try dir.createDirPath(io, wal_dir);
+            const seg_dir = try alloc.print("{s}/seg", .{path});
+            defer alloc.free(seg_dir);
+            try dir.createDirPath(io, seg_dir);
+        }
 
         if (segmod.timing_enabled) {
             const t1 = @as(u64, @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds));
@@ -188,19 +209,6 @@ pub const Table = struct {
             for (segs.items) |*s| s.close();
             segs.deinit(alloc);
         }
-
-        const index_path = try alloc.print("{s}/seg/index.bin", .{path});
-        errdefer alloc.free(index_path);
-
-        // 一次读入全部段索引（冷重开的唯一 IO）；库为空时文件不存在
-        var arch: []u8 = &.{};
-        if (segmod.readWholeFile(io, dir, index_path, alloc, 16 << 30)) |a| {
-            arch = a;
-        } else |e| switch (e) {
-            error.FileNotFound => {},
-            else => return e,
-        }
-        errdefer if (arch.len > 0) alloc.free(arch);
 
         try openSegmentsFromArchive(io, dir, path, arch, alloc, opts.mmap_preheat, &segs);
         const id: u64 = @intCast(segs.items.len + 1);
@@ -306,7 +314,7 @@ pub const Table = struct {
         const data_path = try self.alloc.print("{s}/seg/{d:0>6}.data", .{ self.base_path, id });
         defer self.alloc.free(data_path);
 
-        var w = try segmod.Writer.create(self.io, self.dir, data_path, self.alloc);
+        var w = try segmod.Writer.create(self.io, self.dir, data_path, self.alloc, self.opts.bloom_bits);
         var it = self.mem.iterator();
         while (it.next()) |e| {
             try w.push(e.key, e.seq, e.flags, e.value);
@@ -316,7 +324,7 @@ pub const Table = struct {
         errdefer self.alloc.free(fin.bytes);
         _ = try segmod.archiveAppend(self.io, self.dir, self.index_path, fin.bytes);
 
-        const seg = try segmod.Segment.fromBytes(self.io, self.dir, data_path, fin.bytes, self.alloc, true, self.opts.mmap_preheat);
+        const seg = try segmod.Segment.fromBytes(self.io, self.dir, self.base_path, id, fin.bytes, self.alloc, true, self.opts.mmap_preheat);
         self.segs.append(self.alloc, seg) catch |e| {
             var s = seg;
             s.close();

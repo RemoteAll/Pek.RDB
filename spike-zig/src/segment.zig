@@ -63,6 +63,10 @@ pub const Writer = struct {
     io: std.Io,
     file: std.Io.File,
     alloc: std.mem.Allocator,
+    /// Bloom 位数/key（0 = 不生成 Bloom）。默认 10（误报率 ~1%）。
+    /// Bloom 占索引体积的 ~80%（200 万行时 2.4MB / 3.1MB），而它只对「不存在的 key」有用，
+    /// 所以做成可配：关掉后索引只剩稀疏索引，冷重开与索引 IO 同步变小。
+    bloom_bits: u8 = 10,
     buf: std.ArrayList(u8) = .empty,
     buf_base: u64 = 0,
     rows: usize = 0,
@@ -72,9 +76,9 @@ pub const Writer = struct {
     max_seq: u64 = 0,
     scratch: std.ArrayList(u8) = .empty,
 
-    pub fn create(io: std.Io, dir: std.Io.Dir, path: []const u8, alloc: std.mem.Allocator) !Writer {
+    pub fn create(io: std.Io, dir: std.Io.Dir, path: []const u8, alloc: std.mem.Allocator, bloom_bits: u8) !Writer {
         const f = try dir.createFile(io, path, .{ .read = true, .truncate = true });
-        return .{ .io = io, .file = f, .alloc = alloc };
+        return .{ .io = io, .file = f, .alloc = alloc, .bloom_bits = bloom_bits };
     }
 
     pub fn push(self: *Writer, key: []const u8, seq: u64, flags: u8, value: []const u8) !void {
@@ -94,8 +98,10 @@ pub const Writer = struct {
         try self.scratch.appendSlice(self.alloc, value);
         try self.buf.appendSlice(self.alloc, self.scratch.items);
 
-        const hp = hashPair(key);
-        try self.hashes.append(self.alloc, hp[0]);
+        if (self.bloom_bits > 0) {
+            const hp = hashPair(key);
+            try self.hashes.append(self.alloc, hp[0]);
+        }
 
         self.rows += 1;
         self.min_seq = @min(self.min_seq, seq);
@@ -131,24 +137,26 @@ pub const Writer = struct {
             try idx.appendSlice(self.alloc, e.key);
         }
 
-        // Bloom：10 bit/key，k=7
-        const bits_len: usize = @max(@as(usize, 64), self.rows * 10);
-        const bytes_len = (bits_len + 7) / 8;
-        const bits = try self.alloc.alloc(u8, bytes_len);
-        defer self.alloc.free(bits);
-        @memset(bits, 0);
-        for (self.hashes.items) |h1| {
-            const h2 = (h1 *% 0x9E3779B97F4A7C15) | 1;
-            var i: usize = 0;
-            while (i < 7) : (i += 1) {
-                const step: u64 = @as(u64, @intCast(i)) *% h2;
-                const pos: usize = @intCast((h1 +% step) % @as(u64, bits_len));
-                bits[pos / 8] |= @as(u8, 1) << @intCast(pos % 8);
-            }
-        }
+        // Bloom：默认 10 bit/key、k=7；bloom_bits=0 时 bits_len=0，读取侧 mayContain 直接返回 true
+        const bits_len: usize = if (self.bloom_bits == 0) 0 else @max(@as(usize, 64), self.rows * @as(usize, self.bloom_bits));
         try codec.putU64le(&idx, self.alloc, bits_len);
         try idx.append(self.alloc, 7);
-        try idx.appendSlice(self.alloc, bits);
+        if (bits_len > 0) {
+            const bytes_len = (bits_len + 7) / 8;
+            const bits = try self.alloc.alloc(u8, bytes_len);
+            defer self.alloc.free(bits);
+            @memset(bits, 0);
+            for (self.hashes.items) |h1| {
+                const h2 = (h1 *% 0x9E3779B97F4A7C15) | 1;
+                var i: usize = 0;
+                while (i < 7) : (i += 1) {
+                    const step: u64 = @as(u64, @intCast(i)) *% h2;
+                    const pos: usize = @intCast((h1 +% step) % @as(u64, bits_len));
+                    bits[pos / 8] |= @as(u8, 1) << @intCast(pos % 8);
+                }
+            }
+            try idx.appendSlice(self.alloc, bits);
+        }
         try codec.putU64le(&idx, self.alloc, codec.hashIdx(idx.items));
 
         const meta = Meta{
@@ -266,8 +274,11 @@ pub const Segment = struct {
     io: std.Io,
     alloc: std.mem.Allocator,
     dir: std.Io.Dir = undefined,
-    /// 数据文件路径（延迟打开用；close 时释放）
-    data_path: []u8 = &.{},
+    /// 数据文件定位：`id == 0` 时 base_path 就是完整路径（单段场景）；
+    /// `id > 0` 时首次读数据才拼 `{base_path}/seg/{id:0>6}.data`。
+    /// 这样做是为了让重开时**不碰字符串**（25 段 × 拼路径 + 分配实测占 0.3ms）。
+    base_path: []const u8 = &.{},
+    id: u64 = 0,
     preheat: bool = false,
     mapped: bool = false,
     data: []const u8 = &.{},
@@ -314,15 +325,17 @@ pub const Segment = struct {
         var seg = Segment{ .io = io, .alloc = alloc, .idx = idx_bytes, .owns_idx = true };
         errdefer seg.entries.deinit(alloc);
         try seg.parseIdxBytes(idx_bytes);
-        try seg.attach(dir, data_path, preheat);
+        try seg.attach(dir, data_path, 0, preheat);
         return seg;
     }
 
     /// 从聚合索引里的切片构造（不读文件；`take_ownership` 决定是否接管这块内存）。
+    /// `base_path` + `id` 只是记下位置，路径拼装推迟到首次读数据。
     pub fn fromBytes(
         io: std.Io,
         dir: std.Io.Dir,
-        data_path: []const u8,
+        base_path: []const u8,
+        id: u64,
         payload: []const u8,
         alloc: std.mem.Allocator,
         take_ownership: bool,
@@ -336,14 +349,15 @@ pub const Segment = struct {
         };
         errdefer seg.entries.deinit(alloc);
         try seg.parseIdxBytes(payload);
-        try seg.attach(dir, data_path, preheat);
+        try seg.attach(dir, base_path, id, preheat);
         return seg;
     }
 
-    fn attach(self: *Segment, dir: std.Io.Dir, data_path: []const u8, preheat: bool) !void {
+    fn attach(self: *Segment, dir: std.Io.Dir, base_path: []const u8, id: u64, preheat: bool) !void {
         // 数据文件延迟打开 + 延迟 mmap（冷重开只做索引）；preheat=true 时立即建视图。
         self.dir = dir;
-        self.data_path = try self.alloc.dupe(u8, data_path);
+        self.base_path = base_path;
+        self.id = id;
         self.preheat = preheat;
         if (preheat) _ = try self.dataView();
     }
@@ -400,11 +414,19 @@ pub const Segment = struct {
     fn dataView(self: *Segment) ![]const u8 {
         if (self.mapped) return self.data;
         self.mapped = true;
-        if (self.data_path.len == 0) return self.data;
+        if (self.base_path.len == 0) return self.data;
+
+        var tmp: ?[]u8 = null;
+        defer if (tmp) |p| self.alloc.free(p);
+        const path: []const u8 = if (self.id == 0) self.base_path else blk: {
+            const p = try std.fmt.allocPrint(self.alloc, "{s}/seg/{d:0>6}.data", .{ self.base_path, self.id });
+            tmp = p;
+            break :blk p;
+        };
 
         var t0: u64 = 0;
         if (timing_enabled) t0 = tick(self.io);
-        const f = try self.dir.openFile(self.io, self.data_path, .{});
+        const f = try self.dir.openFile(self.io, path, .{});
         self.file = f;
         self.file_size = (try f.stat(self.io)).size;
         if (timing_enabled) {
@@ -429,7 +451,6 @@ pub const Segment = struct {
     pub fn close(self: *Segment) void {
         self.entries.deinit(self.alloc);
         if (self.owns_idx and self.idx.len > 0) self.alloc.free(@constCast(self.idx));
-        if (self.data_path.len > 0) self.alloc.free(self.data_path);
         if (self.mm) |*m| m.destroy(self.io);
         if (self.file) |f| f.close(self.io);
         self.* = undefined;
@@ -645,7 +666,7 @@ test "segment idx 被翻位后必须报错（不静默返回错误结果）" {
     try dir.createDirPath(io, tmp);
 
     {
-        var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc);
+        var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc, 10);
         try w.push("a", 1, 0, "va");
         try w.push("b", 2, 0, "vb");
         _ = try w.finish(dir, tmp ++ "/000001.idx");
@@ -677,7 +698,7 @@ test "segment write + point get + scan" {
     defer dir.deleteTree(io, tmp) catch {};
 
     {
-        var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc);
+        var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc, 10);
         try w.push("a", 1, 0, "va");
         try w.push("b", 2, 0, "vb2");
         try w.push("b", 1, 0, "vb1");

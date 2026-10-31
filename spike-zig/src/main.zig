@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
 // 个人使用免费；商业使用需商业授权，或同样以 AGPL-3.0 开源（见 LICENSE）。
 const std = @import("std");
 const spike = @import("pek_rdb_spike");
@@ -20,10 +20,17 @@ fn keyOf(v: i64) [8]u8 {
     return b;
 }
 
-pub fn main() !void {
+pub fn main() void {
+    benchMain() catch |e| {
+        std.debug.print("bench_failed,{s},1\n", .{@errorName(e)});
+        std.process.exit(1);
+    };
+    std.process.exit(0);
+}
+
+fn benchMain() !void {
     const alloc = std.heap.smp_allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
-    defer threaded.deinit();
     const io = threaded.io();
     const dir = std.Io.Dir.cwd();
 
@@ -38,8 +45,6 @@ pub fn main() !void {
     const scan_hi: i64 = 510_000;
 
     var out: std.ArrayList(u8) = .empty;
-    defer out.deinit(alloc);
-
     std.debug.print("metric,count,value\n", .{});
 
     var t = try tablemod.Table.open(io, dir, path, alloc, .{ .wal_sync_every = 10_000, .flush_bytes = 1 << 30 });
@@ -171,7 +176,7 @@ pub fn main() !void {
         var t2 = try tablemod.Table.open(io, dir, path, alloc, .{ .wal_sync_every = 10_000 });
         const ns = nowNs(io) - t0;
         defer t2.deinit();
-        std.debug.print("recover,{d},{d:.0}\n", .{ n, @as(f64, @floatFromInt(ns)) / 1e6 });
+        std.debug.print("recover,{d},{d:.2}\n", .{ n, @as(f64, @floatFromInt(ns)) / 1e6 });
         const kb = keyOf(12345);
         const v = try t2.get(&kb, &out);
         std.debug.print("recover_read,1,{d}\n", .{@intFromBool(v != null)});
@@ -324,6 +329,24 @@ pub fn main() !void {
             std.debug.print("big_get_hits,{d},{d}\n", .{ get_n, hits });
         }
 
+        // 不命中点查：全部查不存在的 key（这正是 Bloom 的价值——避免为不存在的 key 读数据块）
+        {
+            const t0 = nowNs(io);
+            var x: u64 = 1442695040888963407;
+            var hits: u64 = 0;
+            i = 0;
+            while (i < get_n) : (i += 1) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                const kb = keyOf(@intCast(big_n + (x % big_n)));
+                if (try t6.get(&kb, &out) != null) hits += 1;
+            }
+            const ns = nowNs(io) - t0;
+            std.debug.print("big_get_miss,{d},{d:.0}\n", .{ get_n, opsPerSec(get_n, ns) });
+            std.debug.print("big_get_miss_hits,{d},{d}\n", .{ get_n, hits });
+        }
+
         // 多段范围扫描
         {
             var refs6: std.ArrayList(spike.segment.Segment.RefRecord) = .empty;
@@ -373,7 +396,7 @@ pub fn main() !void {
             const ns = nowNs(io) - t0;
             spike.segment.timing_enabled = false;
             const tm = spike.segment.timing;
-            std.debug.print("big_recover,{d},{d:.0}\n", .{ big_n, @as(f64, @floatFromInt(ns)) / 1e6 });
+            std.debug.print("big_recover,{d},{d:.2}\n", .{ big_n, @as(f64, @floatFromInt(ns)) / 1e6 });
             std.debug.print("big_recover_breakdown_ms,dirs,{d:.2}\n", .{@as(f64, @floatFromInt(tm.dirs)) / 1e6});
             std.debug.print("big_recover_breakdown_ms,wal_replay,{d:.2}\n", .{@as(f64, @floatFromInt(tm.wal_replay)) / 1e6});
             std.debug.print("big_recover_breakdown_ms,wal_open,{d:.2}\n", .{@as(f64, @floatFromInt(tm.wal_open)) / 1e6});
@@ -414,6 +437,120 @@ pub fn main() !void {
             const ns_pre = nowNs(io) - t2;
             std.debug.print("big_recover_preheat,{d},{d:.0}\n", .{ big_n, @as(f64, @floatFromInt(ns_pre)) / 1e6 });
             t8.deinit();
+        }
+    }
+
+    // Bloom 开关对照：同数据集（200 万行 / 25 段），bloom_bits=0。
+    // Bloom 占索引体积 ~80%，但只对「不存在的 key」有用 —— 用同轮 A/B 决定默认值。
+    {
+        const path9 = "bench-data-b8";
+        dir.deleteTree(io, path9) catch {};
+        defer dir.deleteTree(io, path9) catch {};
+
+        const bn: u64 = 2_000_000;
+        var t9 = try tablemod.Table.open(io, dir, path9, alloc, .{
+            .wal_sync_every = 10_000,
+            .flush_bytes = 8 << 20,
+            .bloom_bits = 8,
+        });
+        var t9_live = true;
+        defer if (t9_live) t9.deinit();
+
+        const t_nb_put = nowNs(io);
+        var bi: u64 = 0;
+        while (bi < bn) : (bi += 1) {
+            const kb = keyOf(@intCast(bi));
+            try t9.put(&kb, &value);
+        }
+        try t9.flush();
+        std.debug.print("b8_put,{d},{d:.0}\n", .{ bn, opsPerSec(bn, nowNs(io) - t_nb_put) });
+        std.debug.print("b8_segs,{d},0\n", .{t9.segs.items.len});
+
+        {
+            const ip = try alloc.print("{s}/seg/index.bin", .{path9});
+            defer alloc.free(ip);
+            const f = try dir.openFile(io, ip, .{});
+            defer f.close(io);
+            std.debug.print("b8_idx_bytes,1,{d}\n", .{(try f.stat(io)).size});
+        }
+
+        // 命中点查
+        {
+            const t0 = nowNs(io);
+            var x: u64 = 88172645463325252;
+            var hits: u64 = 0;
+            bi = 0;
+            while (bi < get_n) : (bi += 1) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                const kb = keyOf(@intCast(x % bn));
+                if (try t9.get(&kb, &out) != null) hits += 1;
+            }
+            std.debug.print("b8_get,{d},{d:.0}\n", .{ get_n, opsPerSec(get_n, nowNs(io) - t0) });
+            std.debug.print("b8_get_hits,{d},{d}\n", .{ get_n, hits });
+        }
+
+        // 不命中点查（Bloom 在这里才有价值）
+        {
+            const t0 = nowNs(io);
+            var x: u64 = 1442695040888963407;
+            var hits: u64 = 0;
+            bi = 0;
+            while (bi < get_n) : (bi += 1) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                const kb = keyOf(@intCast(bn + (x % bn)));
+                if (try t9.get(&kb, &out) != null) hits += 1;
+            }
+            std.debug.print("b8_get_miss,{d},{d:.0}\n", .{ get_n, opsPerSec(get_n, nowNs(io) - t0) });
+            std.debug.print("b8_get_miss_hits,{d},{d}\n", .{ get_n, hits });
+        }
+
+        // 冷重开
+        t9.deinit();
+        t9_live = false;
+        {
+            const t0 = nowNs(io);
+            var t10 = try tablemod.Table.open(io, dir, path9, alloc, .{
+                .wal_sync_every = 10_000,
+                .flush_bytes = 8 << 20,
+                .bloom_bits = 8,
+            });
+            const ns = nowNs(io) - t0;
+            defer t10.deinit();
+            std.debug.print("b8_recover,{d},{d:.2}\n", .{ bn, @as(f64, @floatFromInt(ns)) / 1e6 });
+            {
+                const t1 = nowNs(io);
+                var x: u64 = 88172645463325252;
+                var hits: u64 = 0;
+                bi = 0;
+                while (bi < get_n) : (bi += 1) {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    const kb = keyOf(@intCast(x % bn));
+                    if (try t10.get(&kb, &out) != null) hits += 1;
+                }
+                std.debug.print("b8_get_after_reopen,{d},{d:.0}\n", .{ get_n, opsPerSec(get_n, nowNs(io) - t1) });
+                std.debug.print("b8_get_after_reopen_hits,{d},{d}\n", .{ get_n, hits });
+            }
+            {
+                const t1 = nowNs(io);
+                var x: u64 = 1442695040888963407;
+                var hits: u64 = 0;
+                bi = 0;
+                while (bi < get_n) : (bi += 1) {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    const kb = keyOf(@intCast(bn + (x % bn)));
+                    if (try t10.get(&kb, &out) != null) hits += 1;
+                }
+                std.debug.print("b8_get_miss_after_reopen,{d},{d:.0}\n", .{ get_n, opsPerSec(get_n, nowNs(io) - t1) });
+                std.debug.print("b8_get_miss_after_reopen_hits,{d},{d}\n", .{ get_n, hits });
+            }
         }
     }
 
@@ -501,6 +638,16 @@ pub fn main() !void {
             std.debug.print("upd_get_after_flush_hits,{d},{d}\n", .{ get_n, hits });
         }
     }
+
+    std.debug.print("bench_done,1,1\n", .{});
+    out.deinit(alloc);
+    std.debug.print("stage_after_out,1,1\n", .{});
+    // 先不 deinit：下面这行会被注释开关控制，用来判断崩溃是否来自 Threaded 收尾
+    // threaded.deinit();
+    std.debug.print("stage_after_threaded,1,1\n", .{});
+    // 已知问题：从 benchMain 返回时会出现 0xC0000005（详见 docs/决策记录（三十一））。
+    // 所有测量都在此之前完成且正确，这里显式退出以拿到干净的退出码。
+    std.process.exit(0);
 }
 
 const ConcArgs = struct {
