@@ -195,20 +195,28 @@ pub const Finished = struct {
 // 格式：ARCHIVE_MAGIC(8) 之后为连续 record：{ u32 len, u32 crc32Fast(payload), payload[len] }；
 // payload 就是单段 `.idx` 的完整内容（自带 magic 与尾部 CRC，读取时仍逐段校验、能定位损坏段）。
 // 只追加不改写，所以 flush 的代价仍是一段索引的大小。
-pub const ARCHIVE_MAGIC = "PEKZAG02";
+pub const ARCHIVE_MAGIC = "PEKZAG03";
+
+pub const ArchiveRecord = struct {
+    /// 段号（跟数据文件名里的数字一致）。
+    /// **不能靠 record 在文件里的序号推断**：compaction 后新段的段号会比段数大得多。
+    id: u32,
+    payload: []const u8,
+};
 
 pub const ArchiveIter = struct {
     buf: []const u8,
     pos: usize = 8,
 
     /// 取下一段索引；遇到截断的 record（追加时崩溃）就停下，等效于该段不存在。
-    pub fn next(self: *ArchiveIter) ?[]const u8 {
-        if (self.buf.len < 12 or self.pos + 12 > self.buf.len) return null;
+    pub fn next(self: *ArchiveIter) ?ArchiveRecord {
+        if (self.buf.len < 16 or self.pos + 16 > self.buf.len) return null;
         const len: usize = @intCast(std.mem.readInt(u32, self.buf[self.pos..][0..4], .little));
-        const off = self.pos + 12;
+        const id = std.mem.readInt(u32, self.buf[self.pos + 4 ..][0..4], .little);
+        const off = self.pos + 16;
         if (off + len > self.buf.len) return null;
         self.pos = off + len;
-        return self.buf[off..][0..len];
+        return .{ .id = id, .payload = self.buf[off..][0..len] };
     }
 
     /// 最后一条**完整** record 的末尾偏移（= 下次追加应写的位置）。
@@ -219,9 +227,38 @@ pub const ArchiveIter = struct {
     }
 };
 
+fn writeRecord(f: std.Io.File, io: std.Io, at: u64, id: u32, payload: []const u8) !u64 {
+    var hdr: [16]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], @intCast(payload.len), .little);
+    std.mem.writeInt(u32, hdr[4..8], id, .little);
+    std.mem.writeInt(u64, hdr[8..16], codec.hashIdx(payload), .little);
+    try f.writePositionalAll(io, &hdr, at);
+    try f.writePositionalAll(io, payload, at + 16);
+    return at + 16 + payload.len;
+}
+
+/// 重写整个归档（compaction 用）：写临时文件 → 原子 rename 覆盖目标。
+/// 这样「重写归档途中断电」不会留下半个文件导致整个库打不开。
+/// 返回新的有效末尾。
+pub fn archiveRewrite(io: std.Io, dir: std.Io.Dir, path: []const u8, records: []const ArchiveRecord) !u64 {
+    const tmp_path = try std.fmt.allocPrint(std.heap.page_allocator, "{s}.tmp", .{path});
+    defer std.heap.page_allocator.free(tmp_path);
+
+    var at: u64 = 8;
+    {
+        const f = try dir.createFile(io, tmp_path, .{ .read = true, .truncate = true });
+        defer f.close(io);
+        try f.writePositionalAll(io, ARCHIVE_MAGIC, 0);
+        for (records) |r| at = try writeRecord(f, io, at, r.id, r.payload);
+        try f.sync(io);
+    }
+    try dir.rename(tmp_path, dir, path, io);
+    return at;
+}
+
 /// 追加一段索引，从 `at` 处开始写（会覆盖该位置之后的残片），返回新的有效末尾。
 /// `at < 8` 视为新建，先写 magic。
-pub fn archiveAppend(io: std.Io, dir: std.Io.Dir, path: []const u8, payload: []const u8, at_in: u64) !u64 {
+pub fn archiveAppend(io: std.Io, dir: std.Io.Dir, path: []const u8, id: u32, payload: []const u8, at_in: u64) !u64 {
     // truncate=false：已存在则保留内容
     const f = try dir.createFile(io, path, .{ .read = true, .truncate = false });
     defer f.close(io);
@@ -230,12 +267,7 @@ pub fn archiveAppend(io: std.Io, dir: std.Io.Dir, path: []const u8, payload: []c
         try f.writePositionalAll(io, ARCHIVE_MAGIC, 0);
         at = 8;
     }
-    var hdr: [12]u8 = undefined;
-    std.mem.writeInt(u32, hdr[0..4], @intCast(payload.len), .little);
-    std.mem.writeInt(u64, hdr[4..12], codec.hashIdx(payload), .little);
-    try f.writePositionalAll(io, &hdr, at);
-    try f.writePositionalAll(io, payload, at + 12);
-    const new_end = at + 12 + payload.len;
+    const new_end = try writeRecord(f, io, at, id, payload);
     // 截断到新末尾：若之前尾部有更长的崩溃残片，残留字节会被下一次读取当成
     // 一条「看似合法」的 record（虽然 hash 会拒掉，但会让整个库打开失败）。
     try f.setLength(io, new_end);
@@ -661,9 +693,12 @@ pub const RefCursor = struct {
             const v = data[self.pos + 17 + klen ..][0..vlen];
             self.pos += total;
 
-            switch (keyCmp(k, self.end)) {
-                .gt, .eq => return null,
-                .lt => {},
+            // 空 end = 无上界（compaction 全量归并时用）
+            if (self.end.len > 0) {
+                switch (keyCmp(k, self.end)) {
+                    .gt, .eq => return null,
+                    .lt => {},
+                }
             }
             if (keyCmp(k, self.start) == .lt) continue;
             if (seq > self.snapshot) continue;

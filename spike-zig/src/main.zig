@@ -628,6 +628,201 @@ fn benchMain() !void {
         }
     }
 
+    // 段数曲线：**同一份数据**（200 万行）、不同 flush_bytes → 不同段数，
+    // 量出「段数 → 点查 / 扫描 / 冷重开」的代价。这是 compaction 触发策略的依据（先量再做）。
+    {
+        const cn: u64 = 2_000_000;
+        const curve = [_]struct { tag: []const u8, fb: usize }{
+            .{ .tag = "c128m", .fb = 128 << 20 },
+            .{ .tag = "c32m", .fb = 32 << 20 },
+            .{ .tag = "c16m", .fb = 16 << 20 },
+            .{ .tag = "c8m", .fb = 8 << 20 },
+        };
+        for (curve) |c| {
+            const cp = try alloc.print("bench-data-curve-{s}", .{c.tag});
+            defer alloc.free(cp);
+            dir.deleteTree(io, cp) catch {};
+            defer dir.deleteTree(io, cp) catch {};
+
+            var ct = try tablemod.Table.open(io, dir, cp, alloc, .{ .wal_sync_every = 10_000, .flush_bytes = c.fb });
+            var ct_live = true;
+            defer if (ct_live) ct.deinit();
+
+            var ci: u64 = 0;
+            const cput0 = nowNs(io);
+            while (ci < cn) : (ci += 1) {
+                const kb = keyOf(@intCast(ci));
+                try ct.put(&kb, &value);
+            }
+            try ct.flush();
+            std.debug.print("{s}_put,{d},{d:.0}\n", .{ c.tag, cn, opsPerSec(cn, nowNs(io) - cput0) });
+            std.debug.print("{s}_segs,{d},0\n", .{ c.tag, ct.segs.items.len });
+
+            {
+                const ip = try alloc.print("{s}/seg/index.bin", .{cp});
+                defer alloc.free(ip);
+                const f = try dir.openFile(io, ip, .{});
+                defer f.close(io);
+                std.debug.print("{s}_idx_bytes,1,{d}\n", .{ c.tag, (try f.stat(io)).size });
+            }
+
+            // 命中点查
+            {
+                const t0 = nowNs(io);
+                var x: u64 = 88172645463325252;
+                var hits: u64 = 0;
+                ci = 0;
+                while (ci < get_n) : (ci += 1) {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    const kb = keyOf(@intCast(x % cn));
+                    if (try ct.get(&kb, &out) != null) hits += 1;
+                }
+                std.debug.print("{s}_get,{d},{d:.0}\n", .{ c.tag, get_n, opsPerSec(get_n, nowNs(io) - t0) });
+                std.debug.print("{s}_get_hits,{d},{d}\n", .{ c.tag, get_n, hits });
+            }
+            // 不命中点查
+            {
+                const t0 = nowNs(io);
+                var x: u64 = 1442695040888963407;
+                var hits: u64 = 0;
+                ci = 0;
+                while (ci < get_n) : (ci += 1) {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    const kb = keyOf(@intCast(cn + (x % cn)));
+                    if (try ct.get(&kb, &out) != null) hits += 1;
+                }
+                std.debug.print("{s}_miss,{d},{d:.0}\n", .{ c.tag, get_n, opsPerSec(get_n, nowNs(io) - t0) });
+                std.debug.print("{s}_miss_hits,{d},{d}\n", .{ c.tag, get_n, hits });
+            }
+            // 范围扫描
+            {
+                var refs: std.ArrayList(spike.segment.Segment.RefRecord) = .empty;
+                defer refs.deinit(alloc);
+                const lo = keyOf(scan_lo);
+                const hi = keyOf(scan_hi);
+                const t0 = nowNs(io);
+                try ct.scanRefs(&lo, &hi, &refs);
+                std.debug.print("{s}_scan,{d},{d:.0}\n", .{ c.tag, refs.items.len, opsPerSec(@intCast(refs.items.len), nowNs(io) - t0) });
+            }
+
+            // 冷重开 + 重开后点查
+            ct.deinit();
+            ct_live = false;
+            {
+                const t0 = nowNs(io);
+                var ct2 = try tablemod.Table.open(io, dir, cp, alloc, .{ .wal_sync_every = 10_000, .flush_bytes = c.fb });
+                defer ct2.deinit();
+                std.debug.print("{s}_recover,{d},{d:.2}\n", .{ c.tag, cn, @as(f64, @floatFromInt(nowNs(io) - t0)) / 1e6 });
+                const t1 = nowNs(io);
+                var x: u64 = 88172645463325252;
+                var hits: u64 = 0;
+                ci = 0;
+                while (ci < get_n) : (ci += 1) {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    const kb = keyOf(@intCast(x % cn));
+                    if (try ct2.get(&kb, &out) != null) hits += 1;
+                }
+                std.debug.print("{s}_get_after_reopen,{d},{d:.0}\n", .{ c.tag, get_n, opsPerSec(get_n, nowNs(io) - t1) });
+                std.debug.print("{s}_get_after_reopen_hits,{d},{d}\n", .{ c.tag, get_n, hits });
+            }
+        }
+    }
+
+    // compaction 效果：25 段 → 1 段，量「合并耗时 vs 点查收益」
+    {
+        const kn: u64 = 2_000_000;
+        const kp = "bench-data-compact";
+        dir.deleteTree(io, kp) catch {};
+        defer dir.deleteTree(io, kp) catch {};
+
+        var kt = try tablemod.Table.open(io, dir, kp, alloc, .{ .wal_sync_every = 10_000, .flush_bytes = 8 << 20 });
+        var kt_live = true;
+        defer if (kt_live) kt.deinit();
+
+        var ki: u64 = 0;
+        while (ki < kn) : (ki += 1) {
+            const kb = keyOf(@intCast(ki));
+            try kt.put(&kb, &value);
+        }
+        try kt.flush();
+        std.debug.print("cm_segs_before,{d},0\n", .{kt.segs.items.len});
+
+        // 合并前点查
+        {
+            const t0 = nowNs(io);
+            var x: u64 = 88172645463325252;
+            var hits: u64 = 0;
+            ki = 0;
+            while (ki < get_n) : (ki += 1) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                const kb = keyOf(@intCast(x % kn));
+                if (try kt.get(&kb, &out) != null) hits += 1;
+            }
+            std.debug.print("cm_get_before,{d},{d:.0}\n", .{ get_n, opsPerSec(get_n, nowNs(io) - t0) });
+            std.debug.print("cm_get_before_hits,{d},{d}\n", .{ get_n, hits });
+        }
+
+        // 合并
+        {
+            const tcm = nowNs(io);
+            const cr = try kt.compact();
+            const cmns = nowNs(io) - tcm;
+            std.debug.print("cm_ms,{d},{d:.2}\n", .{ cr.rows, @as(f64, @floatFromInt(cmns)) / 1e6 });
+            std.debug.print("cm_segs_after,{d},0\n", .{cr.after});
+        }
+
+        // 合并后点查
+        {
+            const t0 = nowNs(io);
+            var x: u64 = 88172645463325252;
+            var hits: u64 = 0;
+            ki = 0;
+            while (ki < get_n) : (ki += 1) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                const kb = keyOf(@intCast(x % kn));
+                if (try kt.get(&kb, &out) != null) hits += 1;
+            }
+            std.debug.print("cm_get_after,{d},{d:.0}\n", .{ get_n, opsPerSec(get_n, nowNs(io) - t0) });
+            std.debug.print("cm_get_after_hits,{d},{d}\n", .{ get_n, hits });
+        }
+        // 合并后不命中点查
+        {
+            const t0 = nowNs(io);
+            var x: u64 = 1442695040888963407;
+            var hits: u64 = 0;
+            ki = 0;
+            while (ki < get_n) : (ki += 1) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                const kb = keyOf(@intCast(kn + (x % kn)));
+                if (try kt.get(&kb, &out) != null) hits += 1;
+            }
+            std.debug.print("cm_miss_after,{d},{d:.0}\n", .{ get_n, opsPerSec(get_n, nowNs(io) - t0) });
+            std.debug.print("cm_miss_after_hits,{d},{d}\n", .{ get_n, hits });
+        }
+
+        // 合并后重开
+        kt.deinit();
+        kt_live = false;
+        {
+            const t0 = nowNs(io);
+            var kt2 = try tablemod.Table.open(io, dir, kp, alloc, .{ .wal_sync_every = 10_000, .flush_bytes = 8 << 20 });
+            defer kt2.deinit();
+            std.debug.print("cm_recover,{d},{d:.2}\n", .{ kn, @as(f64, @floatFromInt(nowNs(io) - t0)) / 1e6 });
+        }
+    }
+
     std.debug.print("bench_done,1,1\n", .{});
     out.deinit(alloc);
     // threaded.deinit() 会让进程收尾更慢，基准进程直接靠 OS 回收；这里保留但注释说明

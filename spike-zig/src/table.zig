@@ -56,7 +56,8 @@ const MemCursor = struct {    it: Skiplist.Iterator,
 
     fn next(self: *MemCursor) ?segmod.Segment.RefRecord {
         while (self.it.next()) |e| {
-            if (std.mem.order(u8, e.key, self.end) != .lt) return null;
+            // 空 end = 无上界（compaction 全量归并）
+            if (self.end.len > 0 and std.mem.order(u8, e.key, self.end) != .lt) return null;
             if (e.seq > self.snapshot) continue;
             return .{ .key = e.key, .seq = e.seq, .flags = e.flags, .value = e.value };
         }
@@ -88,18 +89,19 @@ fn openSegmentsFromArchive(
     alloc: std.mem.Allocator,
     preheat: bool,
     segs: *std.ArrayList(segmod.Segment),
-) !u64 {
+) !OpenSegmentsResult {
     var it = segmod.ArchiveIter{ .buf = buf };
-    var id: u64 = 1;
-    while (it.next()) |payload| : (id += 1) {
+    var max_id: u64 = 0;
+    while (it.next()) |rec| {
         var ta: u64 = 0;
         if (segmod.timing_enabled) ta = segmod.tick(io);
-        const seg = try segmod.Segment.fromBytes(io, dir, base_path, id, payload, alloc, false, preheat);
+        const seg = try segmod.Segment.fromBytes(io, dir, base_path, rec.id, rec.payload, alloc, false, preheat);
         if (segmod.timing_enabled) {
             const tb = segmod.tick(io);
             segmod.timing.mkseg += tb - ta;
             ta = tb;
         }
+        max_id = @max(max_id, rec.id);
         segs.append(alloc, seg) catch |e| {
             var s = seg;
             s.close();
@@ -107,8 +109,13 @@ fn openSegmentsFromArchive(
         };
         if (segmod.timing_enabled) segmod.timing.seg_append += segmod.tick(io) - ta;
     }
-    return it.validEnd();
+    return .{ .valid_end = it.validEnd(), .max_id = max_id };
 }
+
+pub const OpenSegmentsResult = struct {
+    valid_end: u64,
+    max_id: u64,
+};
 
 /// 单表引擎（试验版）：memtable + WAL + 不可变段。
 pub const Table = struct {
@@ -214,8 +221,8 @@ pub const Table = struct {
             segs.deinit(alloc);
         }
 
-        const valid_len = try openSegmentsFromArchive(io, dir, path, arch, alloc, opts.mmap_preheat, &segs);
-        const id: u64 = @intCast(segs.items.len + 1);
+        const opened = try openSegmentsFromArchive(io, dir, path, arch, alloc, opts.mmap_preheat, &segs);
+        const id: u64 = opened.max_id + 1;
         for (segs.items) |s| seq = @max(seq, s.max_seq);
 
         if (segmod.timing_enabled) {
@@ -231,7 +238,7 @@ pub const Table = struct {
             .wal_path = wal_path,
             .index_path = index_path,
             .idx_archive = arch,
-            .index_valid_len = valid_len,
+            .index_valid_len = opened.valid_end,
             .mem = mem,
             .segs = segs,
             .wal = wal,
@@ -328,7 +335,7 @@ pub const Table = struct {
         const fin = try w.finishBytes();
         errdefer self.alloc.free(fin.bytes);
         // 从「有效末尾」写：若上次追加留下崩溃残片，这里会把它覆盖掉
-        self.index_valid_len = try segmod.archiveAppend(self.io, self.dir, self.index_path, fin.bytes, self.index_valid_len);
+        self.index_valid_len = try segmod.archiveAppend(self.io, self.dir, self.index_path, @intCast(id), fin.bytes, self.index_valid_len);
 
         const seg = try segmod.Segment.fromBytes(self.io, self.dir, self.base_path, id, fin.bytes, self.alloc, true, self.opts.mmap_preheat);
         self.segs.append(self.alloc, seg) catch |e| {
@@ -380,59 +387,139 @@ pub const Table = struct {
     }
     /// 通用 refs 扫描：memtable + 所有段的 k 路归并（值零拷贝借用；调用期间不得写）。
     pub fn scanRefs(self: *Table, start: []const u8, end: []const u8, out: *std.ArrayList(segmod.Segment.RefRecord)) !void {
-        var cursors: std.ArrayList(ScanCursor) = .empty;
-        defer cursors.deinit(self.alloc);
+        var it = MergeIter{};
+        try it.init(self, start, end);
+        defer it.deinit();
+        while (it.next()) |rec| try out.append(self.alloc, rec);
+    }
 
-        if (self.mem.len() > 0) {
-            try cursors.append(self.alloc, .{ .mem = .{
-                .it = self.mem.iteratorFrom(start),
+    /// 全量合并：把全部段重写成一个新段。
+    /// - 只保留每个 key 的最新可见版本，**墓碑直接丢弃**（全量合并后不再需要）
+    /// - 重建 `index.bin`（用临时文件 + rename，崩溃时不会留下半个归档）
+    /// - 删除旧段数据文件
+    /// 内存是流式的：不为全部结果分配缓冲（200 万行时那是 100MB+）。
+    pub fn compact(self: *Table) !CompactResult {
+        const before = self.segs.items.len;
+        if (before <= 1) return .{ .before = before, .after = before, .rows = 0 };
+
+        // 先把 memtable 落盘，避免「合并结果 + memtable」重复持有同一批 key
+        if (self.mem.len() > 0) try self.flush();
+
+        const id = self.next_seg;
+        const data_path = try self.alloc.print("{s}/seg/{d:0>6}.data", .{ self.base_path, id });
+        defer self.alloc.free(data_path);
+
+        var w = try segmod.Writer.create(self.io, self.dir, data_path, self.alloc, self.opts.bloom_bits);
+        var rows: usize = 0;
+        {
+            var it = MergeIter{};
+            try it.init(self, &.{}, &.{}); // 无下界、无上界
+            defer it.deinit();
+            while (it.next()) |rec| {
+                try w.push(rec.key, rec.seq, rec.flags, rec.value);
+                rows += 1;
+            }
+        }
+        const fin = try w.finishBytes();
+        errdefer self.alloc.free(fin.bytes);
+
+        // 重建归档：只剩这一段（写入临时文件再原子替换）
+        const records = [_]segmod.ArchiveRecord{.{ .id = @intCast(id), .payload = fin.bytes }};
+        self.index_valid_len = try segmod.archiveRewrite(self.io, self.dir, self.index_path, &records);
+
+        // 关闭旧段并删除它们的数据文件
+        for (self.segs.items) |*s| {
+            const old_id = s.id;
+            s.close();
+            const op = try self.alloc.print("{s}/seg/{d:0>6}.data", .{ self.base_path, old_id });
+            defer self.alloc.free(op);
+            self.dir.deleteFile(self.io, op) catch {};
+        }
+        self.segs.clearRetainingCapacity();
+        if (self.idx_archive.len > 0) self.alloc.free(self.idx_archive);
+        self.idx_archive = &.{};
+
+        const seg = try segmod.Segment.fromBytes(self.io, self.dir, self.base_path, id, fin.bytes, self.alloc, true, self.opts.mmap_preheat);
+        self.segs.append(self.alloc, seg) catch |e| {
+            var s = seg;
+            s.owns_idx = false;
+            s.close();
+            return e;
+        };
+        self.next_seg = id + 1;
+
+        return .{ .before = before, .after = self.segs.items.len, .rows = rows };
+    }
+};
+
+pub const CompactResult = struct {
+    before: usize,
+    after: usize,
+    rows: usize,
+};
+
+/// memtable + 所有段的流式 k 路归并：按 (key asc, seq desc) 产出**可见**记录，
+/// 同一 key 只产出一次（seq 最大的可见版本），墓碑跳过。
+pub const MergeIter = struct {
+    table: *Table = undefined,
+    cursors: std.ArrayList(ScanCursor) = .empty,
+    cur: []?segmod.Segment.RefRecord = &.{},
+    last_key: []const u8 = &.{},
+    have_last: bool = false,
+
+    pub fn init(self: *MergeIter, table: *Table, start: []const u8, end: []const u8) !void {
+        self.* = .{ .table = table };
+        const alloc = table.alloc;
+        if (table.mem.len() > 0) {
+            try self.cursors.append(alloc, .{ .mem = .{
+                .it = table.mem.iteratorFrom(start),
                 .end = end,
-                .snapshot = self.visible,
+                .snapshot = table.visible,
             } });
         }
-        for (self.segs.items) |*s| {
-            try cursors.append(self.alloc, .{ .seg = try s.cursor(start, end, self.visible) });
+        for (table.segs.items) |*s| {
+            try self.cursors.append(alloc, .{ .seg = try s.cursor(start, end, table.visible) });
         }
-        if (cursors.items.len == 0) return;
+        if (self.cursors.items.len > 1) {
+            self.cur = try alloc.alloc(?segmod.Segment.RefRecord, self.cursors.items.len);
+            for (self.cursors.items, 0..) |*c, i| self.cur[i] = c.next();
+        }
+    }
 
-        // 单游标（单段或仅 memtable）：直接顺序去重，省掉 k 路选择开销。
-        if (cursors.items.len == 1) {
-            var last_key: []const u8 = &.{};
-            var have_last = false;
-            while (cursors.items[0].next()) |rec| {
-                if (have_last and std.mem.eql(u8, rec.key, last_key)) continue;
-                last_key = rec.key;
-                have_last = true;
-                if (rec.flags == 0) try out.append(self.alloc, rec);
+    pub fn deinit(self: *MergeIter) void {
+        if (self.cur.len > 0) self.table.alloc.free(self.cur);
+        self.cursors.deinit(self.table.alloc);
+    }
+
+    pub fn next(self: *MergeIter) ?segmod.Segment.RefRecord {
+        // 单游标（单段或仅 memtable）：顺序去重，省掉 k 路选择开销
+        if (self.cursors.items.len == 1) {
+            while (self.cursors.items[0].next()) |rec| {
+                if (self.have_last and std.mem.eql(u8, rec.key, self.last_key)) continue;
+                self.last_key = rec.key;
+                self.have_last = true;
+                if (rec.flags == 0) return rec;
             }
-            return;
+            return null;
         }
-
-        const cur = try self.alloc.alloc(?segmod.Segment.RefRecord, cursors.items.len);
-        defer self.alloc.free(cur);
-        for (cursors.items, 0..) |*c, i| cur[i] = c.next();
-
-        var last_key: []const u8 = &.{};
-        var have_last = false;
         while (true) {
             var best: ?usize = null;
-            for (cur, 0..) |maybe, i| {
+            for (self.cur, 0..) |maybe, i| {
                 const r = maybe orelse continue;
                 if (best == null) {
                     best = i;
                     continue;
                 }
-                const b = cur[best.?].?;
-                if (refLess({}, r, b)) best = i;
+                if (refLess({}, r, self.cur[best.?].?)) best = i;
             }
-            const bi = best orelse break;
-            const rec = cur[bi].?;
-            cur[bi] = cursors.items[bi].next();
+            const bi = best orelse return null;
+            const rec = self.cur[bi].?;
+            self.cur[bi] = self.cursors.items[bi].next();
 
-            if (have_last and std.mem.eql(u8, rec.key, last_key)) continue;
-            last_key = rec.key;
-            have_last = true;
-            if (rec.flags == 0) try out.append(self.alloc, rec);
+            if (self.have_last and std.mem.eql(u8, rec.key, self.last_key)) continue;
+            self.last_key = rec.key;
+            self.have_last = true;
+            if (rec.flags == 0) return rec;
         }
     }
 };
@@ -640,6 +727,88 @@ test "bloom_bits 0 与 10 的读写结果必须一致" {
         try std.testing.expectEqual(@as(usize, 20), refs.items.len);
         try std.testing.expectEqualStrings("k000", refs.items[0].key);
         try std.testing.expectEqualStrings("v019", refs.items[19].value);
+    }
+}
+
+test "compact 合并多段后数据一致（含更新与墓碑）" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-compact";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+
+        // 先落 5 段，每段 10 行
+        var seg_i: usize = 0;
+        while (seg_i < 5) : (seg_i += 1) {
+            var r: usize = 0;
+            while (r < 10) : (r += 1) {
+                var kb: [16]u8 = undefined;
+                var vb: [16]u8 = undefined;
+                const k = try std.fmt.bufPrint(&kb, "k{d:0>2}_{d:0>2}", .{ seg_i, r });
+                const v = try std.fmt.bufPrint(&vb, "v{d:0>2}_{d:0>2}", .{ seg_i, r });
+                try t.put(k, v);
+            }
+            try t.flush();
+        }
+        try std.testing.expectEqual(@as(usize, 5), t.segs.items.len);
+
+        // 再产生一段：更新一行 + 删除一行
+        try t.put("k00_00", "UPDATED");
+        try t.delete("k02_03");
+        try t.flush();
+        try std.testing.expectEqual(@as(usize, 6), t.segs.items.len);
+
+        const res = try t.compact();
+        try std.testing.expectEqual(@as(usize, 6), res.before);
+        try std.testing.expectEqual(@as(usize, 1), res.after);
+        try std.testing.expectEqual(@as(usize, 49), res.rows); // 50 - 1 个墓碑
+
+        // 合并后数据必须完全一致
+        try std.testing.expectEqualStrings("UPDATED", (try t.get("k00_00", &out)).?);
+        try std.testing.expect((try t.get("k02_03", &out)) == null);
+        try std.testing.expectEqualStrings("v04_09", (try t.get("k04_09", &out)).?);
+
+        var refs: std.ArrayList(segmod.Segment.RefRecord) = .empty;
+        defer refs.deinit(alloc);
+        try t.scanRefs("", "z", &refs);
+        try std.testing.expectEqual(@as(usize, 49), refs.items.len);
+        try std.testing.expectEqualStrings("k00_00", refs.items[0].key);
+        try std.testing.expectEqualStrings("UPDATED", refs.items[0].value);
+
+        t.deinit();
+    }
+
+    // 重开后仍正确
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        try std.testing.expectEqual(@as(usize, 1), t.segs.items.len);
+        try std.testing.expectEqualStrings("UPDATED", (try t.get("k00_00", &out)).?);
+        try std.testing.expect((try t.get("k02_03", &out)) == null);
+
+        // compaction 之后继续写，编号与归档必须仍然对得上
+        try t.put("zzz", "after");
+        try t.flush();
+        try std.testing.expectEqualStrings("after", (try t.get("zzz", &out)).?);
+        t.deinit();
+    }
+
+    // 再重开：compaction 后的段 + 新写的一段
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        defer t.deinit();
+        try std.testing.expectEqual(@as(usize, 2), t.segs.items.len);
+        try std.testing.expectEqualStrings("after", (try t.get("zzz", &out)).?);
+        try std.testing.expectEqualStrings("UPDATED", (try t.get("k00_00", &out)).?);
     }
 }
 
