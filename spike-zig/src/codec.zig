@@ -66,6 +66,14 @@ pub fn crc32(bytes: []const u8) u32 {
     return ~c;
 }
 
+/// 索引/归档完整性校验：64 位 XxHash（约 10GB/s，实测 3MB 从 1.67ms 降到 0.2ms）。
+/// 只用于**派生数据**（段索引可从 .data 重建），目的是发现截断/位翻转；
+/// 64 位哈希对随机误码的抗碰撞能力高于 32 位 CRC，所以校验强度是提升而非降低。
+/// WAL（写入热路径、崩溃恢复语义）仍用 `crc32`，不在此列。
+pub fn hashIdx(bytes: []const u8) u64 {
+    return std.hash.XxHash64.hash(0, bytes);
+}
+
 // ---------- CRC32 快速版（slicing-by-8，8KB 表） ----------
 // 只给主引擎的大块校验用（段索引、WAL 批次）：值域与 `crc32` 完全一致、可互验，
 // 但常量区 8KB。**M0 档不得用**（flash 预算只有 2KB），那里走 `crc32`/`crc32Nibble`/`crc32Bitwise`。

@@ -5,7 +5,7 @@ const codec = @import("codec.zig");
 
 pub const INDEX_STRIDE: usize = 64;
 const FLUSH_BYTES: usize = 1 << 20;
-const IDX_MAGIC = "PEKZIX01";
+const IDX_MAGIC = "PEKZIX02";
 
 pub const IndexEntry = struct {
     offset: u64,
@@ -41,7 +41,7 @@ fn hashPair(key: []const u8) [2]u64 {
     return .{ h1, h2 };
 }
 
-fn readWholeFile(io: std.Io, dir: std.Io.Dir, path: []const u8, alloc: std.mem.Allocator, max: u64) ![]u8 {
+pub fn readWholeFile(io: std.Io, dir: std.Io.Dir, path: []const u8, alloc: std.mem.Allocator, max: u64) ![]u8 {
     const f = try dir.openFile(io, path, .{});
     defer f.close(io);
     // 先 stat 拿长度再一次性读：比「盲读 64KB 再扩容」少一次 read（实测后者慢 ~1ms / 25 段）。
@@ -111,14 +111,15 @@ pub const Writer = struct {
         self.buf.clearRetainingCapacity();
     }
 
-    /// 收尾：落数据、写索引（稀疏索引 + Bloom + CRC）。调用后 Writer 不可再用。
-    pub fn finish(self: *Writer, idx_dir: std.Io.Dir, idx_path: []const u8) !Meta {
+    /// 收尾：落数据 + 返回索引字节（调用方决定写哪：单段 `.idx` 还是聚合 `index.bin`）。
+    /// 调用后 Writer 不可再用。
+    pub fn finishBytes(self: *Writer) !Finished {
         try self.flushBuf();
         try self.file.sync(self.io);
         self.file.close(self.io);
 
         var idx: std.ArrayList(u8) = .empty;
-        defer idx.deinit(self.alloc);
+        errdefer idx.deinit(self.alloc);
         try idx.appendSlice(self.alloc, IDX_MAGIC);
         try codec.putU64le(&idx, self.alloc, @intCast(self.rows));
         try codec.putU64le(&idx, self.alloc, if (self.rows == 0) 0 else self.min_seq);
@@ -148,12 +149,7 @@ pub const Writer = struct {
         try codec.putU64le(&idx, self.alloc, bits_len);
         try idx.append(self.alloc, 7);
         try idx.appendSlice(self.alloc, bits);
-        try codec.putU32le(&idx, self.alloc, codec.crc32(idx.items));
-
-        var f = try idx_dir.createFile(self.io, idx_path, .{ .truncate = true });
-        try f.writePositionalAll(self.io, idx.items, 0);
-        try f.sync(self.io);
-        f.close(self.io);
+        try codec.putU64le(&idx, self.alloc, codec.hashIdx(idx.items));
 
         const meta = Meta{
             .rows = self.rows,
@@ -166,9 +162,68 @@ pub const Writer = struct {
         self.hashes.deinit(self.alloc);
         self.buf.deinit(self.alloc);
         self.scratch.deinit(self.alloc);
-        return meta;
+
+        return .{ .bytes = try idx.toOwnedSlice(self.alloc), .meta = meta };
+    }
+
+    /// 便捷封装：落数据 + 写单段 `.idx` 文件（测试与独立段场景用）。
+    pub fn finish(self: *Writer, idx_dir: std.Io.Dir, idx_path: []const u8) !Meta {
+        const f = try self.finishBytes();
+        defer self.alloc.free(f.bytes);
+        var file = try idx_dir.createFile(self.io, idx_path, .{ .truncate = true });
+        try file.writePositionalAll(self.io, f.bytes, 0);
+        try file.sync(self.io);
+        file.close(self.io);
+        return f.meta;
     }
 };
+
+pub const Finished = struct {
+    bytes: []u8,
+    meta: Meta,
+};
+
+// ---------------- 索引聚合文件（seg/index.bin） ----------------
+// 冷重开的最大成本原本是「每段一次 open/stat/read/close」：25 段实测 3.66ms，
+// 而索引总量才 3MB。把全部段的索引按顺序追加进一个文件后，重开只需 **一次 open + 一次读**。
+// 格式：ARCHIVE_MAGIC(8) 之后为连续 record：{ u32 len, u32 crc32Fast(payload), payload[len] }；
+// payload 就是单段 `.idx` 的完整内容（自带 magic 与尾部 CRC，读取时仍逐段校验、能定位损坏段）。
+// 只追加不改写，所以 flush 的代价仍是一段索引的大小。
+pub const ARCHIVE_MAGIC = "PEKZAG02";
+
+pub const ArchiveIter = struct {
+    buf: []const u8,
+    pos: usize = 8,
+
+    /// 取下一段索引；遇到截断的 record（追加时崩溃）就停下，等效于该段不存在。
+    pub fn next(self: *ArchiveIter) ?[]const u8 {
+        if (self.buf.len < 12 or self.pos + 12 > self.buf.len) return null;
+        const len: usize = @intCast(std.mem.readInt(u32, self.buf[self.pos..][0..4], .little));
+        const off = self.pos + 12;
+        if (off + len > self.buf.len) return null;
+        self.pos = off + len;
+        return self.buf[off..][0..len];
+    }
+};
+
+/// 追加一段索引（文件不存在则创建并写 magic），返回追加后的文件字节数。
+pub fn archiveAppend(io: std.Io, dir: std.Io.Dir, path: []const u8, payload: []const u8) !u64 {
+    // truncate=false：已存在则保留内容，从末尾追加
+    const f = try dir.createFile(io, path, .{ .read = true, .truncate = false });
+    defer f.close(io);
+    var at: u64 = (try f.stat(io)).size;
+    if (at == 0) {
+        try f.writePositionalAll(io, ARCHIVE_MAGIC, 0);
+        at = 8;
+    }
+    var hdr: [12]u8 = undefined;
+    std.mem.writeInt(u32, hdr[0..4], @intCast(payload.len), .little);
+    std.mem.writeInt(u64, hdr[4..12], codec.hashIdx(payload), .little);
+    try f.writePositionalAll(io, &hdr, at);
+    try f.writePositionalAll(io, payload, at + 12);
+    try f.sync(io);
+    return at + 12 + payload.len;
+}
 
 // ---------------- 读取 ----------------
 
@@ -190,11 +245,20 @@ pub const Timing = struct {
     parse: u64 = 0,
     data_open: u64 = 0,
     mmap: u64 = 0,
+    // 以下为 Table.open 层面的分项（不属于单个段）
+    dirs: u64 = 0,
+    wal_replay: u64 = 0,
+    wal_open: u64 = 0,
+    segs: u64 = 0,
+    /// 每段：建路径 + 构造 Segment（含 CRC/解析）
+    mkseg: u64 = 0,
+    /// 每段：数组 append
+    seg_append: u64 = 0,
 };
 pub var timing_enabled: bool = false;
 pub var timing: Timing = .{};
 
-fn tick(io: std.Io) u64 {
+pub fn tick(io: std.Io) u64 {
     return @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
 }
 
@@ -209,8 +273,11 @@ pub const Segment = struct {
     data: []const u8 = &.{},
     mm: ?std.Io.File.MemoryMap = null,
     file: ?std.Io.File = null,
-    /// 整个 `.idx` 文件内容（entries 的 key 与 Bloom 都指向这里）
-    idx: []u8 = &.{},
+    /// 索引字节：单段 `.idx` 文件内容，或聚合 `index.bin` 里本段的切片。
+    /// `owns_idx=true` 时由本段负责释放（单文件模式 / flush 后接管）；
+    /// `false` 时指向 Table 持有的聚合缓冲（生命周期由 Table 管）。
+    idx: []const u8 = &.{},
+    owns_idx: bool = false,
     entries: std.ArrayList(Entry) = .empty,
     bits_off: u32 = 0,
     bits_len: u64 = 0,
@@ -244,56 +311,88 @@ pub const Segment = struct {
             timing.idx_read += t1 - t0;
             t0 = t1;
         }
-        if (idx_bytes.len < 12 or std.mem.readInt(u32, idx_bytes[idx_bytes.len - 4 ..][0..4], .little) != codec.crc32Fast(idx_bytes[0 .. idx_bytes.len - 4])) {
+        var seg = Segment{ .io = io, .alloc = alloc, .idx = idx_bytes, .owns_idx = true };
+        errdefer seg.entries.deinit(alloc);
+        try seg.parseIdxBytes(idx_bytes);
+        try seg.attach(dir, data_path, preheat);
+        return seg;
+    }
+
+    /// 从聚合索引里的切片构造（不读文件；`take_ownership` 决定是否接管这块内存）。
+    pub fn fromBytes(
+        io: std.Io,
+        dir: std.Io.Dir,
+        data_path: []const u8,
+        payload: []const u8,
+        alloc: std.mem.Allocator,
+        take_ownership: bool,
+        preheat: bool,
+    ) !Segment {
+        var seg = Segment{
+            .io = io,
+            .alloc = alloc,
+            .idx = payload,
+            .owns_idx = take_ownership,
+        };
+        errdefer seg.entries.deinit(alloc);
+        try seg.parseIdxBytes(payload);
+        try seg.attach(dir, data_path, preheat);
+        return seg;
+    }
+
+    fn attach(self: *Segment, dir: std.Io.Dir, data_path: []const u8, preheat: bool) !void {
+        // 数据文件延迟打开 + 延迟 mmap（冷重开只做索引）；preheat=true 时立即建视图。
+        self.dir = dir;
+        self.data_path = try self.alloc.dupe(u8, data_path);
+        self.preheat = preheat;
+        if (preheat) _ = try self.dataView();
+    }
+
+    /// 解析一段索引的字节：自己带 magic + 尾部 CRC（聚合归档里定位损坏段用）。
+    fn parseIdxBytes(self: *Segment, idx_bytes: []const u8) !void {
+        var t0: u64 = 0;
+        if (timing_enabled) t0 = tick(self.io);
+        if (idx_bytes.len < 16 or std.mem.readInt(u64, idx_bytes[idx_bytes.len - 8 ..][0..8], .little) != codec.hashIdx(idx_bytes[0 .. idx_bytes.len - 8])) {
             return error.BadIndexChecksum;
         }
         if (!std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC)) return error.BadIndexMagic;
 
         if (timing_enabled) {
-            const t1 = tick(io);
+            const t1 = tick(self.io);
             timing.crc += t1 - t0;
             t0 = t1;
         }
 
         var r = codec.Reader{ .buf = idx_bytes[8..] };
-        var seg = Segment{ .io = io, .alloc = alloc, .idx = idx_bytes };
-        seg.rows = @intCast(try r.u64le());
-        seg.min_seq = try r.u64le();
-        seg.max_seq = try r.u64le();
+        self.rows = @intCast(try r.u64le());
+        self.min_seq = try r.u64le();
+        self.max_seq = try r.u64le();
         const n: usize = @intCast(try r.u32le());
-        try seg.entries.ensureTotalCapacity(alloc, n);
+        try self.entries.ensureTotalCapacity(self.alloc, n);
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const off = try r.u64le();
             const klen: usize = @intCast(try r.u32le());
             const key = try r.bytes(klen);
-            seg.entries.appendAssumeCapacity(.{
+            self.entries.appendAssumeCapacity(.{
                 .offset = off,
                 .key_off = @intCast(@intFromPtr(key.ptr) - @intFromPtr(idx_bytes.ptr)),
                 .key_len = @intCast(klen),
             });
         }
-        seg.bits_len = try r.u64le();
+        self.bits_len = try r.u64le();
         const k = try r.u8v();
-        const bits_bytes = (seg.bits_len + 7) / 8;
+        const bits_bytes = (self.bits_len + 7) / 8;
         const bits = try r.bytes(@intCast(bits_bytes));
-        seg.bits_off = @intCast(@intFromPtr(bits.ptr) - @intFromPtr(idx_bytes.ptr));
+        self.bits_off = @intCast(@intFromPtr(bits.ptr) - @intFromPtr(idx_bytes.ptr));
 
         // k 未存进结构：固定 7（与写入一致）
         _ = k;
 
         if (timing_enabled) {
-            const t1 = tick(io);
+            const t1 = tick(self.io);
             timing.parse += t1 - t0;
-            t0 = t1;
         }
-
-        // 数据文件延迟打开 + 延迟 mmap（冷重开只做索引）；preheat=true 时立即建视图。
-        seg.dir = dir;
-        seg.data_path = try alloc.dupe(u8, data_path);
-        seg.preheat = preheat;
-        if (preheat) _ = try seg.dataView();
-        return seg;
     }
 
     /// 首次访问数据视图时才 open + mmap（"按需打开"）。
@@ -329,7 +428,7 @@ pub const Segment = struct {
 
     pub fn close(self: *Segment) void {
         self.entries.deinit(self.alloc);
-        if (self.idx.len > 0) self.alloc.free(self.idx);
+        if (self.owns_idx and self.idx.len > 0) self.alloc.free(@constCast(self.idx));
         if (self.data_path.len > 0) self.alloc.free(self.data_path);
         if (self.mm) |*m| m.destroy(self.io);
         if (self.file) |f| f.close(self.io);
@@ -532,6 +631,38 @@ pub const RefCursor = struct {
         return null;
     }
 };
+
+test "segment idx 被翻位后必须报错（不静默返回错误结果）" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-segment-corrupt";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+    try dir.createDirPath(io, tmp);
+
+    {
+        var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc);
+        try w.push("a", 1, 0, "va");
+        try w.push("b", 2, 0, "vb");
+        _ = try w.finish(dir, tmp ++ "/000001.idx");
+    }
+
+    // 改中间一个字节（既不破坏 magic，也与尾部哈希不符）
+    {
+        const bytes = try readWholeFile(io, dir, tmp ++ "/000001.idx", alloc, 1 << 20);
+        defer alloc.free(bytes);
+        bytes[bytes.len / 2] ^= 0xFF;
+        var f = try dir.createFile(io, tmp ++ "/000001.idx", .{ .truncate = true });
+        defer f.close(io);
+        try f.writePositionalAll(io, bytes, 0);
+    }
+
+    try std.testing.expectError(error.BadIndexChecksum, Segment.open(io, dir, tmp ++ "/000001.data", tmp ++ "/000001.idx", alloc, false));
+}
 
 test "segment write + point get + scan" {
     const alloc = std.testing.allocator;

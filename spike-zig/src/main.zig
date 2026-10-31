@@ -371,6 +371,12 @@ pub fn main() !void {
             spike.segment.timing_enabled = false;
             const tm = spike.segment.timing;
             std.debug.print("big_recover,{d},{d:.0}\n", .{ big_n, @as(f64, @floatFromInt(ns)) / 1e6 });
+            std.debug.print("big_recover_breakdown_ms,dirs,{d:.2}\n", .{@as(f64, @floatFromInt(tm.dirs)) / 1e6});
+            std.debug.print("big_recover_breakdown_ms,wal_replay,{d:.2}\n", .{@as(f64, @floatFromInt(tm.wal_replay)) / 1e6});
+            std.debug.print("big_recover_breakdown_ms,wal_open,{d:.2}\n", .{@as(f64, @floatFromInt(tm.wal_open)) / 1e6});
+            std.debug.print("big_recover_breakdown_ms,segs,{d:.2}\n", .{@as(f64, @floatFromInt(tm.segs)) / 1e6});
+            std.debug.print("big_recover_breakdown_ms,mkseg,{d:.2}\n", .{@as(f64, @floatFromInt(tm.mkseg)) / 1e6});
+            std.debug.print("big_recover_breakdown_ms,seg_append,{d:.2}\n", .{@as(f64, @floatFromInt(tm.seg_append)) / 1e6});
             std.debug.print("big_recover_breakdown_ms,idx_read,{d:.2}\n", .{@as(f64, @floatFromInt(tm.idx_read)) / 1e6});
             std.debug.print("big_recover_breakdown_ms,crc,{d:.2}\n", .{@as(f64, @floatFromInt(tm.crc)) / 1e6});
             std.debug.print("big_recover_breakdown_ms,parse,{d:.2}\n", .{@as(f64, @floatFromInt(tm.parse)) / 1e6});
@@ -405,17 +411,6 @@ pub fn main() !void {
             const ns_pre = nowNs(io) - t2;
             std.debug.print("big_recover_preheat,{d},{d:.0}\n", .{ big_n, @as(f64, @floatFromInt(ns_pre)) / 1e6 });
             t8.deinit();
-
-            // A/B：并行开段（同轮同机对比，避免跨轮环境差异）
-            const t3 = nowNs(io);
-            var t9 = try tablemod.Table.open(io, dir, path6, alloc, .{
-                .wal_sync_every = 10_000,
-                .flush_bytes = 8 << 20,
-                .parallel_open = true,
-            });
-            const ns_par = nowNs(io) - t3;
-            defer t9.deinit();
-            std.debug.print("big_recover_parallel,{d},{d:.0}\n", .{ big_n, @as(f64, @floatFromInt(ns_par)) / 1e6 });
         }
     }
 }
