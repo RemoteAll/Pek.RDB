@@ -73,7 +73,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
     mcu.root_module.strip = true;
-    b.installArtifact(mcu);
+    // 注意：**不能** b.installArtifact(mcu)，否则默认 `zig build` 会在宿主上尝试链接 mcu-probe
+    // （没有 main，只有 _start）→ 默认构建失败。只由 `zig build mcu` 步骤安装。
     const mcu_step = b.step("mcu", "Build the bare-metal M0 probe (cross-compile)");
     mcu_step.dependOn(&b.addInstallArtifact(mcu, .{}).step);
 }

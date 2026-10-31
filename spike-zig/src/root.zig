@@ -11,6 +11,7 @@ pub const exec = @import("exec.zig");
 pub const catalog = @import("catalog.zig");
 pub const engine = @import("engine.zig");
 pub const m0 = @import("m0.zig");
+pub const m0_spi = @import("m0_spi.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
