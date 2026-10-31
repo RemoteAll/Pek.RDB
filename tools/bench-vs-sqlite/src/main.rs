@@ -135,5 +135,143 @@ fn main() -> rusqlite::Result<()> {
     println!("recover_read,1,1");
 
     drop(conn2);
+
+    // ---------------- 并发写（对齐 Zig 侧「跨表并行」：每线程独立库文件） ----------------
+    let conc_per: i64 = 300_000;
+    for nt in [1usize, 2, 4] {
+        // (a) 逐行 autocommit —— 对应 Zig 侧逐行 put（Zig 有跨行组提交，SQLite 这里是每行一次提交）
+        let t0 = Instant::now();
+        std::thread::scope(|s| {
+            for i in 0..nt {
+                s.spawn(move || -> rusqlite::Result<()> {
+                    let path = format!("bench-conc-{i}.db");
+                    let _ = std::fs::remove_file(&path);
+                    let c = Connection::open(&path)?;
+                    c.pragma_update(None, "journal_mode", "WAL")?;
+                    c.pragma_update(None, "synchronous", "NORMAL")?;
+                    c.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)")?;
+                    let mut stmt = c.prepare("INSERT INTO t(id, v) VALUES (?1, ?2)")?;
+                    for k in 0..conc_per {
+                        stmt.execute(params![k, &value[..]])?;
+                    }
+                    drop(stmt);
+                    drop(c);
+                    let _ = std::fs::remove_file(&path);
+                    let _ = std::fs::remove_file(format!("{path}-wal"));
+                    let _ = std::fs::remove_file(format!("{path}-shm"));
+                    Ok(())
+                });
+            }
+        });
+        let secs = t0.elapsed().as_secs_f64();
+        let total = conc_per as f64 * nt as f64;
+        println!("conc_put_{}t_auto,{},{}", nt, total as i64, total / secs);
+
+        // (b) 每线程单事务 —— 对应 Zig 侧批量写能力（SQLite 的最佳形态）
+        let t0 = Instant::now();
+        std::thread::scope(|s| {
+            for i in 0..nt {
+                s.spawn(move || -> rusqlite::Result<()> {
+                    let path = format!("bench-conc-t-{i}.db");
+                    let _ = std::fs::remove_file(&path);
+                    let c = Connection::open(&path)?;
+                    c.pragma_update(None, "journal_mode", "WAL")?;
+                    c.pragma_update(None, "synchronous", "NORMAL")?;
+                    c.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)")?;
+                    c.execute_batch("BEGIN")?;
+                    {
+                        let mut stmt = c.prepare("INSERT INTO t(id, v) VALUES (?1, ?2)")?;
+                        for k in 0..conc_per {
+                            stmt.execute(params![k, &value[..]])?;
+                        }
+                    }
+                    c.execute_batch("COMMIT")?;
+                    drop(c);
+                    let _ = std::fs::remove_file(&path);
+                    let _ = std::fs::remove_file(format!("{path}-wal"));
+                    let _ = std::fs::remove_file(format!("{path}-shm"));
+                    Ok(())
+                });
+            }
+        });
+        let secs = t0.elapsed().as_secs_f64();
+        let total = conc_per as f64 * nt as f64;
+        println!("conc_put_{}t_txn,{},{}", nt, total as i64, total / secs);
+    }
+
+    // ---------------- 超内存数据集（200 万行） ----------------
+    {
+        const BIG: i64 = 2_000_000;
+        let path = "bench-big.db";
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+
+        let c = Connection::open(path)?;
+        c.pragma_update(None, "journal_mode", "WAL")?;
+        c.pragma_update(None, "synchronous", "NORMAL")?;
+        c.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)")?;
+
+        let t0 = Instant::now();
+        c.execute_batch("BEGIN")?;
+        {
+            let mut stmt = c.prepare("INSERT INTO t(id, v) VALUES (?1, ?2)")?;
+            for i in 0..BIG {
+                stmt.execute(params![i, &value[..]])?;
+            }
+        }
+        c.execute_batch("COMMIT")?;
+        let secs = t0.elapsed().as_secs_f64();
+        println!("big_put_txn,{},{}", BIG, BIG as f64 / secs);
+
+        // 随机点查
+        let t0 = Instant::now();
+        let mut hits: i64 = 0;
+        {
+            let mut stmt = c.prepare("SELECT v FROM t WHERE id = ?1")?;
+            let mut x: u64 = 88_172_645_463_325_252;
+            for _ in 0..GET_N {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let id = (x % BIG as u64) as i64;
+                let v: Vec<u8> = stmt.query_row(params![id], |r| r.get(0))?;
+                if !v.is_empty() {
+                    hits += 1;
+                }
+            }
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        println!("big_get,{},{}", GET_N, GET_N as f64 / secs);
+        println!("big_get_hits,{},{}", GET_N, hits);
+
+        // 范围扫描（仅 key，与 Zig big_scan_refs 同口径）
+        let t0 = Instant::now();
+        let count: i64 = {
+            let mut stmt = c.prepare("SELECT id FROM t WHERE id >= ?1 AND id < ?2")?;
+            let mut rows = stmt.query(params![SCAN_LO, SCAN_HI])?;
+            let mut c2 = 0i64;
+            while rows.next()?.is_some() {
+                c2 += 1;
+            }
+            c2
+        };
+        let secs = t0.elapsed().as_secs_f64();
+        println!("big_scan,{},{}", count, count as f64 / secs);
+
+        drop(c);
+
+        let t0 = Instant::now();
+        let c2 = Connection::open(path)?;
+        c2.pragma_update(None, "journal_mode", "WAL")?;
+        c2.pragma_update(None, "synchronous", "NORMAL")?;
+        let _: Vec<u8> = c2.query_row("SELECT v FROM t WHERE id = ?1", params![12345i64], |r| r.get(0))?;
+        println!("big_recover,{},{}", BIG, t0.elapsed().as_secs_f64() * 1000.0);
+        drop(c2);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
     Ok(())
 }

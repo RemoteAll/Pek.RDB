@@ -74,7 +74,17 @@ $pairs = @(
     [pscustomobject]@{ Name = '范围扫描（仅 key）';       Zig = 'scan_refs';   Lite = 'scan';     Unit = '行/s';  Higher = $true },
     [pscustomobject]@{ Name = 'SQL 层插入';               Zig = 'sql_put';     Lite = 'put_txn';  Unit = '行/s';  Higher = $true },
     [pscustomobject]@{ Name = 'SQL 层点查';               Zig = 'sql_get';     Lite = 'get';      Unit = '次/s';  Higher = $true },
-    [pscustomobject]@{ Name = '冷重开（1M 行）';          Zig = 'recover';     Lite = 'recover';  Unit = 'ms';    Higher = $false }
+    [pscustomobject]@{ Name = '冷重开（1M 行）';          Zig = 'recover';     Lite = 'recover';  Unit = 'ms';    Higher = $false },
+    # 并发写（跨表并行；SQLite 侧每线程独立库文件）
+    [pscustomobject]@{ Name = '并发写 1 线程（vs SQLite 事务）'; Zig = 'conc_put_1t'; Lite = 'conc_put_1t_txn'; Unit = '行/s'; Higher = $true },
+    [pscustomobject]@{ Name = '并发写 2 线程（vs SQLite 事务）'; Zig = 'conc_put_2t'; Lite = 'conc_put_2t_txn'; Unit = '行/s'; Higher = $true },
+    [pscustomobject]@{ Name = '并发写 4 线程（vs SQLite 事务）'; Zig = 'conc_put_4t'; Lite = 'conc_put_4t_txn'; Unit = '行/s'; Higher = $true },
+    [pscustomobject]@{ Name = '并发写 4 线程（vs SQLite 逐行 auto）'; Zig = 'conc_put_4t'; Lite = 'conc_put_4t_auto'; Unit = '行/s'; Higher = $true },
+    # 超内存数据集（200 万行）
+    [pscustomobject]@{ Name = '超内存写 200 万行';        Zig = 'big_put';        Lite = 'big_put_txn'; Unit = '行/s'; Higher = $true },
+    [pscustomobject]@{ Name = '超内存点查';               Zig = 'big_get';        Lite = 'big_get';     Unit = '次/s'; Higher = $true },
+    [pscustomobject]@{ Name = '超内存范围扫描（仅 key）'; Zig = 'big_scan_refs';  Lite = 'big_scan';    Unit = '行/s'; Higher = $true },
+    [pscustomobject]@{ Name = '超内存冷重开';             Zig = 'big_recover';    Lite = 'big_recover'; Unit = 'ms';   Higher = $false }
 )
 
 function Format-Num {
