@@ -111,7 +111,11 @@ $pairs = @(
     [pscustomobject]@{ Name = '超内存小范围扫描（我们收集 / SQLite 只推进游标，不对等）'; Zig = 'big_scan_refs'; Lite = 'big_scan'; Unit = '行/s'; Higher = $true },
     [pscustomobject]@{ Name = '超内存范围扫描（仅 key，20 万行，两边都只数行）'; Zig = 'big_count_range'; Lite = 'big_count_range'; Unit = '行/s'; Higher = $true },
     [pscustomobject]@{ Name = '超内存全表遍历（两边都只数行，50 万行）'; Zig = 'big_count'; Lite = 'big_count'; Unit = '行/s'; Higher = $true },
-    [pscustomobject]@{ Name = '超内存冷重开';             Zig = 'big_recover';    Lite = 'big_recover'; Unit = 'ms';   Higher = $false },
+    # 冷重开口径：Zig 的 `big_recover` 只量 `Table.open`，所以对等的 SQLite 档必须是
+    # `big_recover_open`（open + 两次 pragma，不查询）。`big_recover` 里带了一条
+    # `query_row` 取值，两边做的事不同，仅留档不计入结论。
+    [pscustomobject]@{ Name = '超内存冷重开（纯 open，越低越好）'; Zig = 'big_recover'; Lite = 'big_recover_open'; Unit = 'ms'; Higher = $false },
+    [pscustomobject]@{ Name = '超内存冷重开（SQLite 额外做一次点查取值，不对等留档）'; Zig = 'big_recover'; Lite = 'big_recover'; Unit = 'ms'; Higher = $false },
     # 随机原地 UPDATE（§16.1 达标线：SQLite 强项）。主口径用 SQLite 单事务（最佳形态），逐行 auto 作参考。
     [pscustomobject]@{ Name = '随机原地 UPDATE（vs SQLite 单事务）'; Zig = 'upd_random'; Lite = 'upd_random_txn';  Unit = '次/s'; Higher = $true },
     [pscustomobject]@{ Name = '随机原地 UPDATE（vs SQLite 逐行 auto）'; Zig = 'upd_random'; Lite = 'upd_random_auto'; Unit = '次/s'; Higher = $true },

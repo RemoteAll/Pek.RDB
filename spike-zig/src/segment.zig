@@ -51,7 +51,51 @@ fn hashPair(key: []const u8) [2]u64 {
     return .{ h1, h2 };
 }
 
+/// 索引归档的只读映射（`seg/index.bin`）。
+///
+/// 为什么用 mmap 而不是「读进堆」：200 万行 25 段时间 3.13MB，`readPositionalAll`
+/// 实测 1.0–1.6ms（3.1GB/s，是 Windows 内核拷贝的实速）。mmap 后：
+/// - 建立映射 ~0.3ms，不拷贝；
+/// - 只访问各段头部（`parseIdxHeader`）时只缺页 25 页（实测 0.022ms）；
+/// - CRC 与 Bloom 在 `Segment.ensureParsed()` 时才访存，推迟到真正查询时。
+///
+/// 这就是 SQLite `sqlite3BtreeOpen` 的做法：open 只读第 1 页（`pPage1`），其余页按需缺页。
+pub const IndexMap = struct {
+    io: std.Io,
+    file: std.Io.File,
+    mm: std.Io.File.MemoryMap,
+
+    pub fn bytes(self: *const IndexMap) []const u8 {
+        return self.mm.memory;
+    }
+
+    /// 释放映射与文件句柄。**必须在 Table 生命周期结束前、或归档被 rename 覆盖后调用**
+    /// （rename 本身不会被拒，见 `test "mmap 存活时 rename 覆盖同路径"`，但映射
+    /// 仍指向旧 inode，内容会过期，所以之后必须不再使用）。
+    pub fn destroy(self: *IndexMap) void {
+        self.mm.destroy(self.io);
+        self.file.close(self.io);
+        self.* = undefined;
+    }
+};
+
+/// 把整个文件映射成只读切片；空文件/不存在按 `FileNotFound` 上报（调用方据此区分「新建库」）。
+pub fn mapWholeFile(io: std.Io, dir: std.Io.Dir, path: []const u8, max: u64) !IndexMap {
+    const f = try dir.openFile(io, path, .{});
+    errdefer f.close(io);
+    const size = (try f.stat(io)).size;
+    if (size > max) return error.FileTooBig;
+    if (size == 0) return error.FileNotFound;
+    const mm = try std.Io.File.MemoryMap.create(io, f, .{
+        .len = @intCast(size),
+        .protection = .{ .read = true, .write = false },
+    });
+    return .{ .io = io, .file = f, .mm = mm };
+}
+
 pub fn readWholeFile(io: std.Io, dir: std.Io.Dir, path: []const u8, alloc: std.mem.Allocator, max: u64) ![]u8 {
+    var t0: u64 = 0;
+    if (timing_enabled) t0 = tick(io);
     const f = try dir.openFile(io, path, .{});
     defer f.close(io);
     // 先 stat 拿长度再一次性读：比「盲读 64KB 再扩容」少一次 read（实测后者慢 ~1ms / 25 段）。
@@ -59,7 +103,13 @@ pub fn readWholeFile(io: std.Io, dir: std.Io.Dir, path: []const u8, alloc: std.m
     if (size > max) return error.FileTooBig;
     const buf = try alloc.alloc(u8, @intCast(size));
     errdefer alloc.free(buf);
+    if (timing_enabled) {
+        const t1 = tick(io);
+        timing.idx_alloc += t1 - t0;
+        t0 = t1;
+    }
     const n = try f.readPositionalAll(io, buf, 0);
+    if (timing_enabled) timing.idx_copy += tick(io) - t0;
     // 注意：这里**不能**手动 free（errdefer 已经会释放），否则是 double free
     if (n != buf.len) return error.UnexpectedEndOfFile;
     return buf;
@@ -381,6 +431,11 @@ pub const Timing = struct {
     mkseg: u64 = 0,
     /// 每段：数组 append
     seg_append: u64 = 0,
+    /// `readWholeFile` 的分配阶段（smp_allocator 大块走 mmap，首次写有却页）。
+    /// 单独计是为了判断 3.13MB 索引读入的 1.3ms 到底花在「分配+却页」还是「内核拷贝」。
+    idx_alloc: u64 = 0,
+    /// `readWholeFile` 的 readPositionalAll 阶段（内核从页缓存拷到用户空间）。
+    idx_copy: u64 = 0,
 };
 pub var timing_enabled: bool = false;
 pub var timing: Timing = .{};
@@ -409,6 +464,13 @@ pub const Segment = struct {
     idx: []const u8 = &.{},
     owns_idx: bool = false,
     entries: std.ArrayList(Entry) = .empty,
+    /// 稀疏索引总条数（来自段头部，**不需要解析全量 entries 就能知道**）。
+    n_entries: u32 = 0,
+    /// `entries` / `bits_*` / CRC 是否已真正解析。
+    /// 对齐 SQLite：`sqlite3BtreeOpen` 只读第 1 页（`pPage1`），叶页/索引页按需缺页。
+    /// 我们同样只读段头部（magic + 行数/seq 水位 + 第 1 条稀疏索引），
+    /// 足够做段裁剪与可见性判定，剩下的 entries/Bloom/CRC 推到 `ensureParsed()`。
+    parsed: bool = false,
     bits_off: u32 = 0,
     bits_len: u64 = 0,
     rows: usize = 0,
@@ -417,8 +479,28 @@ pub const Segment = struct {
     file_size: u64 = 0,
 
     pub fn entryKey(self: *const Segment, i: usize) []const u8 {
+        std.debug.assert(self.parsed);
         const e = self.entries.items[i];
         return self.idx[e.key_off..][0..e.key_len];
+    }
+
+    /// 段内最小 key（第 1 条稀疏索引）。
+    /// **不要求 `ensureParsed()`** —— 头部解析时就已装好第 1 条，段裁剪靠它。
+    pub fn firstKey(self: *const Segment) ?[]const u8 {
+        if (self.entries.items.len == 0) return null;
+        const e = self.entries.items[0];
+        return self.idx[e.key_off..][0..e.key_len];
+    }
+
+    /// 首次真正使用本段（扫描/点查/Bloom）前调用：完成 CRC 校验 + entries + Bloom 解析。
+    ///
+    /// 代价说明：CRC 覆盖整段字节，所以一次 `ensureParsed()` 必然访存整段 ——
+    /// 这正是「open 只读头部」换来的推迟，不是省掉。要判断值不值，请看
+    /// `big_recover`（纯 open）与 `big_get_after_reopen`（重开+查询）两个指标的变化。
+    pub fn ensureParsed(self: *Segment) !void {
+        if (self.parsed) return;
+        try self.parseIdxBody(self.idx);
+        self.parsed = true;
     }
 
     /// `preheat`：是否在打开时就把数据文件全部读进页缓存。
@@ -443,7 +525,7 @@ pub const Segment = struct {
         }
         var seg = Segment{ .io = io, .alloc = alloc, .idx = idx_bytes, .owns_idx = true };
         errdefer seg.entries.deinit(alloc);
-        try seg.parseIdxBytes(idx_bytes);
+        try seg.parseIdxHeader(idx_bytes);
         try seg.attach(dir, data_path, 0, preheat);
         return seg;
     }
@@ -467,7 +549,7 @@ pub const Segment = struct {
             .owns_idx = take_ownership,
         };
         errdefer seg.entries.deinit(alloc);
-        try seg.parseIdxBytes(payload);
+        try seg.parseIdxHeader(payload);
         try seg.attach(dir, base_path, id, preheat);
         return seg;
     }
@@ -482,7 +564,37 @@ pub const Segment = struct {
     }
 
     /// 解析一段索引的字节：自己带 magic + 尾部 CRC（聚合归档里定位损坏段用）。
-    fn parseIdxBytes(self: *Segment, idx_bytes: []const u8) !void {
+    ///
+    /// 拆成两半：
+    /// - `parseIdxHeader`：open 时只读这一段（magic + 行数/seq 水位 + 第 1 条稀疏索引），
+    ///   几十字节就够做段裁剪与可见性判定；
+    /// - `parseIdxBody`：首次使用时才做（CRC 覆盖整段，必须全读）。
+    fn parseIdxHeader(self: *Segment, idx_bytes: []const u8) !void {
+        if (idx_bytes.len < 16) return error.BadIndexChecksum;
+        if (!std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC)) return error.BadIndexMagic;
+
+        var r = codec.Reader{ .buf = idx_bytes[8..] };
+        self.rows = @intCast(try r.u64le());
+        self.min_seq = try r.u64le();
+        self.max_seq = try r.u64le();
+        self.n_entries = @intCast(try r.u32le());
+
+        // 第 1 条稀疏索引就是段内最小 key —— 段裁剪只需要它。
+        // 先把它装进 `entries`，这样「只 open 不查询」的路径也能正确裁剪。
+        if (self.n_entries > 0) {
+            const off = try r.u64le();
+            const klen: usize = @intCast(try r.u32le());
+            const key = try r.bytes(klen);
+            try self.entries.append(self.alloc, .{
+                .offset = off,
+                .key_off = @intCast(@intFromPtr(key.ptr) - @intFromPtr(idx_bytes.ptr)),
+                .key_len = @intCast(klen),
+            });
+        }
+    }
+
+    /// 全量解析（CRC + 全部稀疏索引 + Bloom）。
+    fn parseIdxBody(self: *Segment, idx_bytes: []const u8) !void {
         var t0: u64 = 0;
         if (timing_enabled) t0 = tick(self.io);
         if (idx_bytes.len < 16 or std.mem.readInt(u64, idx_bytes[idx_bytes.len - 8 ..][0..8], .little) != codec.hashIdx(idx_bytes[0 .. idx_bytes.len - 8])) {
@@ -496,10 +608,11 @@ pub const Segment = struct {
             t0 = t1;
         }
 
+        self.entries.clearRetainingCapacity();
         var r = codec.Reader{ .buf = idx_bytes[8..] };
-        self.rows = @intCast(try r.u64le());
-        self.min_seq = try r.u64le();
-        self.max_seq = try r.u64le();
+        _ = try r.u64le(); // rows（头部已读）
+        _ = try r.u64le(); // min_seq
+        _ = try r.u64le(); // max_seq
         const n: usize = @intCast(try r.u32le());
         try self.entries.ensureTotalCapacity(self.alloc, n);
         var i: usize = 0;
@@ -615,6 +728,7 @@ pub const Segment = struct {
     /// 点查：Bloom 否定 → 稀疏索引定位 → 读出该段记录扫描。
     /// out 为避免每次分配的复用缓冲；返回 flags。
     pub fn get(self: *Segment, key: []const u8, snapshot: u64, out: *std.ArrayList(u8)) !?u8 {
+        try self.ensureParsed();
         if (!self.mayContain(key)) return null;
         if (self.entries.items.len == 0) return null;
 
@@ -663,6 +777,7 @@ pub const Segment = struct {
     /// 零拷贝扫描：输出借用 mmap 的切片（调用方保证段存活）。
     /// 同一 key 只输出一个可见版本（墓碑跳过）。
     pub fn scanRefs(self: *Segment, start: []const u8, end: []const u8, snapshot: u64, out: *std.ArrayList(RefRecord)) !void {
+        try self.ensureParsed();
         if (self.entries.items.len == 0) return;
         const data = try self.dataView();
         var pos: usize = @intCast(self.entries.items[self.candidateIndex(start)].offset);
@@ -701,6 +816,7 @@ pub const Segment = struct {
 
     /// 流式游标：按 (key asc, seq desc) 逐条产出可见记录（不去重）。
     pub fn cursor(self: *Segment, start: []const u8, end: []const u8, snapshot: u64) !RefCursor {
+        try self.ensureParsed();
         const view = try self.dataView();
         var pos: usize = view.len;
         if (self.entries.items.len > 0) {
@@ -718,6 +834,7 @@ pub const Segment = struct {
         snapshot: u64,
         out: *std.ArrayList(RecordOwned),
     ) !void {
+        try self.ensureParsed();
         if (self.entries.items.len == 0) return;
         const i = self.candidateIndex(start);
         const begin: usize = @intCast(self.entries.items[i].offset);
@@ -822,7 +939,11 @@ test "segment idx 被翻位后必须报错（不静默返回错误结果）" {
         try f.writePositionalAll(io, bytes, 0);
     }
 
-    try std.testing.expectError(error.BadIndexChecksum, Segment.open(io, dir, tmp ++ "/000001.data", tmp ++ "/000001.idx", alloc, false));
+    // CRC 改为**懒校验**（对齐 SQLite：open 只读第 1 页，页完整性在使用时才发现）。
+    // 所以这里不能指望 `open` 就报错，必须走到 `ensureParsed()` 才校验。
+    var seg = try Segment.open(io, dir, tmp ++ "/000001.data", tmp ++ "/000001.idx", alloc, false);
+    defer seg.close();
+    try std.testing.expectError(error.BadIndexChecksum, seg.ensureParsed());
 }
 
 test "segment write + point get + scan" {
@@ -969,7 +1090,9 @@ test "Bloom 在线累积：位图大小由预估行数定，行数超预估也�
 
     var seg = try Segment.open(io, dir, tmp ++ "/000001.data", tmp ++ "/000001.idx", alloc, false);
     defer seg.close();
+    // rows 来自段头部（open 时就有）；bits_len 属于主体，必须先 ensureParsed。
     try std.testing.expectEqual(@as(usize, n), seg.rows);
+    try seg.ensureParsed();
     try std.testing.expectEqual(@as(u64, 64), seg.bits_len);
 
     var out: std.ArrayList(u8) = .empty;
@@ -995,5 +1118,67 @@ test "Bloom 在线累积：位图大小由预估行数定，行数超预估也�
     }
     var seg2 = try Segment.open(io, dir, tmp ++ "/000002.data", tmp ++ "/000002.idx", alloc, false);
     defer seg2.close();
+    try seg2.ensureParsed();
     try std.testing.expectEqual(@as(u64, 0), seg2.bits_len);
+}
+
+test "mmap 存活时 rename 覆盖同路径：验证 compact 重写归档是否可行" {
+    // 冷重开优化（对齐 SQLite 的懒加载）打算把 `seg/index.bin` 改成 mmap，
+    // 而 `compact()` 的 `archiveRewrite` 是「写临时文件 + rename 覆盖目标」。
+    // 若映射存活时 rename 会被拒（Windows 可能返回 AccessDenied），方案就得改设计。
+    // 这个用例就是那个前提的守门人。
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const cwd = std.Io.Dir.cwd();
+
+    const dirname = "test-mmap-rename-tmp";
+    cwd.deleteTree(io, dirname) catch {};
+    defer cwd.deleteTree(io, dirname) catch {};
+    try cwd.createDirPath(io, dirname);
+
+    const p = dirname ++ "/index.bin";
+    const tmp = dirname ++ "/index.bin.tmp";
+    const original = "ORIGINAL-CONTENT-0123456789";
+    const replacement = "NEW";
+
+    {
+        const f = try cwd.createFile(io, p, .{ .truncate = true });
+        defer f.close(io);
+        try f.writePositionalAll(io, original, 0);
+    }
+
+    const f_map = try cwd.openFile(io, p, .{});
+    var mm = try std.Io.File.MemoryMap.create(io, f_map, .{
+        .len = original.len,
+        .protection = .{ .read = true, .write = false },
+    });
+    defer {
+        mm.destroy(io);
+        f_map.close(io);
+    }
+    try std.testing.expectEqualStrings(original, mm.memory[0..original.len]);
+
+    {
+        const f = try cwd.createFile(io, tmp, .{ .truncate = true });
+        defer f.close(io);
+        try f.writePositionalAll(io, replacement, 0);
+    }
+
+    // 关键动作：映射还活着时 rename 覆盖目标路径
+    // 这里**不允许** SkipZigTest：跳过等于没测，而这条正是懒加载方案的前提。
+    cwd.rename(tmp, cwd, p, io) catch |e| {
+        std.debug.print("\n[结论] mmap 存活时 rename 被拒: {s}\n", .{@errorName(e)});
+        return e;
+    };
+
+    // 映射仍指向旧文件：内容不变
+    try std.testing.expectEqualStrings(original, mm.memory[0..original.len]);
+    // 重新 open 则是新内容
+    const f3 = try cwd.openFile(io, p, .{});
+    defer f3.close(io);
+    var rd: [3]u8 = undefined;
+    _ = try f3.readPositionalAll(io, &rd, 0);
+    try std.testing.expectEqualStrings(replacement, &rd);
 }

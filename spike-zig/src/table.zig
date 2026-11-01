@@ -136,7 +136,10 @@ pub const Table = struct {
     /// 索引聚合文件路径（`seg/index.bin`）
     index_path: []u8,
     /// 从 index.bin 一次读入的全部段索引（段的 idx 指向这里）
-    idx_archive: []u8 = &.{},
+    /// 索引归档的只读映射；`idx_archive` 就是它的一部分切片。
+    /// 生命周期由 Table 持有：注销时 `destroy()`，compact 后置空。
+    idx_map: ?segmod.IndexMap = null,
+    idx_archive: []const u8 = &.{},
     /// index.bin 的有效末尾（下次追加从这里写，覆盖崩溃残片）
     index_valid_len: u64 = 8,
     mem: Skiplist,
@@ -185,17 +188,22 @@ pub const Table = struct {
 
         // 索引文件读得到 ⇒ 库已初始化 ⇒ 目录一定存在，直接跳过 3 次 createDirPath
         // （实测 createDirPath × 3 在冷重开里占 0.2–0.8ms）。
-        var arch: []u8 = &.{};
+        var idx_map: ?segmod.IndexMap = null;
+        errdefer if (idx_map) |*m| m.destroy();
+        var arch: []const u8 = &.{};
         const has_index = blk: {
-            if (segmod.readWholeFile(io, dir, index_path, alloc, 16 << 30)) |a| {
-                arch = a;
+            // mmap 而非读入堆：3.13MB 的 `readPositionalAll` 实测 1.0–1.6ms（内核拷贝），
+            // 而 mmap 建映射 ~0.3ms，且只访问段头部时只缺页 25 页（~0.02ms）。
+            // 这是 SQLite `sqlite3BtreeOpen` 只读第 1 页的同款做法。
+            if (segmod.mapWholeFile(io, dir, index_path, 64 << 30)) |m| {
+                idx_map = m;
+                arch = m.bytes();
                 break :blk true;
             } else |e| switch (e) {
                 error.FileNotFound => break :blk false,
                 else => return e,
             }
         };
-        errdefer if (arch.len > 0) alloc.free(arch);
         // 归档格式必须对得上：宁可报错，也不能把旧格式按新布局解析出乱数据
         try segmod.archiveCheckMagic(arch);
 
@@ -270,6 +278,7 @@ pub const Table = struct {
             .base_path = base_path,
             .wal_path = wal_path,
             .index_path = index_path,
+            .idx_map = idx_map,
             .idx_archive = arch,
             .index_valid_len = opened.valid_end,
             .mem = mem,
@@ -285,7 +294,9 @@ pub const Table = struct {
     pub fn deinit(self: *Table) void {
         for (self.segs.items) |*s| s.close();
         self.segs.deinit(self.alloc);
-        if (self.idx_archive.len > 0) self.alloc.free(self.idx_archive);
+        if (self.idx_map) |*m| m.destroy();
+        self.idx_map = null;
+        self.idx_archive = &.{};
         self.mem.deinit();
         self.wal.close();
         self.alloc.free(self.base_path);
@@ -578,7 +589,8 @@ pub const Table = struct {
             self.dir.deleteFile(self.io, op) catch {};
         }
         self.segs.clearRetainingCapacity();
-        if (self.idx_archive.len > 0) self.alloc.free(self.idx_archive);
+        if (self.idx_map) |*m| m.destroy();
+        self.idx_map = null;
         self.idx_archive = &.{};
 
         // 用 assumeCapacity：`segs` 刚装过 ≥2 个元素、容量一定够，append 不会重分配。
@@ -644,8 +656,12 @@ pub const MergeIter = struct {
             // 顺序写入的段 key 范围几乎不重叠，这一刀能砍掉大部分路数。
             // 注：只能剪「段在查询之后」这一侧 —— 「段在查询之前」需要段的**最大** key，
             // 而稀疏索引只能给出近似值（最后几行没有索引项），不能用来做安全判定。
-            if (end.len > 0 and s.entries.items.len > 0) {
-                if (segmod.keyCmp(s.entryKey(0), end) != .lt) continue;
+            if (end.len > 0) {
+                // 用 `firstKey()`（段头部就有，不需要 `ensureParsed`）——
+                // 冷重开只解析头部，裁剪判定的信息已经够了。
+                if (s.firstKey()) |k0| {
+                    if (segmod.keyCmp(k0, end) != .lt) continue;
+                }
             }
             const c = try s.cursor(start, end, table.visible);
             try self.cursors.append(alloc, .{ .seg = c });

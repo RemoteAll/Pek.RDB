@@ -595,6 +595,8 @@ fn benchMain() !void {
             const tm = spike.segment.timing;
             std.debug.print("big_recover,{d},{d:.2}\n", .{ big_n, @as(f64, @floatFromInt(ns)) / 1e6 });
             std.debug.print("big_recover_breakdown_ms,dirs,{d:.2}\n", .{@as(f64, @floatFromInt(tm.dirs)) / 1e6});
+            std.debug.print("big_recover_breakdown_ms,idx_alloc,{d:.2}\n", .{@as(f64, @floatFromInt(tm.idx_alloc)) / 1e6});
+            std.debug.print("big_recover_breakdown_ms,idx_copy,{d:.2}\n", .{@as(f64, @floatFromInt(tm.idx_copy)) / 1e6});
             std.debug.print("big_recover_breakdown_ms,wal_replay,{d:.2}\n", .{@as(f64, @floatFromInt(tm.wal_replay)) / 1e6});
             std.debug.print("big_recover_breakdown_ms,wal_open,{d:.2}\n", .{@as(f64, @floatFromInt(tm.wal_open)) / 1e6});
             std.debug.print("big_recover_breakdown_ms,segs,{d:.2}\n", .{@as(f64, @floatFromInt(tm.segs)) / 1e6});
@@ -634,6 +636,87 @@ fn benchMain() !void {
             const ns_pre = nowNs(io) - t2;
             std.debug.print("big_recover_preheat,{d},{d:.0}\n", .{ big_n, @as(f64, @floatFromInt(ns_pre)) / 1e6 });
             t8.deinit();
+        }
+
+        // 诊断：索引「读取方式」对照 —— 堆读 vs mmap。
+        //
+        // 背景：`big_recover` 的分阶段实测显示 `idx_copy` = 1.01ms 占 57%
+        // （3.13MB / 1.01ms = 3.1GB/s，是 Windows 上 readPositionalAll 的实速），
+        // 而 `idx_alloc` 只占 0.19ms。也就是说**只要还把索引拷进用户空间，这 1ms 就下不来**。
+        // 这里只量「拿到可访问字节」的成本，不解析、不校验，回答两个问题：
+        //   ① mmap 建映射本身有多贵（应该接近 0）；
+        //   ② mmap 之后「只读 record 头」vs「全量访存」各多贵（决定能否懒加载）。
+        // 顺序要紧：只读头在前，全量在后，否则前者会被后者的缺页掩盖。
+        {
+            const ip = try alloc.print("{s}/seg/index.bin", .{path6});
+            defer alloc.free(ip);
+
+            // 先预热页缓存一次，避免 A 先跑替 B 付了首次 IO 的账
+            {
+                const f = try dir.openFile(io, ip, .{});
+                defer f.close(io);
+                const sz: usize = @intCast((try f.stat(io)).size);
+                const warm = try alloc.alloc(u8, sz);
+                defer alloc.free(warm);
+                _ = try f.readPositionalAll(io, warm, 0);
+            }
+
+            var sum: u64 = 0;
+
+            // A. 堆读：openFile + stat + alloc + readPositionalAll（= 现在的做法）
+            const ta = nowNs(io);
+            var heap: []u8 = &.{};
+            {
+                const f = try dir.openFile(io, ip, .{});
+                defer f.close(io);
+                const sz: usize = @intCast((try f.stat(io)).size);
+                heap = try alloc.alloc(u8, sz);
+                _ = try f.readPositionalAll(io, heap, 0);
+            }
+            const ns_heap = nowNs(io) - ta;
+            defer alloc.free(heap);
+            sum +%= heap[heap.len / 2];
+
+            // B. mmap：openFile + stat + MemoryMap.create（不触碰页面）
+            const tb = nowNs(io);
+            const f2 = try dir.openFile(io, ip, .{});
+            const sz2: usize = @intCast((try f2.stat(io)).size);
+            var mm = try std.Io.File.MemoryMap.create(io, f2, .{
+                .len = sz2,
+                .protection = .{ .read = true, .write = false },
+            });
+            const ns_map = nowNs(io) - tb;
+            defer {
+                mm.destroy(io);
+                f2.close(io);
+            }
+
+            // C. mmap + 只读 record 头（模拟「只读段元信息表就完成重开」）
+            const tc = nowNs(io);
+            var pos: usize = 8;
+            var nrec: u64 = 0;
+            while (pos + 16 <= mm.memory.len) {
+                const len: usize = @intCast(std.mem.readInt(u32, mm.memory[pos..][0..4], .little));
+                if (pos + 16 + len > mm.memory.len) break;
+                sum +%= mm.memory[pos];
+                pos += 16 + len;
+                nrec += 1;
+            }
+            const ns_hdr = nowNs(io) - tc;
+
+            // D. mmap + 全量访存（模拟 CRC 校验必须读全部 payload 的缺页成本）
+            const td = nowNs(io);
+            var k: usize = 0;
+            while (k < mm.memory.len) : (k += 4096) sum +%= mm.memory[k];
+            const ns_touch = nowNs(io) - td;
+
+            std.mem.doNotOptimizeAway(sum);
+            std.debug.print("idx_read_probe_ms,heap,{d:.3}\n", .{@as(f64, @floatFromInt(ns_heap)) / 1e6});
+            std.debug.print("idx_read_probe_ms,mmap,{d:.3}\n", .{@as(f64, @floatFromInt(ns_map)) / 1e6});
+            std.debug.print("idx_read_probe_ms,mmap_hdronly,{d:.3}\n", .{@as(f64, @floatFromInt(ns_hdr)) / 1e6});
+            std.debug.print("idx_read_probe_ms,mmap_touch,{d:.3}\n", .{@as(f64, @floatFromInt(ns_touch)) / 1e6});
+            std.debug.print("idx_read_probe_recs,1,{d}\n", .{nrec});
+            std.debug.print("idx_read_probe_bytes,1,{d}\n", .{mm.memory.len});
         }
     }
 

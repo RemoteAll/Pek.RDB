@@ -326,6 +326,19 @@ fn main() -> rusqlite::Result<()> {
 
         drop(c);
 
+        // 纯 open（与 Zig 的 `Table.open` 对等）：只开连接 + 两次 pragma，**不做任何查询**。
+        // 原口径里还带了一条 `query_row`，而 Zig 侧 `big_recover` 只量 open ——
+        // 两边做的事不同，比出来的倍数没有意义（这是本项目第 5 次踩同一个坑）。
+        {
+            let t0 = Instant::now();
+            let c_open = Connection::open(path)?;
+            c_open.pragma_update(None, "journal_mode", "WAL")?;
+            c_open.pragma_update(None, "synchronous", "NORMAL")?;
+            println!("big_recover_open,{},{}", BIG, t0.elapsed().as_secs_f64() * 1000.0);
+            drop(c_open);
+        }
+
+        // 重开 + 首次点查（原口径，保留作参考，不计入对等结论）
         let t0 = Instant::now();
         let c2 = Connection::open(path)?;
         c2.pragma_update(None, "journal_mode", "WAL")?;
