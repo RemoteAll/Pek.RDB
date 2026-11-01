@@ -7,6 +7,11 @@ pub const INDEX_STRIDE: usize = 64;
 const FLUSH_BYTES: usize = 1 << 20;
 const IDX_MAGIC = "PEKZIX03";
 
+/// `push` 的升序不变量检查用（只在 Debug/ReleaseSafe 生效）。
+fn keyCmpLessEq(a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) != .gt;
+}
+
 pub const IndexEntry = struct {
     offset: u64,
     key: []u8,
@@ -202,7 +207,14 @@ pub const Writer = struct {
         self.buffers_live = false;
     }
 
+    /// **不变量：`key` 必须按升序（`keyCmp` ≤ 0）调用。**
+    /// 段头写的是「最后一个 `push` 的 key」，只有在升序前提下它才等于段内最大 key；
+    /// 一旦违序，`MergeIter` 的 `canConcat` 就会把「其实重叠」的两段判成不重叠 →
+    /// 顺序拼接会产出乱序甚至漏行。
+    /// 断言只在 Debug/ReleaseSafe 下有效（ReleaseFast 会整条抹掉，热路径零成本）；
+    /// 现有调用方（memtable 刷盘 / compaction 归并）都是升序，测试也跑在 Debug 下。
     pub fn push(self: *Writer, key: []const u8, seq: u64, flags: u8, value: []const u8) !void {
+        std.debug.assert(self.rows == 0 or keyCmpLessEq(self.last_key, key));
         if (self.rows % INDEX_STRIDE == 0) {
             // 必须分两步：写成 `try append(.{ .key = try dupe(...) })` 时，
             // append 一失败，刚 dupe 出来的 key 就丢了（`checkAllAllocationFailures` 抓到的真实泄漏）。
@@ -1121,8 +1133,11 @@ test "Bloom 在线累积：位图大小由预估行数定，行数超预估也�
         defer w.deinit();
         try std.testing.expectEqual(@as(usize, 64), w.bits_len);
         var i: usize = 0;
+        // `k` **必须声明在循环外**：`Writer` 现在会记住最后一个 key 的**地址**（段头 max_key），
+        // 到 `finish` 时才读。声明在循环体内的话，作用域早已结束，`finish` 读到的是
+        // 悬垂栈地址（实践中能跑通，但属未定义行为）。
+        var k: [8]u8 = undefined;
         while (i < n) : (i += 1) {
-            var k: [8]u8 = undefined;
             std.mem.writeInt(u64, &k, @as(u64, @intCast(i)), .big);
             try w.push(&k, @intCast(i + 1), 0, "v");
         }

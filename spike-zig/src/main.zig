@@ -1134,10 +1134,46 @@ fn benchMain() !void {
             }
             std.debug.print("cm_count_before,{d},{d:.0}\n", .{ cnt, opsPerSec(cnt, nowNs(io) - t0) });
             // 确定性观测：25 段到底建了几个游标、比了多少次。
-            // 25 路归并每行约 log2(25)≈4.6 次比较 + 每行一次 `cur[bi] = cursor.next()`，
-            // 而单段路径是内联紧循环 —— 这才是 cm_count_before 比 cm_count_after 慢的来源。
+            //
+            // **别再用「每行 log2(k) 次比较」来推断归并开销** —— §16.1.21 的计数器已经把它
+            // 证伪了：25 段顺序写入时 key 范围互不重叠，堆顶游标推进后仍是最小值，
+            // `siftDown` 第一轮就 return，实测是每行 **2.0** 次比较（不是 4.6）。
+            // 真正的每行成本是「2 次 keyCmp + 一次跨游标间接调用」。
+            // §16.1.22 的顺序拼接把这些降到 0（compares 归零即证明快路径生效）。
             std.debug.print("cm_cursors_before,1,{d}\n", .{kt.merge_cursors_built});
             std.debug.print("cm_compares_before,{d},{d}\n", .{ cnt, itc.compares });
+        }
+
+        // **配对 A/B：顺序拼接 on vs off，同一进程、同一张表、背靠背交替。**
+        //
+        // 为什么必须有这一档：§16.1.22 原本用「本批 25 段 ÷ 本批 1 段」的比值去比
+        // **上一批**的同一个比值，而这两个档在本机的批内波动就有 20–40%
+        // （实测同一轮里 cm_count_before/cm_count_after 从 1.01 到 0.88 都出现过），
+        // 跨批次比值差 14% 根本不可信。这里把「要不要拼接」做成同一进程内的开关，
+        // 每轮背靠背跑两边，并奇偶轮交换先后顺序抵消「先跑的更冷/更热」的系统偏差。
+        {
+            var hic3: [16]u8 = @splat(0xFF);
+            var round: usize = 0;
+            while (round < 3) : (round += 1) {
+                const order: [2]bool = if (round % 2 == 0) .{ true, false } else .{ false, true };
+                for (order) |off| {
+                    kt.opts.no_concat = off;
+                    var it = tablemod.MergeIter{};
+                    try it.init(&kt, &.{}, &hic3);
+                    const t0 = nowNs(io);
+                    var cnt: u64 = 0;
+                    while (it.next()) |_| {
+                        cnt += 1;
+                        if (cnt >= 500_000) break;
+                    }
+                    const ns = nowNs(io) - t0;
+                    const tag = if (off) "off" else "on";
+                    std.debug.print("cm_ab_{s},{d},{d:.0}\n", .{ tag, cnt, opsPerSec(cnt, ns) });
+                    std.debug.print("cm_ab_{s}_compares,{d},{d}\n", .{ tag, cnt, it.compares });
+                    it.deinit();
+                }
+            }
+            kt.opts.no_concat = false;
         }
 
         // 合并前点查
