@@ -1,0 +1,36 @@
+bench: 补齐扫描的同口径对照（1万行「只数行」），公平口径 0 项落后
+
+用户原话：「请继续，目前还有啥是比sqlite差的」
+
+一、发现一处配对错误
+  SQLite 的 scan / big_scan 是 SELECT id ... while rows.next()——只推进游标、一行都不取；
+  我们对应位置放的是 scan_refs / big_scan_refs，它把每条记录收进 ArrayList
+  （RefRecord 48 B/行），压缩块还要重建 key。两件事不同，0.60x / 0.78x 不是「我们慢」，
+  是「我们多做了活」。20 万行的同口径对照（range_k_200k 2.0x、big_range_k 1.6x）早就有，
+  1 万行那一档一直空着，于是那个比值看着像落后。
+
+  新增 count_10k / big_count_10k（两边都只数行，逐字同口径）：
+    scan_10k_count     30,497,103 vs 15,620,119  -> 1.95x
+    big_scan_10k_count 30,039,051 vs 14,624,159  -> 2.05x
+  pairs-verdict.ps1 里把这两对指向新指标；scan_refs/big_scan_refs 仍打印但标 UNEQUAL 不计分。
+
+二、同批 3+3 轮最终结论（scan10k 批次）
+  decidable = 21 / 24; overlap = 1; decidable-and-behind = 0; unequal-work = 2
+  公平口径下 0 项落后。
+
+  唯一「区间重叠、测不出来」的是 big_write 0.93x：
+    我们 1,294,370 (1,158,364-1,325,535)  SQLite 1,387,495 (1,092,197-1,425,518)
+  SQLite 这条历史值 0.84M-1.43M、我们 1.16M-1.73M，区间重叠 -> 按项目规矩不能下结论。
+
+三、真正还「可能更差」的三件事——都是没测过的维度（写进决策记录）
+  1. 常驻内存 / 峰值 RSS：SQLite 有页缓存上限，我们是 memtable 64MB + 段索引 mmap + Bloom
+     + 本轮新增的 KeyArena（全表 scanRefs 后常驻全表 key 总量，200万行约 16MB）。
+     两边都没有 peak_rss 指标。
+  2. 真·冷数据 I/O：所谓「超内存」只是超 64MB memtable，数据集 94MB 全在页缓存里，
+     磁盘读一次都没发生。
+  3. 多线程并发读：只测了并发写（1/2/4 线程），读一直单线程。
+
+验证：zig build test 62/62 通过；zig build -Doptimize=ReleaseFast 通过。
+数据：docs/实测数据/zig-2026-11-01-scan10k-run{1,2,3}.csv
+      配对 sqlite-2026-11-01-pfxblk2-run{1,2,3}.csv
+文档：决策记录（六十七）

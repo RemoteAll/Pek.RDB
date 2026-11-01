@@ -163,6 +163,22 @@ fn benchMain() !void {
         std.debug.print("scan,{d},{d:.0}\n", .{ set.records.len, opsPerSec(@intCast(set.records.len), ns) });
     }
 
+    // 同口径对照（1 万行区间「只数行」）：对应 SQLite 的 `SELECT id ... while rows.next()`。
+    // 上面 `scan` 是 `scanRange`，会把 key+value 物化进缓冲；SQLite 那档一条都不取。
+    // 两个数字放在一起才看得出「物化」本身要多少钱，也才有公平的参照。
+    {
+        const lo = keyOf(scan_lo);
+        const hi = keyOf(scan_hi);
+        var it = tablemod.MergeIter{};
+        try it.init(&t, &lo, &hi);
+        defer it.deinit();
+        const t0 = nowNs(io);
+        var cnt: u64 = 0;
+        while (it.next()) |_| cnt += 1;
+        const ns = nowNs(io) - t0;
+        std.debug.print("count_10k,{d},{d:.0}\n", .{ cnt, opsPerSec(cnt, ns) });
+    }
+
     // 零拷贝扫描（mmap + 单段快路径，1 万行）
     {
         var refs: std.ArrayList(spike.segment.Segment.RefRecord) = .empty;
@@ -651,6 +667,21 @@ fn benchMain() !void {
             }
             const ns = nowNs(io) - t0;
             std.debug.print("big_count,{d},{d:.0}\n", .{ cnt6, opsPerSec(cnt6, ns) });
+        }
+
+        // 同口径对照（1 万行区间「只数行」）：对应 SQLite 的 `big_scan`。
+        // 上面 `big_scan_refs` 是收集 RefRecord，两件事不同；这一档两边都只数行。
+        {
+            const lo8 = keyOf(scan_lo);
+            const hi8 = keyOf(scan_hi);
+            var it8 = tablemod.MergeIter{};
+            try it8.init(&t6, &lo8, &hi8);
+            defer it8.deinit();
+            const t0 = nowNs(io);
+            var cnt8: u64 = 0;
+            while (it8.next()) |_| cnt8 += 1;
+            const ns = nowNs(io) - t0;
+            std.debug.print("big_count_10k,{d},{d:.0}\n", .{ cnt8, opsPerSec(cnt8, ns) });
         }
 
         // 超内存 · 区间「只数行」（20 万行）：对等 SQLite 的 `SELECT id WHERE id >= 0 AND id < 200000`。

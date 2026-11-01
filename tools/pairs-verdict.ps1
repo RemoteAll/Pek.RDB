@@ -59,11 +59,11 @@ $pairs = @(
     @('big_recover', 'big_recover_open', 'big_recover_ms', $false),
     @('upd_random', 'upd_random_txn', 'upd_random', $true),
     @('upd_get', 'upd_get', 'upd_get', $true),
-    # NOT COUNTED: unequal work. zig `scan_refs` collects RefRecord (48 B/row) into a
-    # list AND materializes prefixed keys; sqlite `scan`/`big_scan` only advances a
-    # cursor and counts rows (SELECT id). The equal-work counterparts are
-    # range_k_200k / big_range_k (count only, both sides) and they are ahead -- see
-    # the notes in spike-zig/src/main.zig above the count_range / big_count_range probes.
+    # Equal-work scan pairs: both sides only advance a cursor and count rows.
+    # (`scan_refs` / `big_scan_refs` collect RefRecord = 48 B/row and are therefore
+    #  NOT comparable to sqlite's SELECT-and-count; they are listed separately below.)
+    @('count_10k', 'scan', 'scan_10k_count', $true),
+    @('big_count_10k', 'big_scan', 'big_scan_10k_count', $true),
     @('scan_refs', 'scan', 'arch_scan_refs', $true, 'UNEQUAL'),
     @('big_scan_refs', 'big_scan', 'arch_big_scan_refs', $true, 'UNEQUAL')
 )
