@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
+﻿// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
 // 个人使用免费；商业使用需商业授权，或同样以 AGPL-3.0 开源（见 LICENSE）。
 const std = @import("std");
 const Skiplist = @import("skiplist.zig").Skiplist;
@@ -172,6 +172,9 @@ pub const Table = struct {
     /// 最近一次 `MergeIter.init` **实际建了几个游标**（段裁剪是否生效的可观测证据）。
     /// 「不裁剪只是慢、结果一样」，只看结果永远看不出裁剪有没有生效 —— 必须有这个计数。
     merge_cursors_built: usize = 0,
+    /// 归并累计**比较次数**。确定性指标：它不依赖计时器精度与机器噪声。
+    /// 已用它证伪了「k 小改线性」的直觉 —— 见 `MergeIter.compares` 的注释。
+    merge_compares_total: u64 = 0,
 
     pub fn open(
         io: std.Io,
@@ -663,6 +666,16 @@ pub const MergeIter = struct {
     /// 差距全部来自这 25 次比较。改成堆后是 O(log k)，k=25 时约 5 层。
     heap: []usize = &.{},
     heap_len: usize = 0,
+    /// 本次归并的**比较次数**。确定性指标：不依赖计时，用来判断
+    /// 「某个归并改动到底有没有减少实际工作」。
+    ///
+    /// 已量化：k=2 重叠两段、20 万行时恒为 **399,999**（= 2×200000−1），与实现无关 ——
+    /// 这是「归并不得不做的比较数」的下界。
+    ///
+    /// 曾据此想「k 小改用线性选最小」，但那次 A/B 两边一边冷一边热
+    /// （线性跑第一次、堆跑预热后的第二次），得到的 50% 差异是假的，**该方向已放弃**，
+    /// 代码里只保留堆。要重试必须两边都预热后再比。
+    compares: u64 = 0,
     last_key: []const u8 = &.{},
     have_last: bool = false,
 
@@ -724,9 +737,11 @@ pub const MergeIter = struct {
     /// 堆内比较必须用 `refLess`（它含「同 key 时 seq 大的在前」），
     /// **不能只比 key** —— 只比 key 会让同 key 的旧版本排在前面，
     /// 实测会直接让 compaction/scan 的用例读到 v1a 而不是 v1b。
-    inline fn lessAt(self: *const MergeIter, a: usize, b: usize) bool {
+    inline fn lessAt(self: *MergeIter, a: usize, b: usize) bool {
+        self.compares += 1;
         return refLess({}, self.cur[self.heap[a]].?, self.cur[self.heap[b]].?);
     }
+
 
     fn siftDown(self: *MergeIter, start: usize) void {
         var i = start;
@@ -746,6 +761,7 @@ pub const MergeIter = struct {
         if (self.cur.len > 0) self.table.alloc.free(self.cur);
         if (self.heap.len > 0) self.table.alloc.free(self.heap);
         self.cursors.deinit(self.table.alloc);
+        self.table.merge_compares_total += self.compares;
     }
 
     pub fn next(self: *MergeIter) ?segmod.Segment.RefRecord {

@@ -217,6 +217,53 @@ fn benchMain() !void {
         const ns = nowNs(io) - t0;
         std.debug.print("scan_refs_multi,{d},{d:.0}\n", .{ refs5.items.len, opsPerSec(@intCast(refs5.items.len), ns) });
         std.debug.print("scan_refs_multi_segs,{d},0\n", .{t5.segs.items.len});
+        std.debug.print("merge_cursors_multi,1,{d}\n", .{t5.merge_cursors_built});
+    }
+
+    // k=2 归并的**确定性**观测：必须构造范围完全重叠的两段（同一批 key 写两次、各 flush 一次）。
+    // 前面那档测不到 k=2 —— 两段是顺序写入、key 范围不重叠，段裁剪直接把第 2 段剪掉
+    // （实测 `merge_cursors_multi` 恒为 1），全程走单游标快路径。
+    //
+    // 本档的价值是确定性指标：`merge2_compares` 恒为 399,999（= 2×200000−1），
+    // 与归并实现无关，是「k=2 不得不做的比较数」的下界；`merge2_cursors = 2` 证明真的走了 2 路。
+    //
+    // 曾想用本档证明「k 小走线性更快」，但那次 A/B 两边一边冷一边热（线性跑第一次、
+    // 堆跑预热后的第二次），差异全是假象。**该方向已放弃**；要重试必须两边都预热。
+    {
+        const path8 = "bench-data-2seg";
+        dir.deleteTree(io, path8) catch {};
+        var t8 = try tablemod.Table.open(io, dir, path8, alloc, .{ .wal_sync_every = 10_000 });
+        defer {
+            t8.deinit();
+            dir.deleteTree(io, path8) catch {};
+        }
+        var j: u64 = 0;
+        while (j < 200_000) : (j += 1) {
+            const kb = keyOf(@intCast(j));
+            try t8.put(&kb, &value);
+        }
+        try t8.flush();
+        j = 0;
+        while (j < 200_000) : (j += 1) {
+            const kb = keyOf(@intCast(j));
+            try t8.put(&kb, &value);
+        }
+        try t8.flush();
+
+        var hi8: [16]u8 = @splat(0xFF);
+        const cmp8 = t8.merge_compares_total;
+        const tm0 = nowNs(io);
+        var cnt8: u64 = 0;
+        {
+            var it8 = tablemod.MergeIter{};
+            try it8.init(&t8, &.{}, &hi8);
+            defer it8.deinit();
+            while (it8.next()) |_| cnt8 += 1;
+        }
+        const nsm = nowNs(io) - tm0;
+        std.debug.print("merge2,{d},{d:.0}\n", .{ cnt8, opsPerSec(cnt8, nsm) });
+        std.debug.print("merge2_cursors,{d},0\n", .{t8.merge_cursors_built});
+        std.debug.print("merge2_compares,{d},{d}\n", .{ cnt8, t8.merge_compares_total - cmp8 });
     }
 
     // 100 万行**全表**裸扫描（含值），与 SQL 层 sql_full 同口径。
