@@ -12,8 +12,8 @@
 //!   Q4 (空表) 0 行                <- HAVING COUNT(*) > 0 把唯一那行过滤掉
 //!   Q5 g=2 / g=3 / g=4            <- HAVING 作用在文本聚合 MIN(s) 上（本表 g=4 的 MIN='q'）
 //!   Q6 g=2 / g=3                  <- HAVING 用不在选择列表里的聚合
-//!   Q7 SQLite **接受** `SELECT COUNT(*) ... ORDER BY g`（我们报 ColumnNotFound，已知差异、
-//!      已写进 docs/架构设计.md §16.1.38 的「已知边界」）
+//!   Q7 SQLite **接受** `SELECT COUNT(*) ... ORDER BY g`（`g` 未选中）——
+//!      我们已参照它实现「隐藏排序列」（2026-11-01，见 exec.zig 的 1.7 节），现在两边一致。
 
 use rusqlite::Connection;
 
@@ -70,9 +70,9 @@ fn main() -> rusqlite::Result<()> {
     println!("Q6  HAVING 用不在选择列表里的聚合");
     dump(&conn, "SELECT g FROM h GROUP BY g HAVING COUNT(*) = 1 ORDER BY g")?;
 
-    println!("Q7  ORDER BY 只引用输出列：`SELECT COUNT(*) ... ORDER BY g` 是否被 SQLite 接受");
+    println!("Q7  ORDER BY references a column that is NOT selected: `SELECT COUNT(*) ... ORDER BY g`");
     match dump(&conn, "SELECT COUNT(*) FROM h GROUP BY g ORDER BY g") {
-        Ok(()) => println!("    -> SQLite ACCEPTS it (we reject with ColumnNotFound)"),
+        Ok(()) => println!("    -> SQLite ACCEPTS it; our engine now matches via hidden ORDER BY columns"),
         Err(e) => println!("    -> SQLite rejects: {e}"),
     }
 

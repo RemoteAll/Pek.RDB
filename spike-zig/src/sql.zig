@@ -573,20 +573,6 @@ const Parser = struct {
         return .{ .column = column, .op = op, .value = try self.parseValue() };
     }
 
-    fn parseAggFunc(text: []const u8) ?AggFunc {
-        const map = .{
-            .{ "count", AggFunc.count },
-            .{ "sum", AggFunc.sum },
-            .{ "avg", AggFunc.avg },
-            .{ "min", AggFunc.min },
-            .{ "max", AggFunc.max },
-        };
-        inline for (map) |entry| {
-            if (std.ascii.eqlIgnoreCase(text, entry[0])) return entry[1];
-        }
-        return null;
-    }
-
     /// 一个选择项：`*` / 列名 / 聚合调用。
     ///
     /// 聚合的识别方式是「标识符后面紧跟 `(`」—— 与 SQLite 一致（函数名不是关键字）。
@@ -600,7 +586,7 @@ const Parser = struct {
         const name = try self.parseIdent();
         if (self.tok.tag != .lparen) return .{ .column = name };
 
-        const func = parseAggFunc(name) orelse return error.UnsupportedStatement;
+        const func = aggFuncFromName(name) orelse return error.UnsupportedStatement;
         try self.advance(); // (
         var col: ?[]const u8 = null;
         if (self.tok.tag == .star) {
@@ -622,7 +608,7 @@ const Parser = struct {
         const name = try self.parseIdent();
         if (self.tok.tag != .lparen) return name;
 
-        const func = parseAggFunc(name) orelse return error.UnsupportedStatement;
+        const func = aggFuncFromName(name) orelse return error.UnsupportedStatement;
         try self.advance(); // (
         var col: ?[]const u8 = null;
         if (self.tok.tag == .star) {
@@ -640,7 +626,7 @@ const Parser = struct {
 
     fn parseHaving(self: *Parser) Error!Having {
         const name = try self.parseIdent();
-        const func = parseAggFunc(name) orelse return error.UnsupportedStatement;
+        const func = aggFuncFromName(name) orelse return error.UnsupportedStatement;
         _ = try self.expectTag(.lparen);
         var col: ?[]const u8 = null;
         if (self.tok.tag == .star) {
@@ -784,6 +770,24 @@ const Parser = struct {
         return error.UnsupportedStatement;
     }
 };
+
+/// 聚合名 → 枚举（大小写不敏感）。
+///
+/// 公开是为了让执行层能把 `ORDER BY sum(x)` 这样的**规范化列名**解回聚合描述
+/// —— 那一步不能靠字符串再拼一次，必须用同一张表。
+pub fn aggFuncFromName(text: []const u8) ?AggFunc {
+    const map = .{
+        .{ "count", AggFunc.count },
+        .{ "sum", AggFunc.sum },
+        .{ "avg", AggFunc.avg },
+        .{ "min", AggFunc.min },
+        .{ "max", AggFunc.max },
+    };
+    inline for (map) |entry| {
+        if (std.ascii.eqlIgnoreCase(text, entry[0])) return entry[1];
+    }
+    return null;
+}
 
 /// 解析一条 SQL；AST 由内部 arena 持有，调用方负责 `deinit`。src 需在 AST 使用期间有效。
 pub fn parse(alloc: std.mem.Allocator, src: []const u8) Error!Parsed {

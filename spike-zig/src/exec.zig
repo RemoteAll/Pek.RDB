@@ -563,6 +563,34 @@ fn aggFuncName(f: sql.AggFunc) []const u8 {
     };
 }
 
+/// 聚合的规范列名：`sum(x)` / `count(*)`。**输出列名与 ORDER BY 匹配用同一份**，
+/// 两处各拼一次字符串迟早会不一致。
+fn aggLabel(alloc: std.mem.Allocator, a: sql.Agg) ![]const u8 {
+    return if (a.column) |c|
+        try alloc.print("{s}({s})", .{ aggFuncName(a.func), c })
+    else
+        try alloc.print("{s}(*)", .{aggFuncName(a.func)});
+}
+
+/// 隐藏排序列去重：同一个来源只占一个槽，返回已有或新建的槽下标。
+fn hiddenSlot(alloc: std.mem.Allocator, hidden: *std.ArrayList(OutSrc), src: OutSrc) !usize {
+    for (hidden.items, 0..) |h, i| {
+        const same = switch (h) {
+            .grp => |a| switch (src) {
+                .grp => |b| a == b,
+                else => false,
+            },
+            .agg => |a| switch (src) {
+                .agg => |b| a == b,
+                else => false,
+            },
+        };
+        if (same) return i;
+    }
+    try hidden.append(alloc, src);
+    return hidden.items.len - 1;
+}
+
 fn isNullValue(v: sql.Value) bool {
     return switch (v) {
         .null => true,
@@ -628,24 +656,50 @@ pub fn hasAggregate(items: []const sql.SelectItem) bool {
     return false;
 }
 
-/// 输出行排序上下文：聚合结果的 `ORDER BY` 按**输出列名**匹配
-/// （`ORDER BY g` / `ORDER BY count(*)`），因为分组后已无原始行可比。
+/// 输出行排序上下文：聚合结果的 `ORDER BY` 按**输出列名或隐藏列**匹配。
+///
+/// `pos` 是「stride 位置」：`0..out_n` 是输出列，`out_n..` 是只参与排序、不进结果集的
+/// 隐藏列（`ORDER BY g` 而 `g` 未被选中、或 `ORDER BY sum(x)` 而 `sum(x)` 未输出）。
 const GroupSortCtx = struct {
     flat: []const sql.Value,
     ncols: usize,
     order: []const sql.OrderItem,
-    /// 与 `order` 一一对应的输出列下标（排序前解析一次）。
+    /// 与 `order` 一一对应的 stride 位置（排序前解析一次）。
     /// 不在比较函数里按列名查 —— 10 万组时那是 n·log n 次字符串比较。
-    cols: []const usize,
+    pos: []const usize,
 };
 
 fn groupRowLess(ctx: GroupSortCtx, a: usize, b: usize) bool {
-    for (ctx.order, ctx.cols) |o, ci| {
+    for (ctx.order, ctx.pos) |o, ci| {
         const ord = schema_mod.valueCmp(ctx.flat[a * ctx.ncols + ci], ctx.flat[b * ctx.ncols + ci]);
         if (ord == .eq) continue;
         return if (o.desc) ord == .gt else ord == .lt;
     }
     return false;
+}
+
+/// 把规范化的聚合列名（`sum(x)` / `count(*)`）解回聚合描述。
+///
+/// `ORDER BY` 的目标在解析阶段已被归一到这种文本，这里必须用**同一张名字表**解回去，
+/// 否则 `ORDER BY SUM(x)` 会变成“查不到列”。
+fn parseAggTarget(text: []const u8) ?sql.Agg {
+    const lp = std.mem.indexOfScalar(u8, text, '(') orelse return null;
+    if (text.len < lp + 2 or text[text.len - 1] != ')') return null;
+    const func = sql.aggFuncFromName(text[0..lp]) orelse return null;
+    const inner = text[lp + 1 .. text.len - 1];
+    if (std.mem.eql(u8, inner, "*")) {
+        if (func != .count) return null;
+        return .{ .func = func, .column = null };
+    }
+    return .{ .func = func, .column = inner };
+}
+
+/// 取一组某一列的值（输出列与隐藏列共用）。
+fn groupCell(g: *const Group, src: OutSrc, specs: []const AggSpec) !sql.Value {
+    return switch (src) {
+        .grp => |k| g.keys[k],
+        .agg => |k| try accValue(&g.aggs[k], specs[k].func),
+    };
 }
 
 fn accValue(acc: *const AggAcc, func: sql.AggFunc) !sql.Value {
@@ -736,6 +790,81 @@ fn selectGrouped(
             having_spec = specs.items.len - 1;
         }
     }
+
+    // ---- 1.6) 输出列名（提前算：ORDER BY 要靠它匹配）----
+    const out_n = sel.items.len;
+    const columns = try alloc.alloc([]const u8, out_n);
+    var cols_done: usize = 0;
+    errdefer {
+        for (columns[0..cols_done]) |c| alloc.free(c);
+        alloc.free(columns);
+    }
+    for (sel.items, 0..) |item, i| {
+        columns[i] = switch (item) {
+            .star => unreachable,
+            .column => |c| try alloc.dupe(u8, s.columns[s.indexOf(c).?].name),
+            .aggregate => |a| try aggLabel(alloc, a),
+        };
+        cols_done += 1;
+    }
+
+    // ---- 1.7) ORDER BY 可以引用「没被选中的分组键 / 聚合」→ 做成隐藏列 ----
+    //
+    // SQLite 接受 `SELECT COUNT(*) FROM t GROUP BY g ORDER BY g`（实测 3.53.2，见
+    // tools/bench-vs-sqlite/src/bin/having_semantics.rs 的 Q7）；我们原先报 ColumnNotFound。
+    // 做法：这些列参与排序、**不进结果集** —— 输出仍然只有 `sel.items` 那几列。
+    var order_pos_list: std.ArrayList(usize) = .empty;
+    defer order_pos_list.deinit(alloc);
+    var hidden: std.ArrayList(OutSrc) = .empty;
+    defer hidden.deinit(alloc);
+    if (sel.order_by.len > 0) {
+        // 第一步：把隐藏聚合的槽先建好 —— 必须在算 `need` 之前，
+        // 否则 `ORDER BY SUM(x)`（x 未被选中）的参数列不会被解码。
+        for (sel.order_by) |o| {
+            const agg = parseAggTarget(o.column) orelse continue;
+            const ci: ?usize = if (agg.column) |c| (s.indexOf(c) orelse return error.ColumnNotFound) else null;
+            var found = false;
+            for (specs.items) |sp| {
+                if (sp.func == agg.func and sp.col_idx == ci) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) try specs.append(alloc, .{ .func = agg.func, .col_idx = ci });
+        }
+
+        for (sel.order_by) |o| {
+            var at: ?usize = null;
+            // 1) 输出列
+            for (columns, 0..) |cn, ci| {
+                if (std.ascii.eqlIgnoreCase(cn, o.column)) {
+                    at = ci;
+                    break;
+                }
+            }
+            // 2) 聚合（隐藏）
+            if (at == null) {
+                if (parseAggTarget(o.column)) |agg| {
+                    const ci: ?usize = if (agg.column) |c| (s.indexOf(c) orelse return error.ColumnNotFound) else null;
+                    for (specs.items, 0..) |sp, si| {
+                        if (sp.func != agg.func or sp.col_idx != ci) continue;
+                        at = out_n + (try hiddenSlot(alloc, &hidden, .{ .agg = si }));
+                        break;
+                    }
+                }
+            }
+            // 3) 分组键（隐藏）
+            if (at == null) {
+                for (sel.group_by, 0..) |gname, gi| {
+                    if (!std.ascii.eqlIgnoreCase(gname, o.column)) continue;
+                    at = out_n + (try hiddenSlot(alloc, &hidden, .{ .grp = gi }));
+                    break;
+                }
+            }
+            try order_pos_list.append(alloc, at orelse return error.ColumnNotFound);
+        }
+    }
+    const order_pos = order_pos_list.items;
 
     // ---- 2) 只解码真正要用的列（分组键 / 聚合参数 / WHERE 列）----
     const need = try alloc.alloc(bool, ncols);
@@ -881,27 +1010,7 @@ fn selectGrouped(
         }
     }
 
-    // ---- 4) 输出列名 ----
-    const out_n = sel.items.len;
-    const columns = try alloc.alloc([]const u8, out_n);
-    var cols_done: usize = 0;
-    errdefer {
-        for (columns[0..cols_done]) |c| alloc.free(c);
-        alloc.free(columns);
-    }
-    for (sel.items, 0..) |item, i| {
-        columns[i] = switch (item) {
-            .star => unreachable,
-            .column => |c| try alloc.dupe(u8, s.columns[s.indexOf(c).?].name),
-            .aggregate => |a| if (a.column) |c|
-                try alloc.print("{s}({s})", .{ aggFuncName(a.func), c })
-            else
-                try alloc.print("{s}(*)", .{aggFuncName(a.func)}),
-        };
-        cols_done += 1;
-    }
-
-    // ---- 5) 每组算一行，再按 HAVING / ORDER BY / LIMIT 取子集 ----
+    // ---- 4) 每组算一行，再按 HAVING / ORDER BY / LIMIT 取子集 ----
     //
     // SQL 语义：聚合值为 NULL 时比较结果是 unknown → 整组被过滤掉（不是当作 0 参与比较）。
     var kept: std.ArrayList(usize) = .empty;
@@ -917,36 +1026,21 @@ fn selectGrouped(
     }
 
     const nkeep = kept.items.len;
-    const flat0 = try alloc.alloc(sql.Value, nkeep * out_n);
+    // 步长 = 输出列 + 隐藏排序列（隐藏列只参与排序）
+    const stride = out_n + hidden.items.len;
+    const flat0 = try alloc.alloc(sql.Value, nkeep * stride);
     defer alloc.free(flat0);
     for (kept.items, 0..) |gi, r| {
         const g = &groups.items[gi];
-        for (src_of, 0..) |src, ci| {
-            flat0[r * out_n + ci] = switch (src) {
-                .grp => |k| g.keys[k],
-                .agg => |k| try accValue(&g.aggs[k], specs.items[k].func),
-            };
-        }
+        for (src_of, 0..) |src, ci| flat0[r * stride + ci] = try groupCell(g, src, specs.items);
+        for (hidden.items, 0..) |src, hk| flat0[r * stride + out_n + hk] = try groupCell(g, src, specs.items);
     }
 
     const order_idx = try alloc.alloc(usize, nkeep);
     defer alloc.free(order_idx);
     for (order_idx, 0..) |*p, i| p.* = i;
     if (sel.order_by.len > 0) {
-        // 排序键先解析成输出列下标；列名不存在时报错，而不是静默不排序
-        const order_cols = try alloc.alloc(usize, sel.order_by.len);
-        defer alloc.free(order_cols);
-        for (sel.order_by, 0..) |o, k| {
-            var found: ?usize = null;
-            for (columns, 0..) |cn, ci| {
-                if (std.ascii.eqlIgnoreCase(cn, o.column)) {
-                    found = ci;
-                    break;
-                }
-            }
-            order_cols[k] = found orelse return error.ColumnNotFound;
-        }
-        const ctx = GroupSortCtx{ .flat = flat0, .ncols = out_n, .order = sel.order_by, .cols = order_cols };
+        const ctx = GroupSortCtx{ .flat = flat0, .ncols = stride, .order = sel.order_by, .pos = order_pos };
         std.mem.sort(usize, order_idx, ctx, groupRowLess);
     }
 
@@ -961,7 +1055,7 @@ fn selectGrouped(
     var text_total: usize = 0;
     for (order_idx[start..end], 0..) |gi, r| {
         for (0..out_n) |ci| {
-            const v = flat0[gi * out_n + ci];
+            const v = flat0[gi * stride + ci];
             flat[r * out_n + ci] = v;
             switch (v) {
                 .text => |x| text_total += x.len,
@@ -1813,5 +1907,87 @@ test "HAVING 与 WHERE 组合：WHERE 先过滤行，HAVING 后过滤组" {
         try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
         try std.testing.expectEqual(@as(i64, 2), rows.rows[0][0].integer);
         try std.testing.expectEqual(@as(i64, 3), rows.rows[1][0].integer);
+    }
+}
+
+test "ORDER BY 可引用未选中的分组键 / 聚合（隐藏列）" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-exec-hidden-order";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    const cols = [_]schema_mod.Column{
+        .{ .name = "id", .col_type = .integer, .primary_key = true },
+        .{ .name = "g", .col_type = .integer },
+        .{ .name = "x", .col_type = .integer },
+    };
+    var s = try schema_mod.Schema.init(alloc, "ho", &cols);
+    defer s.deinit(alloc);
+    var t = try tablemod.Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+
+    {
+        // g=1: 10,20(2 行) / g=2: 5(1) / g=3: NULL(1) / g=4: 1,2,3(3)
+        var p = try sql.parse(alloc,
+            "INSERT INTO ho (id, g, x) VALUES (1,1,10), (2,1,20), (3,2,5), (4,3,NULL), (5,4,1), (6,4,2), (7,4,3)");
+        defer p.deinit();
+        _ = try insertRows(&t, &s, p.stmt.insert, alloc);
+    }
+
+    // Q7：`g` 没被选中，但 ORDER BY 引用了它（SQLite 3.53.2 接受；我们原先报 ColumnNotFound）
+    {
+        var p = try sql.parse(alloc, "SELECT COUNT(*) FROM ho GROUP BY g ORDER BY g");
+        defer p.deinit();
+        var rows = try selectRows(&t, &s, p.stmt.select, alloc);
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 4), rows.rows.len);
+        // 隐藏列不能泄漏到结果集：每行仍只有 1 列
+        for (rows.rows) |r| try std.testing.expectEqual(@as(usize, 1), r.len);
+        try std.testing.expectEqual(@as(usize, 1), rows.columns.len);
+        // 按 g 升序 → 各组行数 2,1,1,3（与 SQLite 实测一致）
+        try std.testing.expectEqual(@as(i64, 2), rows.rows[0][0].integer);
+        try std.testing.expectEqual(@as(i64, 1), rows.rows[1][0].integer);
+        try std.testing.expectEqual(@as(i64, 1), rows.rows[2][0].integer);
+        try std.testing.expectEqual(@as(i64, 3), rows.rows[3][0].integer);
+    }
+
+    // 聚合没被选中但用于排序：`ORDER BY SUM(x) DESC` → 30(g1) / 6(g4) / 5(g2) / NULL(g3)
+    {
+        var p = try sql.parse(alloc, "SELECT g FROM ho GROUP BY g ORDER BY SUM(x) DESC");
+        defer p.deinit();
+        var rows = try selectRows(&t, &s, p.stmt.select, alloc);
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 4), rows.rows.len);
+        for (rows.rows) |r| try std.testing.expectEqual(@as(usize, 1), r.len);
+        try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
+        try std.testing.expectEqual(@as(i64, 4), rows.rows[1][0].integer);
+        try std.testing.expectEqual(@as(i64, 2), rows.rows[2][0].integer);
+        try std.testing.expectEqual(@as(i64, 3), rows.rows[3][0].integer); // SUM 为 NULL，降序排最后
+    }
+
+    // 两个排序键都与输出无关（一个聚合 + 一个分组键），并且要能去重（只算一次）
+    {
+        var p = try sql.parse(alloc, "SELECT g FROM ho GROUP BY g ORDER BY COUNT(*) DESC, g ASC");
+        defer p.deinit();
+        var rows = try selectRows(&t, &s, p.stmt.select, alloc);
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 4), rows.rows.len);
+        // 行数 3(g4) / 2(g1) / 1(g2) / 1(g3)；并列的 g2<g3 按 g 升序
+        try std.testing.expectEqual(@as(i64, 4), rows.rows[0][0].integer);
+        try std.testing.expectEqual(@as(i64, 1), rows.rows[1][0].integer);
+        try std.testing.expectEqual(@as(i64, 2), rows.rows[2][0].integer);
+        try std.testing.expectEqual(@as(i64, 3), rows.rows[3][0].integer);
+    }
+
+    // 既不是输出列、也不是分组键/聚合 → 仍然要报错（不能静默不排序）
+    {
+        var p = try sql.parse(alloc, "SELECT g FROM ho GROUP BY g ORDER BY x");
+        defer p.deinit();
+        try std.testing.expectError(error.ColumnNotFound, selectRows(&t, &s, p.stmt.select, alloc));
     }
 }
