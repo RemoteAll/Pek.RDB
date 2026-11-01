@@ -57,7 +57,7 @@
   <div class="hero">
     <div class="pill g"><div class="n" id="ahead">–</div><div class="l">项指标全胜（每项 5/5 轮）</div></div>
     <div class="pill g"><div class="n" id="behind">–</div><div class="l">项落后</div></div>
-    <div class="pill"><div class="n" id="top">–</div><div class="l">最高领先倍数</div></div>
+    <div class="pill"><div class="n" id="top">–</div><div class="l">同口径最高领先倍数</div></div>
   </div>
 
   <table>
@@ -70,9 +70,9 @@
   <div class="foot" id="foot"></div>
 
 <script>
-const DATA = {"ahead":18,"behind":0,"rounds":5,"putSync":9.96,"rows":[{"k":"put","z":1837386,"s":35540,"unit":"/s","ratio":51.7},{"k":"sql_put","z":1718553,"s":35540,"unit":"/s","ratio":48.36},{"k":"put_sync","z":378027,"s":37972,"unit":"/s","ratio":9.96},{"k":"upd_get","z":1257104,"s":149300,"unit":"/s","ratio":8.42},{"k":"upd_random","z":1498540,"s":210558,"unit":"/s","ratio":7.12},{"k":"get","z":947553,"s":145263,"unit":"/s","ratio":6.52},{"k":"big_get","z":586652,"s":142584,"unit":"/s","ratio":4.11},{"k":"big_put","z":2013104,"s":569619,"unit":"/s","ratio":3.53},{"k":"conc4","z":3921392,"s":1157705,"unit":"/s","ratio":3.39},{"k":"conc2","z":2753329,"s":1260890,"unit":"/s","ratio":2.18},{"k":"put_batch","z":1918752,"s":930280,"unit":"/s","ratio":2.06},{"k":"count_10k","z":30266413,"s":15956776,"unit":"/s","ratio":1.9},{"k":"big_count","z":26896008,"s":15952591,"unit":"/s","ratio":1.69},{"k":"scan_refs","z":11002699,"s":9069845,"unit":"/s","ratio":1.21}],"reopen":{"z":0.44,"s":1.98},"disk":{"z":40.92,"s":41.56}};
+const DATA = {"ahead":18,"behind":0,"rounds":5,"bprRow":63,"bprRowS":4201.37,"bprBatch":43,"bprBatchS":41.2,"batchRatio":2.27,"rows":[{"k":"upd_get","z":1257104,"s":149300,"unit":"/s","ratio":8.42},{"k":"upd_random","z":1498540,"s":210558,"unit":"/s","ratio":7.12},{"k":"get","z":947553,"s":145263,"unit":"/s","ratio":6.52},{"k":"big_get","z":586652,"s":142584,"unit":"/s","ratio":4.11},{"k":"big_put","z":2013104,"s":569619,"unit":"/s","ratio":3.53},{"k":"conc4","z":3921392,"s":1157705,"unit":"/s","ratio":3.39},{"k":"conc2","z":2753329,"s":1260890,"unit":"/s","ratio":2.18},{"k":"put_batch","z":1918752,"s":930280,"unit":"/s","ratio":2.06},{"k":"count_10k","z":30266413,"s":15956776,"unit":"/s","ratio":1.9},{"k":"big_count","z":26896008,"s":15952591,"unit":"/s","ratio":1.69},{"k":"scan_refs","z":11002699,"s":9069845,"unit":"/s","ratio":1.21}],"reopen":{"z":0.44,"s":1.98},"disk":{"z":40.92,"s":41.56}};
 const LABELS = {
-  put:'逐行写入（组提交档）', put_sync:'逐行写入（逐行落盘档·与 SQLite 同档）', sql_put:'逐行写入（SQL 层）',
+  put:'逐行写入（组提交档・我方 256KB 缓冲）', put_sync:'逐行写入（逐行落盘档・与 SQLite 同档）', sql_put:'逐行写入（SQL 层）',
   upd_get:'更新后点查', upd_random:'随机更新 10 万行', get:'主键点查',
   conc4:'并发写 4 线程', big_get:'超内存点查（25 段）', big_put:'超内存批量写 200 万行',
   conc2:'并发写 2 线程', put_batch:'单事务批量写', count_10k:'范围扫描（只数行）',
@@ -99,9 +99,11 @@ DATA.rows.forEach(r => {
 });
 
 document.getElementById('foot').innerHTML =
-  '<span class="tag">同批 ABBA</span>交替采样 ' + DATA.rounds + ' 轮，每引擎 2 次共 10 个样本取中位；同机同数据。下表为其中 ' + DATA.rows.length + ' 项代表场景。<br>' +
-  '前三行都是「逐行写一行」：组提交档 51.70× 与 SQL 层 48.36× 只差约 7%，说明差距<b>不来自 SQL 层</b>；<br>' +
-  '真正的变量是持久化档位——<b>双方同档</b>（都每行落到操作系统、都不 fsync）时为 <b>' + DATA.putSync + '×</b>。<br>' +
+  '<span class="tag">同批 ABBA</span>交替采样 ' + DATA.rounds + ' 轮，每引擎 2 次共 10 个样本取中位；同机同数据。下表为其中 ' + DATA.rows.length + ' 项。<br>' +
+  '表内<b>只放同口径项</b>：同逻辑工作量、同事务粒度、同持久化档、同写入字节量。<br>' +
+  '<b>逐行写入（每行一个事务）已从表内移除</b>——SQLite 的 WAL 是页粒度，一次提交要写整页 4096 B，' +
+  '我方同档只写 <b>' + DATA.bprRow + ' B</b>，<b>写放大差 67 倍</b>；那个倍数衡量的是写放大，不是引擎速度。<br>' +
+  '口径完全对齐（一次提交 N 行，我方 <b>' + DATA.bprBatch + ' B/行</b> vs SQLite <b>' + DATA.bprBatchS + ' B/行</b>）时，批量写领先 <b>' + DATA.batchRatio + '×</b>。<br>' +
   '冷重开 100 万行 <b>' + DATA.reopen.z.toFixed(2) + ' ms</b> vs <b>' + DATA.reopen.s.toFixed(2) + ' ms</b>' +
   '；磁盘 <b>' + DATA.disk.z.toFixed(2) + ' B/行</b> vs <b>' + DATA.disk.s.toFixed(2) + ' B/行</b>（越低越好）。<br>' +
   '另有 1 项（SQL SELECT * 物化）区间跨 1，判为持平，未计入全胜数。原始 CSV 全部入库，可逐轮复核。';

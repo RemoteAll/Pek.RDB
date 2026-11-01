@@ -1,0 +1,9 @@
+﻿metric,page_size,tag,count,value
+wal_bytes_per_row,4096,bytes,20000,4201.37
+wal_bytes_total,4096,bytes,20000,84027400
+rows_per_sec,4096,speed,200000,37307
+wal_bytes_per_row_txn,4096,txn,20000,41.20
+wal_bytes_per_row,512,bytes,20000,637.81
+wal_bytes_total,512,bytes,20000,12756264
+rows_per_sec,512,speed,200000,67706
+wal_bytes_per_row_txn,512,txn,20000,45.56

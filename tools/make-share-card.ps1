@@ -42,6 +42,20 @@ function Read-Metric([string]$path, [string]$name) {
     return $v
 }
 
+# The walbytes probe writes 5 columns (metric,page_size,tag,count,value),
+# so Read-Metric (3 columns: metric,count,value) cannot be reused.
+function Read-WalBytes([string]$path, [string]$name) {
+    if (-not (Test-Path $path)) { return $null }
+    $line = Get-Content $path -Encoding UTF8 |
+        Where-Object { $_ -match ('^' + [regex]::Escape($name) + ',') } | Select-Object -First 1
+    if (-not $line) { return $null }
+    $p = @($line -split ',')
+    $v = 0.0
+    if (-not [double]::TryParse($p[$p.Count - 1], [ref]$v)) { return $null }
+    if ($v -le 0) { return $null }
+    return $v
+}
+
 function Median([double[]]$v) {
     if (-not $v -or $v.Count -eq 0) { return 0 }
     $s = @($v | Sort-Object); $n = $s.Count
@@ -87,7 +101,13 @@ $defs = @(
 )
 
 # Rows to show on the card (subset). Everything here must be a 5/5 win.
-$show = @('put', 'sql_put', 'upd_get', 'upd_random', 'get', 'big_get', 'big_put',
+#
+# Row-by-row writes ('put', 'sql_put') are deliberately EXCLUDED: SQLite's WAL is
+# page-granular, so one autocommit INSERT ships a whole 4096B page while we ship
+# ~63B. The resulting 51.7x / 9.96x measures write amplification, not engine
+# speed (see docs/决策记录.md 七十九). Showing them as "we are faster" is exactly
+# the cross-criteria claim the user rejected.
+$show = @('upd_get', 'upd_random', 'get', 'big_get', 'big_put',
           'conc4', 'conc2', 'put_batch', 'count_10k', 'big_count', 'scan_refs')
 
 # Chinese labels live in the UTF-8 HTML template (this file must stay ASCII).
@@ -145,34 +165,40 @@ foreach ($d in $defs) {
     }
 }
 
-# Same-durability row: zig `put_sync` (wal_buf_bytes=0, one write per row, no fsync)
-# vs sqlite `put` (synchronous=NORMAL, one pwrite per commit, no fsync).
+# ---- Same-criteria (byte-equal) facts for the footer, computed from raw CSVs ----
 #
-# These three pairs come from a dedicated batch (p15-run1-a / psync-run2 / psync-run3)
-# because the full ABBA batch cannot finish on this machine: sqlite's 4-thread write
-# step stalls (observed in p14 and p15). Values are read from the raw CSVs -- never
-# typed in by hand -- and the row is omitted entirely if the files are missing.
-$syncPairs = @()
-foreach ($f in @('p15-run1-a', 'psync-run2', 'psync-run3')) {
-    $zn = Read-Metric (Join-Path $DataDir "zig-$Date-$f.csv") 'put_sync'
-    $sn = Read-Metric (Join-Path $DataDir "sqlite-$Date-$f.csv") 'put'
-    if ($null -ne $zn -and $null -ne $sn -and $sn -gt 0) { $syncPairs += , @($zn, $sn) }
-}
-if ($syncPairs.Count -ge 3) {
-    $zt = @(); $st = @()
-    foreach ($p in $syncPairs) { $zt += $p[0]; $st += $p[1] }
-    $zm = Median $zt
-    $sm = Median $st
-    $worst = ($zt | Measure-Object -Minimum).Minimum / ($st | Measure-Object -Maximum).Maximum
-    Write-Host ("same-durability put: {0}x  (worst-case {1}x, n={2})" -f [math]::Round($zm / $sm, 2), [math]::Round($worst, 2), $syncPairs.Count)
-    $rows += [pscustomobject]@{
-        k     = 'put_sync'
-        z     = [math]::Round($zm, 0)
-        s     = [math]::Round($sm, 0)
-        unit  = '/s'
-        ratio = [math]::Round($zm / $sm, 2)
+# Bytes written per row is the quantity that makes the row-by-row comparison
+# meaningless, so we publish it next to the numbers that do hold up.
+#   zig-*-walbytes.csv    : put_sync_wal_bytes / put_batch_wal_bytes (count = 1e6)
+#   sqlite-*-walbytes.csv : wal_bytes_per_row (page 4096) / wal_bytes_per_row_txn
+$HZ = Join-Path $DataDir "zig-$Date-walbytes.csv"
+$HS = Join-Path $DataDir "sqlite-$Date-walbytes.csv"
+$bprRow = Read-Metric $HZ 'put_sync_wal_bytes'
+$bprBatch = Read-Metric $HZ 'put_batch_wal_bytes'
+if ($bprRow) { $bprRow = [math]::Round($bprRow / 1000000.0, 1) }
+if ($bprBatch) { $bprBatch = [math]::Round($bprBatch / 1000000.0, 1) }
+$bprRowS = Read-WalBytes $HS 'wal_bytes_per_row'
+$bprBatchS = Read-WalBytes $HS 'wal_bytes_per_row_txn'
+
+# Batch-vs-batch paired ratio (same transaction scope AND same bytes/row).
+# Rounds where the bare-write probe collapsed are A(env) and are excluded -- but
+# the raw values stay in the CSVs and the reason is printed below.
+$batchRatios = @()
+for ($r = 1; $r -le 3; $r++) {
+    $zf = Join-Path $DataDir "zig-$Date-batchcmp-run$r.csv"
+    $sf = Join-Path $DataDir "sqlite-$Date-batchcmp-run$r.csv"
+    $zb = Read-Metric $zf 'put_batch'
+    $sb = Read-Metric $sf 'put_txn'
+    $bare = Read-Metric $zf 'bare_write_mbps'
+    if ($null -eq $zb -or $null -eq $sb) { continue }
+    if ($null -ne $bare -and $bare -lt 100) {
+        Write-Host "batchcmp r$r EXCLUDED (A-env: bare_write=$bare MB/s, others 270-350)"
+        continue
     }
+    $batchRatios += ($zb / $sb)
 }
+$batchRatio = if ($batchRatios.Count -ge 2) { [math]::Round((Median $batchRatios), 2) } else { $null }
+if ($null -ne $batchRatio) { Write-Host "byte-equal batch put: ${batchRatio}x (n=$($batchRatios.Count))" }
 
 # Cold reopen (lower is better) and disk footprint are factual and measured too.
 $zr = Median (Samples 'zig' 'recover')
@@ -183,11 +209,15 @@ $zPerRow = $zdisk / 2000000.0
 $sPerRow = $sdisk / 2000000.0
 
 $payload = [pscustomobject]@{
-    ahead   = $aheadTotal
-    behind  = 0
-    rounds  = $Rounds
-    putSync = $(if ($syncPairs.Count -ge 3) { [math]::Round($zm / $sm, 2) } else { 'n/a' })
-    rows    = @($rows | Sort-Object -Property ratio -Descending)
+    ahead      = $aheadTotal
+    behind     = 0
+    rounds     = $Rounds
+    bprRow     = $bprRow
+    bprRowS    = $bprRowS
+    bprBatch   = $bprBatch
+    bprBatchS  = $bprBatchS
+    batchRatio = $batchRatio
+    rows       = @($rows | Sort-Object -Property ratio -Descending)
     reopen = [pscustomobject]@{ z = [math]::Round($zr, 2); s = [math]::Round($sr, 2) }
     disk   = [pscustomobject]@{ z = [math]::Round($zPerRow, 2); s = [math]::Round($sPerRow, 2) }
 }

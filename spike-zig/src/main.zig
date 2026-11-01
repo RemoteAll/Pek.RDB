@@ -227,6 +227,10 @@ fn benchMain() !void {
         try ts.wal.sync();
         const ns = nowNs(io) - t0;
         std.debug.print("put_sync,{d},{d:.0}\n", .{ n, opsPerSec(n, ns) });
+        // 同档位对照必须给出**两边各自的每行字节量**，否则「快 10 倍」会被误解成
+        // 「引擎更强」。SQLite 的 WAL 是页粒度：每次提交要把整页（默认 4096B）写进 WAL。
+        // 这个计数器就是 `Wal.written`（本表累计写入 WAL 的逻辑字节数），可逐字节核对。
+        std.debug.print("put_sync_wal_bytes,{d},{d}\n", .{ n, ts.wal.total_written });
     }
 
     // 批量写：与 SQLite 单事务批量插入同口径（1M 行一次提交）
@@ -258,6 +262,8 @@ fn benchMain() !void {
         try t3.putBatch(keys, vals);
         const ns = nowNs(io) - t0;
         std.debug.print("put_batch,{d},{d:.0}\n", .{ n, opsPerSec(n, ns) });
+        // 同口径（一次提交 N 行）下两边的每行字节量 —— 与 SQLite `put_txn` 对照。
+        std.debug.print("put_batch_wal_bytes,{d},{d}\n", .{ n, t3.wal.total_written });
     }
 
     {

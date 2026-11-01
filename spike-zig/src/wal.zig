@@ -18,6 +18,12 @@ pub const Wal = struct {
     io: std.Io,
     file: std.Io.File,
     written: u64 = 0,
+    /// **跨 WAL 轮换累计**写入字节数（只增不减）。
+    ///
+    /// `written` 会在 `reset()` 后归零（那是当前文件的追加点），量「这次工作总共写了多少盘」
+    /// 必须用这个：否则中途发生一次段 flush 就会把前面的量抹掉，
+    /// 读出个偏小的数（实测踩过：1,000,000 行只读到 22.35MB，实际约 71B/行）。
+    total_written: u64 = 0,
     /// 用户态缓冲上限（字节）。**`0` = 每次 `append` 立即 `write` 到 OS**。
     ///
     /// 这个值直接决定「进程被强杀（任务管理器结束任务 / `kill -9` / 系统关机强杀）
@@ -77,6 +83,7 @@ pub const Wal = struct {
         if (self.buf.items.len == 0) return;
         try self.file.writePositionalAll(self.io, self.buf.items, self.written);
         self.written += self.buf.items.len;
+        self.total_written += self.buf.items.len;
         self.buf.clearRetainingCapacity();
     }
 
