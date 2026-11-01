@@ -18,3 +18,9 @@ spike-zig/test-*-db/
 tools/bench-vs-sqlite/*.db
 tools/bench-vs-sqlite/*.db-wal
 tools/bench-vs-sqlite/*.db-shm
+
+# 基准产物（SQLite 对照工具在工作目录生成的库文件）
+/bench-sqlite.db
+/bench-sqlite.db-wal
+/bench-sqlite.db-shm
+/bench-zig.db*
