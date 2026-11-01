@@ -90,6 +90,9 @@ foreach ($p in $pairs) {
         if (-not $zv.ContainsKey($zk) -or -not $sv.ContainsKey($sk)) { continue }
         $a = $zv[$zk]; $b = $sv[$sk]
         if ($b -le 0) { continue }
+        # Both directions can end up dividing by zero: our `recover` prints whole ms and can
+        # round to 0. Skip that round rather than feeding Infinity/NaN into the median.
+        if (-not $higher -and $a -le 0) { continue }
         # normalise so that ratio > 1 always means "we are better"
         if ($higher) { $ratios += ($a / $b) } else { $ratios += ($b / $a) }
     }
