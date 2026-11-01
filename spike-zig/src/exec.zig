@@ -24,6 +24,116 @@ pub const Rows = struct {
     }
 };
 
+// ---------------------------------------------------------------- 二级索引
+//
+// 索引键 = `值分量 ++ 主键分量`（都复用 schema 的顺序保持编码，每段自定界），
+// 所以「等值查询」就是一次键前缀扫描，而取主键只需切掉前缀 —— 不用解码主键。
+//
+// **写入顺序的硬规矩：索引宁可多一条脏项，不可少一条。**
+// - 插入：先写索引项、再写行 → 崩溃点最坏是多一条指向「不存在的行」的脏项；
+// - 删除：先删行、再删索引项 → 崩溃点最坏是留一条脏项；
+// - 更新（索引列变了）：先写新索引项 → 写新行 → 删旧索引项。
+// 反过来（先写行后写索引）一旦崩在中间，索引就**缺条目**，走索引的查询会静默漏行。
+// 脏项由查询侧的「回表复核」兜住：取出整行后重新判一次谓词，不匹配就跳过。
+
+/// 一张表的索引集合（表 → 索引名 → 索引表）。
+pub const IndexHost = struct {
+    schema: *const schema_mod.Schema,
+    tables: *std.StringHashMap(tablemod.Table),
+
+    pub fn onColumn(self: *const IndexHost, column_idx: usize) ?*tablemod.Table {
+        const ix = self.schema.indexOnColumn(column_idx) orelse return null;
+        return self.tables.getPtr(ix.name);
+    }
+};
+
+/// 键前缀的上界（不含）。全 `0xFF` 时返回空切片表示「无上界」，
+/// 调用方仍需在循环里按 `startsWith` 判断并 break。
+fn prefixUpperBound(alloc: std.mem.Allocator, prefix: []const u8) ![]u8 {
+    var i = prefix.len;
+    while (i > 0) {
+        i -= 1;
+        if (prefix[i] != 0xFF) {
+            const out = try alloc.dupe(u8, prefix[0 .. i + 1]);
+            out[i] +%= 1;
+            return out;
+        }
+    }
+    return alloc.alloc(u8, 0);
+}
+
+/// 按索引列出「列 = want」的候选行值（**已回表复核过**，可直接当扫描结果用）。
+///
+/// 返回的切片是 `owned` 里各自独立分配的行值 —— 与全表扫描的切片不同，
+/// 这里每次 `t.get` 都填同一个复用缓冲，不复制就会全变成最后一行的内容。
+fn indexCollect(
+    host: *const IndexHost,
+    t: *tablemod.Table,
+    s: *const schema_mod.Schema,
+    column_idx: usize,
+    want: sql.Value,
+    alloc: std.mem.Allocator,
+    owned: *std.ArrayList([]u8),
+    max: ?usize,
+) !void {
+    if (isNullValue(want)) return; // `= NULL` 永远不匹配
+    const itbl = host.onColumn(column_idx) orelse return error.ColumnNotFound;
+
+    const prefix = try s.encodeValueComponent(alloc, column_idx, want);
+    defer alloc.free(prefix);
+    const hi = try prefixUpperBound(alloc, prefix);
+    defer alloc.free(hi);
+
+    const row_vals = try alloc.alloc(sql.Value, s.columns.len);
+    defer alloc.free(row_vals);
+    var vbuf: std.ArrayList(u8) = .empty;
+    defer vbuf.deinit(alloc);
+
+    var it = tablemod.MergeIter{};
+    try it.init(itbl, prefix, hi);
+    defer it.deinit();
+
+    while (it.next()) |rec| {
+        // 前缀不匹配就停：脏项、以及上界为「无上界」时的越界都靠这一句兜住
+        if (!std.mem.startsWith(u8, rec.key, prefix)) break;
+        const raw = (try t.get(rec.key[prefix.len..], &vbuf)) orelse continue; // 行已删 → 脏项
+        try s.decodeRowInto(row_vals, raw);
+        // **回表复核**：索引项可能过期（更新/删除的中间态），必须重判谓词
+        if (!evalWhere(row_vals[column_idx], .eq, want)) continue;
+        const copy = try alloc.dupe(u8, raw);
+        errdefer alloc.free(copy);
+        try owned.append(alloc, copy);
+        if (max) |m| {
+            if (owned.items.len >= m) return;
+        }
+    }
+}
+
+/// 维护索引项：`vals` 为行值，`skip_if_present` 用于「更新时新旧值相同就不动」。
+fn putIndexEntries(host: ?*const IndexHost, s: *const schema_mod.Schema, vals: []const sql.Value, alloc: std.mem.Allocator) !void {
+    const h = host orelse return;
+    for (h.schema.indexes) |ix| {
+        const v = vals[ix.column_idx];
+        if (isNullValue(v)) continue; // NULL 不入索引
+        const itbl = h.tables.getPtr(ix.name) orelse continue;
+        const key = try s.encodeIndexKey(alloc, ix.column_idx, v, vals[s.pk_index]);
+        defer alloc.free(key);
+        try itbl.put(key, &.{});
+    }
+}
+
+fn delIndexEntries(host: ?*const IndexHost, s: *const schema_mod.Schema, vals: []const sql.Value, alloc: std.mem.Allocator) !void {
+    const h = host orelse return;
+    for (h.schema.indexes) |ix| {
+        const v = vals[ix.column_idx];
+        if (isNullValue(v)) continue;
+        const itbl = h.tables.getPtr(ix.name) orelse continue;
+        const key = try s.encodeIndexKey(alloc, ix.column_idx, v, vals[s.pk_index]);
+        defer alloc.free(key);
+        try itbl.delete(key);
+    }
+}
+
 fn evalWhere(a: sql.Value, op: sql.CmpOp, b: sql.Value) bool {
     const ord = schema_mod.valueCmp(a, b);
     return switch (op) {
@@ -191,6 +301,17 @@ pub fn insertRows(
     ins: sql.Insert,
     alloc: std.mem.Allocator,
 ) !usize {
+    return insertRowsHost(t, s, ins, alloc, null);
+}
+
+/// 带索引维护的插入。**先写索引项、再写行**（见文件头「索引宁可多一条脏项」）。
+pub fn insertRowsHost(
+    t: *tablemod.Table,
+    s: *const schema_mod.Schema,
+    ins: sql.Insert,
+    alloc: std.mem.Allocator,
+    host: ?*const IndexHost,
+) !usize {
     var count: usize = 0;
     for (ins.rows) |row| {
         var mapped: []sql.Value = undefined;
@@ -213,6 +334,7 @@ pub fn insertRows(
         defer alloc.free(key);
         const encoded = try s.encodeRow(alloc, mapped);
         defer alloc.free(encoded);
+        try putIndexEntries(host, s, mapped, alloc);
         try t.put(key, encoded);
         count += 1;
     }
@@ -295,42 +417,80 @@ pub fn updateRows(
     upd: sql.Update,
     alloc: std.mem.Allocator,
 ) !usize {
+    return updateRowsHost(t, s, upd, alloc, null);
+}
+
+/// 带索引维护的更新。顺序：**新索引项 → 行 → 删旧索引项**（见文件头）。
+pub fn updateRowsHost(
+    t: *tablemod.Table,
+    s: *const schema_mod.Schema,
+    upd: sql.Update,
+    alloc: std.mem.Allocator,
+    host: ?*const IndexHost,
+) !usize {
     var hi: [16]u8 = @splat(0xFF);
     var set = try t.scanRange(&[_]u8{}, &hi);
     defer set.deinit();
 
     var count: usize = 0;
     for (set.records) |rec| {
-        const vals = try s.decodeRow(alloc, rec.value);
+        const old_vals = try s.decodeRow(alloc, rec.value);
+        defer alloc.free(old_vals);
+
         var matched = true;
         if (upd.where) |w| {
-            const idx = s.indexOf(w.column) orelse {
-                alloc.free(vals);
-                return error.ColumnNotFound;
-            };
-            matched = evalWhere(vals[idx], w.op, w.value);
+            const idx = s.indexOf(w.column) orelse return error.ColumnNotFound;
+            matched = evalWhere(old_vals[idx], w.op, w.value);
         }
-        if (!matched) {
-            alloc.free(vals);
-            continue;
-        }
+        if (!matched) continue;
+
+        const new_vals = try alloc.dupe(sql.Value, old_vals);
+        defer alloc.free(new_vals);
         for (upd.assignments) |a| {
-            const idx = s.indexOf(a.column) orelse {
-                alloc.free(vals);
-                return error.ColumnNotFound;
-            };
-            vals[idx] = a.value;
+            const idx = s.indexOf(a.column) orelse return error.ColumnNotFound;
+            new_vals[idx] = a.value;
         }
-        const key = try s.encodeKey(alloc, vals);
+
+        const key = try s.encodeKey(alloc, new_vals);
         defer alloc.free(key);
-        const encoded = try s.encodeRow(alloc, vals);
+        const encoded = try s.encodeRow(alloc, new_vals);
         defer alloc.free(encoded);
+
+        try putIndexEntries(host, s, new_vals, alloc); // 可能临时多一条（旧值那条还在）
         if (!std.mem.eql(u8, key, rec.key)) try t.delete(rec.key);
         try t.put(key, encoded);
-        alloc.free(vals);
+        try delIndexEntriesIfChanged(host, s, old_vals, new_vals, alloc);
         count += 1;
     }
     return count;
+}
+
+/// 更新后删掉「键确实变了」的旧索引项。新旧键相同就什么都不做 ——
+/// 否则会把刚写进去的那条删掉，造成索引缺条目（比脏项危险得多）。
+fn delIndexEntriesIfChanged(
+    host: ?*const IndexHost,
+    s: *const schema_mod.Schema,
+    old_vals: []const sql.Value,
+    new_vals: []const sql.Value,
+    alloc: std.mem.Allocator,
+) !void {
+    const h = host orelse return;
+    for (h.schema.indexes) |ix| {
+        const ov = old_vals[ix.column_idx];
+        if (isNullValue(ov)) continue;
+        const itbl = h.tables.getPtr(ix.name) orelse continue;
+        const okey = try s.encodeIndexKey(alloc, ix.column_idx, ov, old_vals[s.pk_index]);
+        defer alloc.free(okey);
+        const nv = new_vals[ix.column_idx];
+        if (isNullValue(nv)) {
+            try itbl.delete(okey); // 新值为 NULL → 索引里不该有它
+            continue;
+        }
+        const nkey = try s.encodeIndexKey(alloc, ix.column_idx, nv, new_vals[s.pk_index]);
+        defer alloc.free(nkey);
+        if (std.mem.eql(u8, okey, nkey)) continue;
+        try itbl.delete(okey);
+    }
 }
 
 pub fn deleteRows(
@@ -339,23 +499,34 @@ pub fn deleteRows(
     del: sql.Delete,
     alloc: std.mem.Allocator,
 ) !usize {
+    return deleteRowsHost(t, s, del, alloc, null);
+}
+
+/// 带索引维护的删除。顺序：**先删行、再删索引项**（见文件头）。
+pub fn deleteRowsHost(
+    t: *tablemod.Table,
+    s: *const schema_mod.Schema,
+    del: sql.Delete,
+    alloc: std.mem.Allocator,
+    host: ?*const IndexHost,
+) !usize {
     var hi: [16]u8 = @splat(0xFF);
     var set = try t.scanRange(&[_]u8{}, &hi);
     defer set.deinit();
 
     var count: usize = 0;
     for (set.records) |rec| {
+        // 有索引时必须拿到旧值才能删索引项；没有索引且无 WHERE 时不必解码
+        var old_vals: ?[]sql.Value = null;
+        defer if (old_vals) |v| alloc.free(v);
+        if (del.where != null or host != null) old_vals = try s.decodeRow(alloc, rec.value);
+
         if (del.where) |w| {
-            const vals = try s.decodeRow(alloc, rec.value);
-            const idx = s.indexOf(w.column) orelse {
-                alloc.free(vals);
-                return error.ColumnNotFound;
-            };
-            const ok = evalWhere(vals[idx], w.op, w.value);
-            alloc.free(vals);
-            if (!ok) continue;
+            const idx = s.indexOf(w.column) orelse return error.ColumnNotFound;
+            if (!evalWhere(old_vals.?[idx], w.op, w.value)) continue;
         }
         try t.delete(rec.key);
+        if (host) |h| try delIndexEntries(h, s, old_vals.?, alloc);
         count += 1;
     }
     return count;
@@ -366,6 +537,17 @@ pub fn selectRows(
     s: *const schema_mod.Schema,
     sel: sql.Select,
     alloc: std.mem.Allocator,
+) !Rows {
+    return selectRowsHost(t, s, sel, alloc, null);
+}
+
+/// 带二级索引的查询。`host` 为 null 时退化成纯扫描（与改造前完全一致）。
+pub fn selectRowsHost(
+    t: *tablemod.Table,
+    s: *const schema_mod.Schema,
+    sel: sql.Select,
+    alloc: std.mem.Allocator,
+    host: ?*const IndexHost,
 ) !Rows {
     // 聚合 / GROUP BY 走独立路径：不物化原始行，只产出「每组一行」。
     // 放在最前面（ PK 点查之前），否则 `SELECT COUNT(*) FROM t WHERE id = 1` 会被
@@ -378,6 +560,30 @@ pub fn selectRows(
             if (s.indexOf(w.column)) |idx| {
                 if (idx == s.pk_index) {
                     return selectByPk(t, s, sel, w.value, alloc);
+                }
+            }
+        }
+    }
+
+    // 二级索引：`WHERE <已建索引的列> = 常量` → 键前缀扫描 + 回表复核。
+    // 聚合/分组不走这条（本来就要全表）；`= NULL` 也不走（永远无匹配）。
+    if (host) |h| {
+        if (sel.where) |w| {
+            if (w.op == .eq) {
+                if (s.indexOf(w.column)) |ci| {
+                    if (ci != s.pk_index and h.onColumn(ci) != null) {
+                        var owned: std.ArrayList([]u8) = .empty;
+                        defer {
+                            for (owned.items) |x| alloc.free(x);
+                            owned.deinit(alloc);
+                        }
+                        const max: ?usize = if (sel.order_by.len == 0) blk: {
+                            const l = sel.limit orelse break :blk null;
+                            break :blk @as(usize, sel.offset orelse 0) + @as(usize, l);
+                        } else null;
+                        try indexCollect(h, t, s, ci, w.value, alloc, &owned, max);
+                        return finishFromValues(s, sel, alloc, owned.items);
+                    }
                 }
             }
         }
@@ -471,6 +677,24 @@ pub fn selectRows(
         }
     }
 
+    // 有 ORDER BY 时排序键按**全列**索引取（`SortCtx` 用 `schema.indexOf`），
+    // 所以那种情况下不能按投影解码。
+    //
+    // 另外 `decodeRowProjected` 是「一趟顺序扫描时顺手跳过未投影列」，要求 want **严格升序**；
+    // 而 `SELECT v, id` 会给出 [1,0]、`SELECT id, id` 会给出重复下标 —— 这些都得退回全列解码。
+    return finishFromValues(s, sel, alloc, src);
+}
+
+/// 把「已定位到的一组行值」装配成 `Rows`：投影 → 解码 → 排序 → LIMIT → 输出。
+///
+/// 全表扫描与索引扫描共用这一段 —— 两条路径若各写一份装配逻辑，迟早会出现
+/// 「走索引时 ORDER BY 不生效」这种只在一半场景里错的 bug。
+fn finishFromValues(
+    s: *const schema_mod.Schema,
+    sel: sql.Select,
+    alloc: std.mem.Allocator,
+    src: []const []const u8,
+) !Rows {
     const proj = try buildProjection(alloc, s, sel.items);
     errdefer {
         for (proj.columns) |c| alloc.free(c);
@@ -480,11 +704,6 @@ pub fn selectRows(
         alloc.free(proj.indices);
     }
 
-    // 有 ORDER BY 时排序键按**全列**索引取（`SortCtx` 用 `schema.indexOf`），
-    // 所以那种情况下不能按投影解码。
-    //
-    // 另外 `decodeRowProjected` 是「一趟顺序扫描时顺手跳过未投影列」，要求 want **严格升序**；
-    // 而 `SELECT v, id` 会给出 [1,0]、`SELECT id, id` 会给出重复下标 —— 这些都得退回全列解码。
     const ascending = blk: {
         for (proj.indices, 0..) |v, k| {
             if (k > 0 and v <= proj.indices[k - 1]) break :blk false;

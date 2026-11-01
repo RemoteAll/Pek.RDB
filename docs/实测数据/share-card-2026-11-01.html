@@ -5,7 +5,7 @@
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   body {
-    width:1080px; height:2159px; overflow:hidden;
+    width:1080px; height:2168px; overflow:hidden;
     background:
       radial-gradient(900px 600px at 12% -8%, rgba(56,189,248,.20), transparent 60%),
       radial-gradient(700px 520px at 105% 8%, rgba(167,139,250,.18), transparent 62%),
@@ -56,7 +56,7 @@
 
   <div class="hero">
     <div class="pill g"><div class="n" id="ahead">–</div><div class="l" id="aheadLabel">项指标全胜</div></div>
-    <div class="pill g"><div class="n" id="behind">–</div><div class="l">项落后</div></div>
+    <div class="pill"><div class="n" id="behind">–</div><div class="l" id="behindLabel">项落后</div></div>
     <div class="pill"><div class="n" id="top">–</div><div class="l">同口径最高领先倍数</div></div>
   </div>
 
@@ -70,13 +70,15 @@
   <div class="foot" id="foot"></div>
 
 <script>
-const DATA = {"ahead":23,"behind":0,"rounds":3,"bprRow":63,"bprRowS":4201.37,"bprBatch":43,"bprBatchS":41.2,"bprDelZ":28.8,"bprDelS":415.5,"aggDiskZ":33.76,"aggDiskS":14.62,"batchRatio":2.27,"rows":[{"k":"upd_get","z":1224280,"s":142590,"unit":"/s","ratio":8.59},{"k":"get","z":939531,"s":139993,"unit":"/s","ratio":6.71},{"k":"upd_random","z":1392309,"s":208557,"unit":"/s","ratio":6.68},{"k":"big_get","z":585536,"s":140756,"unit":"/s","ratio":4.16},{"k":"sql_get","z":605600,"s":148023,"unit":"/s","ratio":4.09},{"k":"recover","z":0.52,"s":1.98,"unit":"ms","ratio":3.77},{"k":"big_put","z":1885636,"s":569878,"unit":"/s","ratio":3.31},{"k":"conc4","z":3840302,"s":1175281,"unit":"/s","ratio":3.27},{"k":"sql_limit10","z":435748,"s":152107,"unit":"/s","ratio":2.86},{"k":"sql_each","z":25781878,"s":9071496,"unit":"/s","ratio":2.84},{"k":"conc2","z":2738324,"s":1281274,"unit":"/s","ratio":2.14},{"k":"count_10k","z":30632580,"s":14837285,"unit":"/s","ratio":2.06},{"k":"put_batch","z":1705562,"s":917731,"unit":"/s","ratio":1.86},{"k":"conc1","z":1742556,"s":938511,"unit":"/s","ratio":1.86},{"k":"big_recover","z":0.6,"s":1.07,"unit":"ms","ratio":1.8},{"k":"sql_having_top10","z":8076640,"s":4744301,"unit":"/s","ratio":1.7},{"k":"big_count_range","z":26187042,"s":15466378,"unit":"/s","ratio":1.69},{"k":"big_count","z":26002776,"s":15575331,"unit":"/s","ratio":1.67},{"k":"sql_agg_full","z":18519782,"s":12904957,"unit":"/s","ratio":1.44},{"k":"sql_group_by","z":6534064,"s":4613610,"unit":"/s","ratio":1.42},{"k":"scan","z":10872525,"s":8390444,"unit":"/s","ratio":1.3},{"k":"scan_refs","z":11119829,"s":8630698,"unit":"/s","ratio":1.29},{"k":"sql_full","z":16127828,"s":13049530,"unit":"/s","ratio":1.24}],"reopen":{"z":0.52,"s":1.98},"disk":{"z":40.92,"s":41.56}};
+const DATA = {"ahead":22,"behind":1,"unresolved":2,"slow":["sql_index_build 0.63x"],"slowZ":617,"slowS":382.5,"rounds":3,"bprRow":63,"bprRowS":4201.37,"bprBatch":43,"bprBatchS":41.2,"bprDelZ":28.8,"bprDelS":415.5,"aggDiskZ":33.76,"aggDiskS":14.62,"idxDiskZ":15.16,"idxDiskS":11.69,"batchRatio":2.27,"rows":[{"k":"upd_get","z":1185511,"s":127466,"unit":"/s","ratio":9.3},{"k":"upd_random","z":1450565,"s":198121,"unit":"/s","ratio":7.32},{"k":"get","z":979404,"s":140358,"unit":"/s","ratio":6.98},{"k":"recover","z":0.46,"s":1.94,"unit":"ms","ratio":4.17},{"k":"big_get","z":542924,"s":130904,"unit":"/s","ratio":4.15},{"k":"sql_get","z":581250,"s":146425,"unit":"/s","ratio":3.97},{"k":"conc4","z":3936244,"s":1235569,"unit":"/s","ratio":3.19},{"k":"sql_index_eq","z":67448,"s":21885,"unit":"/s","ratio":3.08},{"k":"sql_each","z":25450586,"s":9225933,"unit":"/s","ratio":2.76},{"k":"sql_limit10","z":344820,"s":145719,"unit":"/s","ratio":2.37},{"k":"big_put","z":2011159,"s":988762,"unit":"/s","ratio":2.03},{"k":"count_10k","z":28969118,"s":15193677,"unit":"/s","ratio":1.91},{"k":"big_recover","z":0.66,"s":1.23,"unit":"ms","ratio":1.87},{"k":"put_batch","z":1761405,"s":972591,"unit":"/s","ratio":1.81},{"k":"conc1","z":1740624,"s":963999,"unit":"/s","ratio":1.81},{"k":"sql_having_top10","z":8328752,"s":4614448,"unit":"/s","ratio":1.8},{"k":"big_count","z":26554467,"s":15134223,"unit":"/s","ratio":1.75},{"k":"big_count_range","z":25543717,"s":14948939,"unit":"/s","ratio":1.71},{"k":"sql_group_by","z":6896346,"s":4462992,"unit":"/s","ratio":1.55},{"k":"sql_agg_full","z":18432862,"s":13641883,"unit":"/s","ratio":1.35},{"k":"scan_refs","z":10868134,"s":8714097,"unit":"/s","ratio":1.25},{"k":"sql_full","z":15412100,"s":13323572,"unit":"/s","ratio":1.16}],"reopen":{"z":0.46,"s":1.94},"disk":{"z":40.92,"s":41.56}};
 const LABELS = {
   put:'逐行写入（组提交档・我方 256KB 缓冲）', put_sync:'逐行写入（逐行落盘档・与 SQLite 同档）', sql_put:'逐行写入（SQL 层）',
   sql_limit10:'SQL 取 10 行（LIMIT）', sql_each:'SQL 全表流式解两列', sql_get:'SQL 主键点查',
   sql_full:'SQL 全表把结果取回（物化）',
     sql_group_by:'GROUP BY 分组聚合（10 万组）', sql_agg_full:'全表聚合 COUNT/SUM/MIN/MAX',
     sql_having_top10:'GROUP BY + HAVING + ORDER BY 取前 10',
+    sql_index_eq:'二级索引等值查询（5000 次）',
+    sql_index_build:'建索引（100 万行）',
   upd_get:'更新后点查', upd_random:'随机更新 10 万行', del_100k:'删除 10 万行（一次提交）', get:'主键点查',
   conc1:'并发写 1 线程', conc4:'并发写 4 线程', big_get:'超内存点查（25 段）', big_put:'超内存批量写 200 万行',
   conc2:'并发写 2 线程', put_batch:'单事务批量写', count_10k:'范围扫描（只数行）',
@@ -88,6 +90,9 @@ const maxRatio = Math.max(...DATA.rows.map(r => r.ratio));
 
 document.getElementById('ahead').textContent = DATA.ahead;
 document.getElementById('behind').textContent = DATA.behind;
+// 落后 / 未决 都必须如实显示：只写「0 项落后」而把落后项藏起来等于造假
+document.getElementById('behindLabel').textContent =
+  '项落后' + (DATA.unresolved > 0 ? ' · ' + DATA.unresolved + ' 项未决' : '');
 document.getElementById('aheadLabel').textContent =
   '项指标全胜（每项 ' + DATA.rounds + '/' + DATA.rounds + ' 轮）';
 document.getElementById('top').textContent = maxRatio.toFixed(1) + '×';
@@ -114,9 +119,19 @@ document.getElementById('foot').innerHTML =
   '<b>删除 10 万行</b>也不进表：我方 <b>' + DATA.bprDelZ + ' B/行</b> vs SQLite <b>' + DATA.bprDelS + ' B/行</b>（写放大 14×），同理只作写放大参考；' +
   '而且我方删除是<b>墓碑</b>，空间要等 compaction 才回收（成本延后，不是立即释放）。<br>' +
         '<b>GROUP BY / 全表聚合</b>两项我方每行落盘 <b>' + DATA.aggDiskZ + ' B</b> vs SQLite <b>' + DATA.aggDiskS + ' B</b>（多 2.3×），读得更多却仍更快 —— 不是「读得少」换来的。<br>' +
+  '<b>二级索引</b>只覆盖<b>单列等值</b>查询；两侧建同一条 agg(g) 索引，我方索引落盘 <b>' + DATA.idxDiskZ + ' MB</b> vs SQLite <b>' + DATA.idxDiskS + ' MB</b>。<br>' +
   '冷重开 100 万行 <b>' + DATA.reopen.z.toFixed(2) + ' ms</b> vs <b>' + DATA.reopen.s.toFixed(2) + ' ms</b>' +
   '；磁盘 <b>' + DATA.disk.z.toFixed(2) + ' B/行</b> vs <b>' + DATA.disk.s.toFixed(2) + ' B/行</b>（越低越好）。<br>' +
-  '另有未达「每轮全胜」的项不计入本表（原始值仍在 CSV 里，可逐轮复核）。';
-</script>
+  '另有未达「每轮全胜」的项不计入本表（原始值仍在 CSV 里，可逐轮复核）。' +
+  (function () {
+    if (!DATA.slow || !DATA.slow.length) return '';
+    var s = '<br><b>每轮都落后的项（已排除出表）：' + DATA.slow.join('、');
+    var hasIdx = DATA.slow.join(' ').indexOf('sql_index_build') >= 0;
+    if (hasIdx && DATA.slowZ > 0 && DATA.slowS > 0) {
+      s += '（建索引 100 万行 ' + Math.round(DATA.slowZ) + ' ms vs ' + Math.round(DATA.slowS) +
+           ' ms；索引落盘 ' + DATA.idxDiskZ + ' MB vs ' + DATA.idxDiskS + ' MB）';
+    }
+    return s + '</b>';
+  })();</script>
 </body>
 </html>

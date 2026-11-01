@@ -417,7 +417,11 @@ pub const Table = struct {
             segs.deinit(alloc);
         }
 
-        const opened = try openSegmentsFromArchive(io, dir, path, arch, alloc, opts.mmap_preheat, &segs);
+        // 段内部保存的 `base_path` 是**借用切片**：必须传自己 dup 的那份（`base_path`），
+        // 不能传调用方的 `path` —— 调用方往往在 open 返回后立刻释放（`Engine` 拼的
+        // `{root}/{table}`、索引的 `{table}/idx/{name}` 都走 defer free），段就会带着
+        // 悬空指针活下来，等到第一次 `cursor()` 才以 `FileNotFound` 的形式爆出来。
+        const opened = try openSegmentsFromArchive(io, dir, base_path, arch, alloc, opts.mmap_preheat, &segs);
         const id: u64 = opened.max_id + 1;
         for (segs.items) |s| seq = @max(seq, s.max_seq);
 

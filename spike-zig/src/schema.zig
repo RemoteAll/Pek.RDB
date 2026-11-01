@@ -6,6 +6,7 @@ const sql = @import("sql.zig");
 
 pub const Error = error{
     InvalidSchema,
+    InvalidIdentifier,
     MissingPrimaryKey,
     TooManyPrimaryKeys,
     TypeMismatch,
@@ -22,10 +23,19 @@ pub const Column = struct {
     not_null: bool = false,
 };
 
+/// 单列二级索引定义。
+pub const IndexDef = struct {
+    name: []const u8,
+    column_idx: usize,
+};
+
 pub const Schema = struct {
     name: []const u8,
     columns: []const Column,
     pk_index: usize,
+    /// 二级索引（声明顺序）。空时是 `&.{}`，**deinit 要判空**：
+    /// 对静态空切片调 `alloc.free` 是未定义行为。
+    indexes: []IndexDef = &.{},
 
     pub fn init(alloc: std.mem.Allocator, name: []const u8, columns: []const Column) Error!Schema {
         var pk_count: usize = 0;
@@ -58,7 +68,45 @@ pub const Schema = struct {
         alloc.free(self.name);
         for (self.columns) |c| alloc.free(c.name);
         alloc.free(self.columns);
+        if (self.indexes.len != 0) {
+            for (self.indexes) |ix| alloc.free(ix.name);
+            alloc.free(self.indexes);
+        }
         self.* = undefined;
+    }
+
+    /// 登记一个索引（深拷贝名字）。同名视为已存在，返回 false。
+    ///
+    /// 名字**不得含空白**：catalog 的 `#idx <名字> <列号>` 是单行空格分隔的格式，
+    /// 名字带空格会让它下次加载时被拆成两段（索引静默消失 = 查询退回全扫，还看不出错）。
+    /// 词法层本来也只认 `[A-Za-z0-9_]` 标识符（没有引号/方括号），这个限制与全局一致。
+    pub fn addIndex(self: *Schema, alloc: std.mem.Allocator, name: []const u8, column_idx: usize) Error!bool {
+        if (name.len == 0 or std.mem.indexOfAny(u8, name, " \t\r\n") != null) return error.InvalidIdentifier;
+        for (self.indexes) |ix| {
+            if (std.ascii.eqlIgnoreCase(ix.name, name)) return false;
+        }
+        const grown = try alloc.alloc(IndexDef, self.indexes.len + 1);
+        errdefer alloc.free(grown);
+        @memcpy(grown[0..self.indexes.len], self.indexes);
+        grown[self.indexes.len] = .{ .name = try alloc.dupe(u8, name), .column_idx = column_idx };
+        if (self.indexes.len != 0) alloc.free(self.indexes);
+        self.indexes = grown;
+        return true;
+    }
+
+    /// 哪些索引建在这一列上（单列索引最多一个，返回第一个）。
+    pub fn indexOnColumn(self: *const Schema, column_idx: usize) ?IndexDef {
+        for (self.indexes) |ix| {
+            if (ix.column_idx == column_idx) return ix;
+        }
+        return null;
+    }
+
+    pub fn findIndex(self: *const Schema, name: []const u8) ?IndexDef {
+        for (self.indexes) |ix| {
+            if (std.ascii.eqlIgnoreCase(ix.name, name)) return ix;
+        }
+        return null;
     }
 
     pub fn indexOf(self: *const Schema, name: []const u8) ?usize {
@@ -86,26 +134,40 @@ pub const Schema = struct {
     /// 顺序保持的单列主键编码（复合主键后续再扩）。
     pub fn encodeKey(self: *const Schema, alloc: std.mem.Allocator, values: []const sql.Value) Error![]u8 {
         if (values.len != self.columns.len) return error.TypeMismatch;
-        const v = values[self.pk_index];
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(alloc);
-        switch (v) {
-            .null => return error.TypeMismatch,
-            .integer => |x| {
-                var b: [8]u8 = undefined;
-                codec.encodeI64Key(&b, x);
-                try out.appendSlice(alloc, &b);
-            },
-            .real => |x| {
-                var bits: u64 = @bitCast(x);
-                bits = if ((bits >> 63) != 0) ~bits else bits | 0x8000_0000_0000_0000;
-                var b: [8]u8 = undefined;
-                std.mem.writeInt(u64, &b, bits, .big);
-                try out.appendSlice(alloc, &b);
-            },
-            .text => |s| try escapeComponent(&out, alloc, s, true),
-            .blob => |s| try escapeComponent(&out, alloc, s, true),
-        }
+        try appendValueComponent(&out, alloc, values[self.pk_index]);
+        return out.toOwnedSlice(alloc);
+    }
+
+    /// 单列值分量（二级索引键的第一段）。NULL 不收录 —— 索引对 NULL 无意义，
+    /// 且 `=` 永远匹配不到 NULL，收录只会白白变大。
+    pub fn encodeValueComponent(self: *const Schema, alloc: std.mem.Allocator, column_idx: usize, v: sql.Value) Error![]u8 {
+        _ = self;
+        _ = column_idx;
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(alloc);
+        try appendValueComponent(&out, alloc, v);
+        return out.toOwnedSlice(alloc);
+    }
+
+    /// 二级索引键 = `值分量 ++ 主键分量`。
+    ///
+    /// 两段都自定界，所以查询时把前缀长度切掉就得到**行的主键键**（无需解码主键）；
+    /// 顺序保持，所以等值查询等价于一次键前缀范围扫描。
+    pub fn encodeIndexKey(
+        self: *const Schema,
+        alloc: std.mem.Allocator,
+        column_idx: usize,
+        col_value: sql.Value,
+        pk_value: sql.Value,
+    ) Error![]u8 {
+        _ = self;
+        _ = column_idx;
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(alloc);
+        try appendValueComponent(&out, alloc, col_value);
+        try appendValueComponent(&out, alloc, pk_value);
         return out.toOwnedSlice(alloc);
     }
 
@@ -251,6 +313,30 @@ pub const Schema = struct {
     }
 };
 
+/// 单个值分量编码：**顺序保持 + 自定界**（数值 8 字节定长；text/blob 转义后以 `0x00 0x01` 收尾）。
+///
+/// 主键与二级索引键共用这一份 —— 两处各写一遍迟早会不一致，而不一致的后果是
+/// 「索引键的前缀比较与行键比较得出不同顺序」，查出来的结果就会漏行或乱序。
+fn appendValueComponent(out: *std.ArrayList(u8), alloc: std.mem.Allocator, v: sql.Value) !void {
+    switch (v) {
+        .null => return error.TypeMismatch,
+        .integer => |x| {
+            var b: [8]u8 = undefined;
+            codec.encodeI64Key(&b, x);
+            try out.appendSlice(alloc, &b);
+        },
+        .real => |x| {
+            var bits: u64 = @bitCast(x);
+            bits = if ((bits >> 63) != 0) ~bits else bits | 0x8000_0000_0000_0000;
+            var b: [8]u8 = undefined;
+            std.mem.writeInt(u64, &b, bits, .big);
+            try out.appendSlice(alloc, &b);
+        },
+        .text => |s| try Schema.escapeComponent(out, alloc, s, true),
+        .blob => |s| try Schema.escapeComponent(out, alloc, s, true),
+    }
+}
+
 pub fn valueCmp(a: sql.Value, b: sql.Value) std.math.Order {
     return switch (a) {
         .null => switch (b) {
@@ -296,6 +382,28 @@ test "schema key encode order" {
     const k2 = try s.encodeKey(alloc, &.{ .{ .integer = 7 }, .{ .text = "a" } });
     defer alloc.free(k2);
     try std.testing.expect(std.mem.order(u8, k1, k2) == .lt);
+}
+
+test "二级索引：名字不许含空白（catalog 行是空格分隔的），重复名字返回 false" {
+    const alloc = std.testing.allocator;
+    const cols = [_]Column{
+        .{ .name = "id", .col_type = .integer, .primary_key = true },
+        .{ .name = "g", .col_type = .integer },
+    };
+    var s = try Schema.init(alloc, "t", &cols);
+    defer s.deinit(alloc);
+
+    // 名字带空格 → 拒绝：写进 `schema.txt` 后下次加载会被拆成两段，索引静默消失
+    try std.testing.expectError(error.InvalidIdentifier, s.addIndex(alloc, "my idx", 1));
+    try std.testing.expectError(error.InvalidIdentifier, s.addIndex(alloc, "", 1));
+    try std.testing.expectEqual(@as(usize, 0), s.indexes.len);
+
+    try std.testing.expect(try s.addIndex(alloc, "idx_g", 1));
+    // 同名（大小写不敏感）→ false，不重复登记
+    try std.testing.expect(!try s.addIndex(alloc, "IDX_G", 1));
+    try std.testing.expectEqual(@as(usize, 1), s.indexes.len);
+    try std.testing.expectEqual(@as(usize, 1), s.indexOnColumn(1).?.column_idx);
+    try std.testing.expect(s.indexOnColumn(0) == null);
 }
 
 test "schema row roundtrip" {

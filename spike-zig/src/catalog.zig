@@ -44,6 +44,16 @@ pub fn saveSchema(io: std.Io, dir: std.Io.Dir, table_path: []const u8, s: *const
         defer alloc.free(line);
         try out.appendSlice(alloc, line);
     }
+    // 索引用 `#idx ` 前缀：列名是 SQL 标识符，永远不会以 `#` 开头，
+    // 所以老文件（没有这些行）= 无索引，新老文件可以互相读。
+    for (s.indexes) |ix| {
+        // 名字带空格会把下一行加载拆成两段（索引静默消失）。`addIndex` 已拦，这里是
+        // 第二道闸：写盘前再确认一次，宁可报错也不写出一个下次读不回来的 catalog。
+        if (std.mem.indexOfAny(u8, ix.name, " \t\r\n") != null) return error.BadCatalog;
+        const line = try alloc.print("#idx {s} {d}\n", .{ ix.name, ix.column_idx });
+        defer alloc.free(line);
+        try out.appendSlice(alloc, line);
+    }
     const path = try alloc.print("{s}/schema.txt", .{table_path});
     defer alloc.free(path);
     try writeText(io, dir, path, out.items);
@@ -62,9 +72,20 @@ pub fn loadSchema(io: std.Io, dir: std.Io.Dir, table_path: []const u8, alloc: st
 
     var cols: std.ArrayList(schema_mod.Column) = .empty;
     defer cols.deinit(alloc);
+    var idxs: std.ArrayList(schema_mod.IndexDef) = .empty;
+    defer idxs.deinit(alloc);
     while (it.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \r\t");
         if (line.len == 0) continue;
+        if (std.mem.startsWith(u8, line, "#idx ")) {
+            var tok = std.mem.tokenizeScalar(u8, line[5..], ' ');
+            const iname = tok.next() orelse return error.BadCatalog;
+            const icol = tok.next() orelse return error.BadCatalog;
+            const ci = std.fmt.parseInt(usize, icol, 10) catch return error.BadCatalog;
+            // 名字先借 text 的切片，等 Schema.init 之后再统一 dupe 进 Schema
+            try idxs.append(alloc, .{ .name = iname, .column_idx = ci });
+            continue;
+        }
         var tok = std.mem.tokenizeScalar(u8, line, ' ');
         const cname = tok.next() orelse return error.BadCatalog;
         const ctype = tok.next() orelse return error.BadCatalog;
@@ -80,7 +101,14 @@ pub fn loadSchema(io: std.Io, dir: std.Io.Dir, table_path: []const u8, alloc: st
             .auto_increment = std.mem.eql(u8, ai, "1"),
         });
     }
-    return schema_mod.Schema.init(alloc, tname, cols.items);
+    var sch = try schema_mod.Schema.init(alloc, tname, cols.items);
+    errdefer sch.deinit(alloc);
+    for (idxs.items) |ix| {
+        if (ix.column_idx >= sch.columns.len) return error.BadCatalog;
+        // addIndex 内部会 dupe 名字：这里传的是 text 的借用，函数返回前 text 就释放了
+        _ = try sch.addIndex(alloc, ix.name, ix.column_idx);
+    }
+    return sch;
 }
 
 /// 数据库根目录的表清单：`v1` + 每行一个表名。

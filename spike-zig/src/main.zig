@@ -769,6 +769,85 @@ fn benchMain() !void {
                 for (rows_h.rows) |r| dh +%= r[1].integer *% 1_000_003 +% r[2].integer;
                 std.debug.print("sql_having_digest,{d},{d}\n", .{ rows_h.rows.len, dh });
             }
+
+            // ------------------------------------------------------------ 二级索引
+            //
+            // 边界（文档里也得这么写）：只支持**单列等值** —— `WHERE <索引列> = 常量`。
+            // 范围条件、多列、非等值仍全扫；这里量的就是「等值点查」这一档。
+            // 两侧**同一条索引、同一串查询、同一份 digest**。
+            {
+                const idx_path = try alloc.print("{s}/idx/idx_g", .{path5});
+                defer alloc.free(idx_path);
+                _ = try s5.addIndex(alloc, "idx_g", 1); // 列 1 = g
+
+                var idx_tables = std.StringHashMap(tablemod.Table).init(alloc);
+                defer {
+                    var mi = idx_tables.iterator();
+                    while (mi.next()) |kv| kv.value_ptr.deinit();
+                    idx_tables.deinit();
+                }
+                try idx_tables.put("idx_g", try tablemod.Table.open(io, dir, idx_path, alloc, .{ .wal_sync_every = 0 }));
+                const ip = idx_tables.getPtr("idx_g").?;
+
+                // 建索引耗时（一次性指标，与 big_recover 同类）
+                {
+                    const t0 = nowNs(io);
+                    try spike.engine.fillIndex(alloc, ip, &s5, &t5, s5.findIndex("idx_g").?);
+                    const ns = nowNs(io) - t0;
+                    std.debug.print("sql_index_build,{d},{d}\n", .{ n, ns / 1_000_000 });
+                }
+                // 索引落盘占用：证明「查得快」不是因为「建得小」
+                {
+                    var total: u64 = 0;
+                    for (ip.segs.items) |sg| {
+                        const sp = try alloc.print("{s}/seg/{d:0>6}.data", .{ idx_path, sg.id });
+                        defer alloc.free(sp);
+                        if (dir.openFile(io, sp, .{})) |ff| {
+                            defer ff.close(io);
+                            total += (try ff.stat(io)).size;
+                        } else |_| {}
+                    }
+                    std.debug.print("sql_index_disk_bytes,{d},{d}\n", .{ n, total });
+                }
+
+                // 等值点查：随机 5000 个 `g`（两侧同一条 xorshift 序列）
+                //
+                // 取 `x` 而不是 `id`：`id` 是主键，SQLite 的索引项里就存着 rowid，
+                // `SELECT id` 可以**只读索引**就答出来（覆盖索引），而我们必须回表 ——
+                // 那就是跨口径。取一个既非索引列也非主键的列，两侧都得「索引 seek + 回表」。
+                const host = spike.exec.IndexHost{ .schema = &s5, .tables = &idx_tables };
+                {
+                    const lookups: u64 = 5_000;
+                    var items_i = [_]spike.sql.SelectItem{.{ .column = "x" }};
+                    var xr: u64 = 88172645463325252;
+                    var total_rows: usize = 0;
+                    var digest: i64 = 0;
+                    t5.scan_rows_read = 0;
+                    const t0 = nowNs(io);
+                    var k: u64 = 0;
+                    while (k < lookups) : (k += 1) {
+                        xr ^= xr << 13;
+                        xr ^= xr >> 7;
+                        xr ^= xr << 17;
+                        const gv: i64 = @intCast(xr % @as(u64, @intCast(group_card)));
+                        const sel_i = spike.sql.Select{
+                            .items = &items_i,
+                            .table = "bench_agg",
+                            .where = .{ .column = "g", .op = .eq, .value = .{ .integer = gv } },
+                        };
+                        var rows_i = try spike.exec.selectRowsHost(&t5, &s5, sel_i, alloc, &host);
+                        defer rows_i.deinit();
+                        total_rows += rows_i.rows.len;
+                        for (rows_i.rows) |r| digest +%= r[0].integer;
+                    }
+                    const ns = nowNs(io) - t0;
+                    std.debug.print("sql_index_eq,{d},{d:.0}\n", .{ total_rows, opsPerSec(lookups, ns) });
+                    std.debug.print("sql_index_eq_rows,{d},0\n", .{total_rows});
+                    std.debug.print("sql_index_eq_digest,{d},{d}\n", .{ total_rows, digest });
+                    // 确定性指标：走索引时**主表一行都不扫**（不靠计时推断）
+                    std.debug.print("sql_index_eq_readrows,{d},0\n", .{t5.scan_rows_read});
+                }
+            }
         }
         // 物化成本拆解：把 selectRows 的四个阶段分别计时，**不猜**。
         // 只有知道 61ms 花在哪一段，才知道该优化什么（§16.1.11 的起点）。

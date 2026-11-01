@@ -156,6 +156,21 @@ SQLite 的 WAL 是**页粒度**：逐行 autocommit 时，一行 40 字节的数
 - 指标：`sql_group_by`（10 万组，单位「行/秒」= 扫描行数 ÷ 耗时）、
   `sql_agg_full`（全表 COUNT/SUM/MIN/MAX，1 行结果）。
 
+## 索引基准的额外要求：投影列必须两侧都「回表」（2026-11-01 起）
+
+`sql_index_eq`（5000 次 `WHERE g = ?` 等值点查）必须 **`SELECT x`**，不能 `SELECT id`：
+
+| 投影 | SQLite 走什么 | 我们走什么 | 单跑结果 |
+|---|---|---|---|
+| `SELECT id` | **覆盖索引**（索引项里含 rowid，只读索引） | 索引 seek + **回表** | 152,790 vs 63,048 = **0.41×** |
+| `SELECT x` | 索引 seek + **回表** | 索引 seek + **回表** | 20,575 vs 73,703 = **3.58×** |
+
+同一个实现、同一条 SQL，只换一个投影就反转结论——所以 `x`（既非索引列也非主键）是**口径的一部分**，
+不是随手选的列名。`sql_index_eq_readrows`（我方走索引时主表扫描行数）必须恒为 `0`。
+
+`sql_index_build`（建索引耗时）是**一次性**指标：两侧自身波动都很大（SQLite 374–744 ms / 3 轮），
+只用于给「谁更慢」的方向性结论，**不要拿它抠倍数**。
+
 ## 耐久口径（2026-11-01 起，硬性）
 
 **基准一律以 SQLite `synchronous=NORMAL` 为对等档**：所有基准表 `wal_sync_every = 0`
@@ -276,6 +291,7 @@ powershell -File tools\abba-verdict.ps1 -Tag <标签> -Date <日期>
 
 | 批次 | 内容 |
 |---|---|
+| `zig/sqlite-2026-11-01-p20` | **二级索引首次实测**（3 轮 ABBA）：`sql_index_eq` **3.025×**（3/3）、索引落盘大 1.30×、**`sql_index_build` 0.633×（落后，如实列出）**；全批 26 胜 / 1 负 / 2 未决；digest `25,379,000` 三轮两侧全同、`readrows` 恒 0；中位 spread 1.106 / 1.143 |
 | `zig/sqlite-2026-11-01-p19` | **HAVING + top-N 首次实测**（3 轮 ABBA）：`sql_having_top10` 1.769×；全批 27 胜 / 0 负 / 0 未决；中位 spread 1.056（我方）/ 1.082（SQLite），比 p18 的 1.122/1.103 更稳 |
 | `zig/sqlite-2026-11-01-p18` | **SQL 聚合 / GROUP BY 首次实测**（3 轮 ABBA）：`sql_group_by` 1.547×、`sql_agg_full` 1.306×；全批 26 胜 / 0 负 / **0 未决**；两侧 digest 与单值校验项全部相等；落盘 33.76 vs 14.62 B/行（我方多 2.31×） |
 | `zig/sqlite-2026-11-01-pfxblk2` + `zig-…-scan10k` | 块内前缀压缩后的同批全量对比：磁盘 40.92 vs 41.56 B/行；21/24 可判定、0 落后 |

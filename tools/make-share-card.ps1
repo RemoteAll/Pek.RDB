@@ -97,6 +97,9 @@ $defs = @(
     @('sql_agg_full', 'sql_agg_full', 'sql_agg_full', '/s', $true),
     # HAVING + ORDER BY ?? + LIMIT (top-N)
     @('sql_having_top10', 'sql_having_top10', 'sql_having_top10', '/s', $true),
+    # secondary index equality lookup (single-column equality only, both sides indexed)
+    @('sql_index_eq', 'sql_index_eq', 'sql_index_eq', '/s', $true),
+    @('sql_index_build', 'sql_index_build', 'sql_index_build', 'ms', $false),
     # SQL point lookup: both sides go through the SQL interface with the same
     # xorshift64 key sequence (not the storage-level get).
     # p13 and earlier had no such probe on the SQLite side; it is skipped automatically.
@@ -124,7 +127,7 @@ $defs = @(
 # speed (see docs/architecture design section 16.1.36). Showing them as "we are faster" is exactly
 # the cross-criteria claim the user rejected.
 $show = @('upd_get', 'upd_random', 'get', 'big_get', 'sql_limit10', 'sql_each', 'sql_get',
-          'sql_group_by', 'sql_agg_full', 'sql_having_top10',
+          'sql_group_by', 'sql_agg_full', 'sql_having_top10', 'sql_index_eq',
           'big_put', 'conc4', 'conc2', 'conc1', 'put_batch', 'count_10k',
           'big_count', 'big_count_range', 'scan', 'scan_refs', 'sql_full',
           'recover', 'big_recover')
@@ -147,6 +150,8 @@ if ($actualRounds -eq 0) { Write-Host "no paired CSVs found for tag=$Tag date=$D
 $rows = @()
 $aheadTotal = 0
 $behindTotal = 0
+$unresolvedTotal = 0
+$slowParts = @()
 $denoms = @()
 foreach ($d in $defs) {
     $key = $d[0]
@@ -174,8 +179,18 @@ foreach ($d in $defs) {
     if ($roundRatios.Count -eq 0) { continue }
 
     $allWin = ($wins -eq $roundRatios.Count)
-    if ($allWin) { $aheadTotal++ } else { $behindTotal++ }
-    if ($allWin) { $denoms += $roundRatios.Count }
+    # Three-way, never two-way: "not all-win" covers BOTH "behind every round" and
+    # "unresolved". Printing a hard-coded 0 for the behind tile while a metric lost
+    # every round is exactly the kind of number the user rejected.
+    if ($allWin) {
+        $aheadTotal++
+        $denoms += $roundRatios.Count
+    } elseif ($wins -eq 0) {
+        $behindTotal++
+        $slowParts += ('{0} {1:N2}x' -f $key, (Median $roundRatios))
+    } else {
+        $unresolvedTotal++
+    }
     if (-not $allWin) { Write-Host "NOT all-win (excluded from card): $key wins=$wins/$($roundRatios.Count)"; continue }
     if ($show -notcontains $key) { continue }
 
@@ -227,6 +242,13 @@ $aggDiskS = Read-Metric (Join-Path $DataDir "sqlite-$Date-$Tag-run1-a.csv") 'agg
 if ($aggDiskZ) { $aggDiskZ = [math]::Round($aggDiskZ / 1000000.0, 2) }
 if ($aggDiskS) { $aggDiskS = [math]::Round($aggDiskS / 1000000.0, 2) }
 
+# index footprint: the index probe is a READ benchmark too, so the extra bytes it costs
+# must be published (otherwise "faster lookup" could be hiding a smaller structure).
+$idxDiskZ = Read-Metric (Join-Path $DataDir "zig-$Date-$Tag-run1-a.csv") 'sql_index_disk_bytes'
+$idxDiskS = Read-Metric (Join-Path $DataDir "sqlite-$Date-$Tag-run1-a.csv") 'sql_index_disk_bytes'
+if ($idxDiskZ) { $idxDiskZ = [math]::Round($idxDiskZ / 1000000.0, 2) }
+if ($idxDiskS) { $idxDiskS = [math]::Round($idxDiskS / 1000000.0, 2) }
+
 # Batch-vs-batch paired ratio (same transaction scope AND same bytes/row).
 # Rounds where the bare-write probe collapsed are A(env) and are excluded -- but
 # the raw values stay in the CSVs and the reason is printed below.
@@ -255,9 +277,21 @@ $sdisk = Median (Samples 'sqlite' 'big_disk_bytes')
 $zPerRow = $zdisk / 2000000.0
 $sPerRow = $sdisk / 2000000.0
 
+# A ratio alone does not tell an operator how bad a loss is: publish the absolute
+# numbers for the one metric we lose every round (index build) plus the index bytes.
+# NOTE: keep this file ASCII-only. Chinese wording lives in share-card-template.html
+# because PowerShell 5.1 reads BOM-less .ps1 as ANSI and mangles CJK literals.
+$slowZ = Median (Samples 'zig' 'sql_index_build')
+$slowS = Median (Samples 'sqlite' 'sql_index_build')
+
 $payload = [pscustomobject]@{
     ahead      = $aheadTotal
-    behind     = 0
+    behind     = $behindTotal
+    unresolved = $unresolvedTotal
+    # Published so the footer can disclose the metrics we lose instead of hiding them.
+    slow       = @($slowParts)
+    slowZ      = $slowZ
+    slowS      = $slowS
     # denominator = the smallest round count among all-win metrics, never the parameter:
     # one metric with only 3 rounds means we must not print 5/5.
     rounds     = if ($denoms.Count -gt 0) { ($denoms | Measure-Object -Minimum).Minimum } else { $actualRounds }
@@ -269,6 +303,8 @@ $payload = [pscustomobject]@{
     bprDelS    = $bprDelS
     aggDiskZ   = $aggDiskZ
     aggDiskS   = $aggDiskS
+    idxDiskZ   = $idxDiskZ
+    idxDiskS   = $idxDiskS
     batchRatio = $batchRatio
     rows       = @($rows | Sort-Object -Property ratio -Descending)
     reopen = [pscustomobject]@{ z = [math]::Round($zr, 2); s = [math]::Round($sr, 2) }
@@ -280,9 +316,12 @@ $json = $payload | ConvertTo-Json -Depth 6 -Compress
 
 # Canvas height must follow the row count: with a fixed 1860 a 22-row card clips the
 # footer, and the footer carries the write-amplification disclosures (clipping hides them).
-# 19 rows <-> 1860px is the calibrated point; ~46px per extra row plus 115px spare.
+# 19 rows <-> 1860px is the calibrated point; ~46px per extra row plus 170px spare.
+# The spare was 115px until the "we lose these" disclosure line was added to the footer
+# (that line pushed the last row of text past the edge; the PNG looked complete because
+# the clipped line was the newest one).
 $canvasH = 1860
-if ($rows.Count -gt 19) { $canvasH = 1860 + ($rows.Count - 19) * 46 + 115 }
+if ($rows.Count -gt 19) { $canvasH = 1860 + ($rows.Count - 19) * 46 + 170 }
 
 $html = $tpl.Replace('__DATA__', $json).Replace('__CANVAS_H__', "$canvasH")
 [System.IO.File]::WriteAllText($OutHtml, $html, (New-Object System.Text.UTF8Encoding $false))

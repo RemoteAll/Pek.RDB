@@ -212,6 +212,14 @@ pub const CreateTable = struct {
     columns: []ColumnDef,
 };
 
+/// `CREATE INDEX name ON table (column)` —— 单列等值索引（最小闭环）。
+pub const CreateIndex = struct {
+    if_not_exists: bool = false,
+    name: []const u8,
+    table: []const u8,
+    column: []const u8,
+};
+
 pub const Value = union(enum) {
     null,
     integer: i64,
@@ -308,6 +316,7 @@ pub const Delete = struct {
 
 pub const Statement = union(enum) {
     create_table: CreateTable,
+    create_index: CreateIndex,
     insert: Insert,
     select: Select,
     update: Update,
@@ -762,12 +771,46 @@ const Parser = struct {
     }
 
     fn parseStatement(self: *Parser) Error!Statement {
-        if (isKw(self.tok, "create")) return self.parseCreateTable();
+        if (isKw(self.tok, "create")) {
+            // `CREATE TABLE` 还是 `CREATE INDEX`？词法器没有 peek，
+            // 但它是纯位置扫描：存下位置读一个词再恢复即可（不会有副作用）。
+            const save_pos = self.lexer.pos;
+            const save_tok = self.tok;
+            try self.advance();
+            const is_index = isKw(self.tok, "index");
+            self.lexer.pos = save_pos;
+            self.tok = save_tok;
+            if (is_index) return self.parseCreateIndex();
+            return self.parseCreateTable();
+        }
         if (isKw(self.tok, "insert")) return self.parseInsert();
         if (isKw(self.tok, "select")) return self.parseSelect();
         if (isKw(self.tok, "update")) return self.parseUpdate();
         if (isKw(self.tok, "delete")) return self.parseDelete();
         return error.UnsupportedStatement;
+    }
+
+    fn parseCreateIndex(self: *Parser) Error!Statement {
+        try self.expectKw("create");
+        try self.expectKw("index");
+        var if_not_exists = false;
+        if (try self.acceptKw("if")) {
+            try self.expectKw("not");
+            try self.expectKw("exists");
+            if_not_exists = true;
+        }
+        const name = try self.parseIdent();
+        try self.expectKw("on");
+        const table = try self.parseIdent();
+        _ = try self.expectTag(.lparen);
+        const column = try self.parseIdent();
+        _ = try self.expectTag(.rparen);
+        return .{ .create_index = .{
+            .if_not_exists = if_not_exists,
+            .name = name,
+            .table = table,
+            .column = column,
+        } };
     }
 };
 

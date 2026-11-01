@@ -59,6 +59,11 @@ $pairs = @(
     @('sql_agg_full', 'sql_agg_full', $true),
     # HAVING + ORDER BY aggregate + LIMIT (top-N): same SQL, with a tie-breaker key so the result
     @('sql_having_top10', 'sql_having_top10', $true),
+    # Secondary index: both sides build the same index agg(g) over the same 1M rows, then
+    # run the same 5000 equality lookups (shared xorshift key sequence) and compare digests.
+    @('sql_index_eq', 'sql_index_eq', $true),
+    # Index build time is a one-shot latency-like metric (milliseconds, lower is better).
+    @('sql_index_build', 'sql_index_build', $false),
     # The three items below are per-row writes on our side vs a single transaction on SQLite (its
     # most favourable form) -- a conservative choice that favours SQLite. Kept because SQLite has
     # no per-row variant at this scale (2M autocommit takes tens of seconds) and it never flatters us.

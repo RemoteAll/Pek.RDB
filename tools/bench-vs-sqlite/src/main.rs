@@ -667,6 +667,46 @@ fn main() -> rusqlite::Result<()> {
                 println!("sql_having_rows,{},0", n);
                 println!("sql_having_digest,{},{}", n, digest);
             }
+
+            // 二级索引：与 Zig 侧同一条索引（agg(g)）、同一串查询、同一份 digest。
+            // 边界与 Zig 侧一致：只覆盖单列等值查询。
+            {
+                let before = std::fs::metadata(agg_db).map(|m| m.len()).unwrap_or(0);
+                let t0 = Instant::now();
+                ca.execute_batch("CREATE INDEX idx_g ON agg(g)")?;
+                println!("sql_index_build,{},{}", N, t0.elapsed().as_millis());
+                ca.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+                let after = std::fs::metadata(agg_db).map(|m| m.len()).unwrap_or(0);
+                println!("sql_index_disk_bytes,{},{}", N, after.saturating_sub(before));
+
+                let lookups: u64 = 5_000;
+                let mut x: u64 = 88172645463325252;
+                let mut total_rows: usize = 0;
+                let mut digest: i64 = 0;
+                let t0 = Instant::now();
+                // Same criteria: select a column that is NEITHER the indexed one NOR the PK.
+                // `SELECT id` would be a covering-index read on the SQLite side (the index
+                // entry carries the rowid) while we still have to fetch the row -- that is a
+                // different criteria, so the probe uses `x`.
+                {
+                    let mut stmt = ca.prepare("SELECT x FROM agg WHERE g = ?1")?;
+                    for _ in 0..lookups {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        let g = (x % 100_000) as i64;
+                        let mut rows = stmt.query([g])?;
+                        while let Some(r) = rows.next()? {
+                            digest = digest.wrapping_add(r.get::<_, i64>(0)?);
+                            total_rows += 1;
+                        }
+                    }
+                }
+                let secs = t0.elapsed().as_secs_f64();
+                println!("sql_index_eq,{},{}", total_rows, lookups as f64 / secs);
+                println!("sql_index_eq_rows,{},0", total_rows);
+                println!("sql_index_eq_digest,{},{}", total_rows, digest);
+            }
         }
         drop(c3);
     }
