@@ -818,9 +818,22 @@ fn selectGrouped(
     var hidden: std.ArrayList(OutSrc) = .empty;
     defer hidden.deinit(alloc);
     if (sel.order_by.len > 0) {
+        // 匹配顺序很重要：**输出列优先**。否则一个名字长得像聚合的输出列
+        // （例如有人真建了 `[sum(x)]` 这么个列）会先被当成聚合表达式，
+        // 一旦内层列不存在就直接误报 ColumnNotFound。
+        const outputIndexOf = struct {
+            fn get(cols: [][]const u8, text: []const u8) ?usize {
+                for (cols, 0..) |cn, ci| {
+                    if (std.ascii.eqlIgnoreCase(cn, text)) return ci;
+                }
+                return null;
+            }
+        }.get;
+
         // 第一步：把隐藏聚合的槽先建好 —— 必须在算 `need` 之前，
         // 否则 `ORDER BY SUM(x)`（x 未被选中）的参数列不会被解码。
         for (sel.order_by) |o| {
+            if (outputIndexOf(columns, o.column) != null) continue; // 是输出列，不是隐藏聚合
             const agg = parseAggTarget(o.column) orelse continue;
             const ci: ?usize = if (agg.column) |c| (s.indexOf(c) orelse return error.ColumnNotFound) else null;
             var found = false;
@@ -834,14 +847,7 @@ fn selectGrouped(
         }
 
         for (sel.order_by) |o| {
-            var at: ?usize = null;
-            // 1) 输出列
-            for (columns, 0..) |cn, ci| {
-                if (std.ascii.eqlIgnoreCase(cn, o.column)) {
-                    at = ci;
-                    break;
-                }
-            }
+            var at: ?usize = outputIndexOf(columns, o.column);
             // 2) 聚合（隐藏）
             if (at == null) {
                 if (parseAggTarget(o.column)) |agg| {
@@ -1989,5 +1995,60 @@ test "ORDER BY 可引用未选中的分组键 / 聚合（隐藏列）" {
         var p = try sql.parse(alloc, "SELECT g FROM ho GROUP BY g ORDER BY x");
         defer p.deinit();
         try std.testing.expectError(error.ColumnNotFound, selectRows(&t, &s, p.stmt.select, alloc));
+    }
+}
+
+test "ORDER BY 匹配顺序：名字长得像聚合的输出列不能被当成聚合表达式" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-exec-aggish-name";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    // 故意把列名起成 `sum(x)`：如果 ORDER BY 的解析先按聚合表达式匹配，
+    // 就会去找一个叫 `x` 的列（不存在）→ 误报 ColumnNotFound。
+    const cols = [_]schema_mod.Column{
+        .{ .name = "id", .col_type = .integer, .primary_key = true },
+        .{ .name = "sum(x)", .col_type = .integer },
+    };
+    var s = try schema_mod.Schema.init(alloc, "aggish", &cols);
+    defer s.deinit(alloc);
+    var t = try tablemod.Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+
+    {
+        var p = try sql.parse(alloc, "INSERT INTO aggish (id, [sum(x)]) VALUES (1, 7), (2, 9)");
+        defer p.deinit();
+        _ = try insertRows(&t, &s, p.stmt.insert, alloc);
+    }
+
+    // 分组键就是那个「像聚合」的列；ORDER BY 引用它 → 必须走输出列路径，不能报错
+    {
+        var p = try sql.parse(alloc,
+            "SELECT [sum(x)], COUNT(*) FROM aggish GROUP BY [sum(x)] ORDER BY [sum(x)]");
+        defer p.deinit();
+        var rows = try selectRows(&t, &s, p.stmt.select, alloc);
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
+        try std.testing.expectEqual(@as(i64, 7), rows.rows[0][0].integer);
+        try std.testing.expectEqual(@as(i64, 9), rows.rows[1][0].integer);
+        try std.testing.expectEqualStrings("sum(x)", rows.columns[0]); // 列名原样保留
+        try std.testing.expectEqualStrings("count(*)", rows.columns[1]);
+    }
+
+    // 对照：真正的聚合排序仍然要能工作（`ORDER BY sum(id)` 而 sum(id) 未输出）
+    {
+        var p = try sql.parse(alloc,
+            "SELECT [sum(x)] FROM aggish GROUP BY [sum(x)] ORDER BY SUM(id) DESC");
+        defer p.deinit();
+        var rows = try selectRows(&t, &s, p.stmt.select, alloc);
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
+        // 每组只有 1 行：SUM(id) 就是该行的 id → 降序 9 在前
+        try std.testing.expectEqual(@as(i64, 9), rows.rows[0][0].integer);
     }
 }
