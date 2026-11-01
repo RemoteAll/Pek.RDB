@@ -267,12 +267,25 @@ pub const OrderItem = struct {
     desc: bool = false,
 };
 
+/// `HAVING <聚合> <op> <常量>`。
+///
+/// 只支持这个形状：`HAVING` 的真需求就是「按聚合结果过滤组」（`HAVING COUNT(*) > 1`、
+/// `HAVING SUM(x) > n`），做成通用表达式树要先有表达式求值，而我们的 `WHERE`
+/// 也只支持单列比较 —— 两边保持一致，不引入半成品。
+pub const Having = struct {
+    agg: Agg,
+    op: CmpOp,
+    value: Value,
+};
+
 pub const Select = struct {
     items: []SelectItem,
     table: []const u8,
     where: ?Expr = null,
     /// `GROUP BY` 列（按书写顺序）；为空且含聚合时整表一个组。
     group_by: [][]const u8 = &.{},
+    /// 分组后的过滤（作用在聚合结果上，不是原始行）。
+    having: ?Having = null,
     order_by: []OrderItem = &.{},
     limit: ?u32 = null,
     offset: ?u32 = null,
@@ -282,7 +295,6 @@ pub const Assign = struct {
     column: []const u8,
     value: Value,
 };
-
 pub const Update = struct {
     table: []const u8,
     assignments: []Assign,
@@ -626,6 +638,32 @@ const Parser = struct {
             try std.fmt.allocPrint(self.arena, "{s}(*)", .{func.name()});
     }
 
+    fn parseHaving(self: *Parser) Error!Having {
+        const name = try self.parseIdent();
+        const func = parseAggFunc(name) orelse return error.UnsupportedStatement;
+        _ = try self.expectTag(.lparen);
+        var col: ?[]const u8 = null;
+        if (self.tok.tag == .star) {
+            if (func != .count) return error.UnsupportedStatement;
+            try self.advance();
+        } else {
+            col = try self.parseIdent();
+        }
+        _ = try self.expectTag(.rparen);
+
+        const op: CmpOp = switch (self.tok.tag) {
+            .eq => .eq,
+            .ne => .ne,
+            .lt => .lt,
+            .le => .le,
+            .gt => .gt,
+            .ge => .ge,
+            else => return error.UnexpectedToken,
+        };
+        try self.advance();
+        return .{ .agg = .{ .func = func, .column = col }, .op = op, .value = try self.parseValue() };
+    }
+
     fn parseSelect(self: *Parser) Error!Statement {
         try self.expectKw("select");
         var items: std.ArrayList(SelectItem) = .empty;
@@ -664,6 +702,10 @@ const Parser = struct {
             }
             sel.group_by = try self.arena.dupe([]const u8, gb.items);
             gb.deinit(self.arena);
+        }
+
+        if (try self.acceptKw("having")) {
+            sel.having = try self.parseHaving();
         }
 
         if (try self.acceptKw("order")) {
@@ -878,6 +920,29 @@ test "parse update and delete" {
 
 test "unsupported statement rejected" {
     try std.testing.expectError(error.UnsupportedStatement, parse(std.testing.allocator, "WITH x AS (SELECT 1) SELECT * FROM x"));
+}
+
+test "parse HAVING 聚合比较" {
+    var p = try parse(std.testing.allocator, "SELECT g, COUNT(*) FROM t GROUP BY g HAVING COUNT(*) > 1 ORDER BY g");
+    defer p.deinit();
+    const s = p.stmt.select;
+    try std.testing.expect(s.having != null);
+    try std.testing.expectEqual(AggFunc.count, s.having.?.agg.func);
+    try std.testing.expect(s.having.?.agg.column == null);
+    try std.testing.expectEqual(CmpOp.gt, s.having.?.op);
+    try std.testing.expectEqual(@as(i64, 1), s.having.?.value.integer);
+
+    var q = try parse(std.testing.allocator, "SELECT g FROM t GROUP BY g HAVING SUM(x) >= 100");
+    defer q.deinit();
+    try std.testing.expectEqual(AggFunc.sum, q.stmt.select.having.?.agg.func);
+    try std.testing.expectEqualStrings("x", q.stmt.select.having.?.agg.column.?);
+    try std.testing.expectEqual(CmpOp.ge, q.stmt.select.having.?.op);
+
+    // HAVING 后面必须是聚合调用，否则拒绝（不猜）
+    try std.testing.expectError(
+        error.UnsupportedStatement,
+        parse(std.testing.allocator, "SELECT g FROM t GROUP BY g HAVING g > 1"),
+    );
 }
 
 test "parse group by with aggregates" {

@@ -95,6 +95,8 @@ $defs = @(
     # aggregate / GROUP BY (same table, same SQL, per-group digest cross-check)
     @('sql_group_by', 'sql_group_by', 'sql_group_by', '/s', $true),
     @('sql_agg_full', 'sql_agg_full', 'sql_agg_full', '/s', $true),
+    # HAVING + ORDER BY ?? + LIMIT (top-N)
+    @('sql_having_top10', 'sql_having_top10', 'sql_having_top10', '/s', $true),
     # SQL point lookup: both sides go through the SQL interface with the same
     # xorshift64 key sequence (not the storage-level get).
     # p13 and earlier had no such probe on the SQLite side; it is skipped automatically.
@@ -122,7 +124,7 @@ $defs = @(
 # speed (see docs/architecture design section 16.1.36). Showing them as "we are faster" is exactly
 # the cross-criteria claim the user rejected.
 $show = @('upd_get', 'upd_random', 'get', 'big_get', 'sql_limit10', 'sql_each', 'sql_get',
-          'sql_group_by', 'sql_agg_full',
+          'sql_group_by', 'sql_agg_full', 'sql_having_top10',
           'big_put', 'conc4', 'conc2', 'conc1', 'put_batch', 'count_10k',
           'big_count', 'big_count_range', 'scan', 'scan_refs', 'sql_full',
           'recover', 'big_recover')

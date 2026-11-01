@@ -370,7 +370,7 @@ pub fn selectRows(
     // 聚合 / GROUP BY 走独立路径：不物化原始行，只产出「每组一行」。
     // 放在最前面（ PK 点查之前），否则 `SELECT COUNT(*) FROM t WHERE id = 1` 会被
     // 当成点查返回整行。
-    if (sel.group_by.len > 0 or hasAggregate(sel.items)) return selectGrouped(t, s, sel, alloc);
+    if (sel.group_by.len > 0 or sel.having != null or hasAggregate(sel.items)) return selectGrouped(t, s, sel, alloc);
 
     // PK 等值查询：直接点查，不扫全表。
     if (sel.where) |w| {
@@ -717,6 +717,26 @@ fn selectGrouped(
         }
     }
 
+    // ---- 1.5) HAVING 的聚合可能不在选择列表里 ----
+    //
+    // `SELECT g FROM t GROUP BY g HAVING COUNT(*) > 1` 就是这种：`COUNT(*)` 只用于过滤，
+    // 不输出。这种情况下在 specs 末尾补一个槽（只算不输出），
+    // 已存在的聚合则直接复用，避免同一个聚合算两遍。
+    var having_spec: ?usize = null;
+    if (sel.having) |hv| {
+        const hci: ?usize = if (hv.agg.column) |c| (s.indexOf(c) orelse return error.ColumnNotFound) else null;
+        for (specs.items, 0..) |sp, k| {
+            if (sp.func == hv.agg.func and sp.col_idx == hci) {
+                having_spec = k;
+                break;
+            }
+        }
+        if (having_spec == null) {
+            try specs.append(alloc, .{ .func = hv.agg.func, .col_idx = hci });
+            having_spec = specs.items.len - 1;
+        }
+    }
+
     // ---- 2) 只解码真正要用的列（分组键 / 聚合参数 / WHERE 列）----
     const need = try alloc.alloc(bool, ncols);
     defer alloc.free(need);
@@ -881,20 +901,35 @@ fn selectGrouped(
         cols_done += 1;
     }
 
-    // ---- 5) 每组算一行，再按 ORDER BY / LIMIT 取子集 ----
-    const ngroups = groups.items.len;
-    const flat0 = try alloc.alloc(sql.Value, ngroups * out_n);
+    // ---- 5) 每组算一行，再按 HAVING / ORDER BY / LIMIT 取子集 ----
+    //
+    // SQL 语义：聚合值为 NULL 时比较结果是 unknown → 整组被过滤掉（不是当作 0 参与比较）。
+    var kept: std.ArrayList(usize) = .empty;
+    if (sel.having) |hv| {
+        const hs = having_spec.?;
+        for (groups.items, 0..) |*g, gi| {
+            const hv_val = try accValue(&g.aggs[hs], specs.items[hs].func);
+            if (isNullValue(hv_val)) continue;
+            if (evalWhere(hv_val, hv.op, hv.value)) try kept.append(arena, gi);
+        }
+    } else {
+        for (0..groups.items.len) |gi| try kept.append(arena, gi);
+    }
+
+    const nkeep = kept.items.len;
+    const flat0 = try alloc.alloc(sql.Value, nkeep * out_n);
     defer alloc.free(flat0);
-    for (groups.items, 0..) |*g, gi| {
+    for (kept.items, 0..) |gi, r| {
+        const g = &groups.items[gi];
         for (src_of, 0..) |src, ci| {
-            flat0[gi * out_n + ci] = switch (src) {
+            flat0[r * out_n + ci] = switch (src) {
                 .grp => |k| g.keys[k],
                 .agg => |k| try accValue(&g.aggs[k], specs.items[k].func),
             };
         }
     }
 
-    const order_idx = try alloc.alloc(usize, ngroups);
+    const order_idx = try alloc.alloc(usize, nkeep);
     defer alloc.free(order_idx);
     for (order_idx, 0..) |*p, i| p.* = i;
     if (sel.order_by.len > 0) {
@@ -916,8 +951,8 @@ fn selectGrouped(
     }
 
     var start: usize = 0;
-    if (sel.offset) |o| start = @min(@as(usize, o), ngroups);
-    var end: usize = ngroups;
+    if (sel.offset) |o| start = @min(@as(usize, o), nkeep);
+    var end: usize = nkeep;
     if (sel.limit) |l| end = @min(end, start + @as(usize, l));
     const m = end - start;
 
@@ -975,7 +1010,7 @@ pub fn forEachRow(
     // 直接复用 `selectRows` 的既有逻辑再回放，避免两处各写一份语义。
     // 聚合也归入这条：流式 API 回放的应该是「每组一行」的结果，而不是原始行。
     const must_materialize = blk: {
-        if (sel.group_by.len > 0 or hasAggregate(sel.items)) break :blk true;
+        if (sel.group_by.len > 0 or sel.having != null or hasAggregate(sel.items)) break :blk true;
         if (sel.order_by.len > 0) break :blk true;
         if (sel.where) |w| {
             if (w.op == .eq) {
@@ -1614,5 +1649,96 @@ test "聚合结果与全表扫描手算一致（1000 行随机分布）" {
         // 组的行数之和必须等于总行数（不漏组、不重复计）
         try std.testing.expectEqual(@as(i64, n), total);
         try std.testing.expectEqual(@as(usize, 37), rows.rows.len);
+    }
+}
+
+test "HAVING：按聚合结果过滤组，NULL 聚合被排除" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-exec-having";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    const cols = [_]schema_mod.Column{
+        .{ .name = "id", .col_type = .integer, .primary_key = true },
+        .{ .name = "g", .col_type = .integer },
+        .{ .name = "x", .col_type = .integer },
+    };
+    var s = try schema_mod.Schema.init(alloc, "h", &cols);
+    defer s.deinit(alloc);
+    var t = try tablemod.Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+
+    {
+        // g=1: 10,20 / g=2: 5 / g=3: NULL / g=4: 1,2,3
+        var p = try sql.parse(alloc,
+            "INSERT INTO h (id, g, x) VALUES (1,1,10), (2,1,20), (3,2,5), (4,3,NULL), (5,4,1), (6,4,2), (7,4,3)");
+        defer p.deinit();
+        _ = try insertRows(&t, &s, p.stmt.insert, alloc);
+    }
+
+    // COUNT(*) >= 2 → 只剩 g=1 与 g=4
+    {
+        var p = try sql.parse(alloc, "SELECT g, COUNT(*) FROM h GROUP BY g HAVING COUNT(*) >= 2 ORDER BY g");
+        defer p.deinit();
+        var rows = try selectRows(&t, &s, p.stmt.select, alloc);
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
+        try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
+        try std.testing.expectEqual(@as(i64, 2), rows.rows[0][1].integer);
+        try std.testing.expectEqual(@as(i64, 4), rows.rows[1][0].integer);
+        try std.testing.expectEqual(@as(i64, 3), rows.rows[1][1].integer);
+    }
+
+    // SUM(x) >= 6 → g=1(30)、g=4(6)；g=2(5) 不够；g=3 的 SUM 是 NULL → 必须被排除（不是当 0）
+    {
+        var p = try sql.parse(alloc, "SELECT g, SUM(x) FROM h GROUP BY g HAVING SUM(x) >= 6 ORDER BY g");
+        defer p.deinit();
+        var rows = try selectRows(&t, &s, p.stmt.select, alloc);
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
+        try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
+        try std.testing.expectEqual(@as(i64, 30), rows.rows[0][1].integer);
+        try std.testing.expectEqual(@as(i64, 4), rows.rows[1][0].integer);
+        try std.testing.expectEqual(@as(i64, 6), rows.rows[1][1].integer);
+    }
+
+    // 反向验证：不加 HAVING 时 NULL 组要在，且 SUM 为 NULL（证明上面的排除不是因为组不存在）
+    {
+        var p = try sql.parse(alloc, "SELECT g, SUM(x) FROM h GROUP BY g ORDER BY g");
+        defer p.deinit();
+        var rows = try selectRows(&t, &s, p.stmt.select, alloc);
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 4), rows.rows.len);
+        try std.testing.expectEqual(@as(i64, 3), rows.rows[2][0].integer);
+        try std.testing.expect(isNullValue(rows.rows[2][1]));
+    }
+
+    // HAVING 里用的聚合可以不在选择列表里
+    {
+        var p = try sql.parse(alloc, "SELECT g FROM h GROUP BY g HAVING COUNT(*) = 1 ORDER BY g");
+        defer p.deinit();
+        var rows = try selectRows(&t, &s, p.stmt.select, alloc);
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 2), rows.rows.len); // g=2, g=3
+        try std.testing.expectEqual(@as(i64, 2), rows.rows[0][0].integer);
+        try std.testing.expectEqual(@as(i64, 3), rows.rows[1][0].integer);
+    }
+
+    // HAVING + ORDER BY 聚合 + LIMIT（top-N 形状）
+    {
+        var p = try sql.parse(alloc,
+            "SELECT g, SUM(x) FROM h GROUP BY g HAVING SUM(x) > 0 ORDER BY sum(x) DESC LIMIT 2");
+        defer p.deinit();
+        var rows = try selectRows(&t, &s, p.stmt.select, alloc);
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
+        try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer); // 30 最大
+        try std.testing.expectEqual(@as(i64, 30), rows.rows[0][1].integer);
+        try std.testing.expectEqual(@as(i64, 4), rows.rows[1][0].integer); // 6 次之
     }
 }

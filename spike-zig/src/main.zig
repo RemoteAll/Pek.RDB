@@ -734,6 +734,41 @@ fn benchMain() !void {
                 std.debug.print("sql_agg_sum,{d},0\n", .{rows_a.rows[0][1].integer});
                 std.debug.print("sql_agg_minmax,{d},{d}\n", .{ rows_a.rows[0][2].integer, rows_a.rows[0][3].integer });
             }
+
+            // HAVING + ORDER BY 聚合 + LIMIT（top-N 形状）。
+            //
+            // 数据是确定性的（每组 10 行、x = id % 1000 且同一个 g 下 x 恒定），
+            // 所以结果可以逐行对账。**排序必须加次级键 g**：只按 sum(x) 排序时
+            // 100 个组并列，不稳定排序会让两侧“都对但顺序不同”，digest 就没法比了。
+            {
+                var items_h = [_]spike.sql.SelectItem{
+                    .{ .column = "g" },
+                    .{ .aggregate = .{ .func = .count, .column = null } },
+                    .{ .aggregate = .{ .func = .sum, .column = "x" } },
+                };
+                var gb_h = [_][]const u8{"g"};
+                var order_h = [_]spike.sql.OrderItem{
+                    .{ .column = "sum(x)", .desc = true },
+                    .{ .column = "g", .desc = false },
+                };
+                const sel_h = spike.sql.Select{
+                    .items = &items_h,
+                    .table = "bench_agg",
+                    .group_by = &gb_h,
+                    .having = .{ .agg = .{ .func = .sum, .column = "x" }, .op = .gt, .value = .{ .integer = 4500 } },
+                    .order_by = &order_h,
+                    .limit = 10,
+                };
+                const t0 = nowNs(io);
+                var rows_h = try spike.exec.selectRows(&t5, &s5, sel_h, alloc);
+                const ns = nowNs(io) - t0;
+                defer rows_h.deinit();
+                std.debug.print("sql_having_top10,{d},{d:.0}\n", .{ n, opsPerSec(n, ns) });
+                std.debug.print("sql_having_rows,{d},0\n", .{rows_h.rows.len});
+                var dh: i64 = 0;
+                for (rows_h.rows) |r| dh +%= r[1].integer *% 1_000_003 +% r[2].integer;
+                std.debug.print("sql_having_digest,{d},{d}\n", .{ rows_h.rows.len, dh });
+            }
         }
         // 物化成本拆解：把 selectRows 的四个阶段分别计时，**不猜**。
         // 只有知道 61ms 花在哪一段，才知道该优化什么（§16.1.11 的起点）。

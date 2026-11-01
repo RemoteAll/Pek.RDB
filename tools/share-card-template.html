@@ -76,6 +76,7 @@ const LABELS = {
   sql_limit10:'SQL 取 10 行（LIMIT）', sql_each:'SQL 全表流式解两列', sql_get:'SQL 主键点查',
   sql_full:'SQL 全表把结果取回（物化）',
     sql_group_by:'GROUP BY 分组聚合（10 万组）', sql_agg_full:'全表聚合 COUNT/SUM/MIN/MAX',
+    sql_having_top10:'GROUP BY + HAVING + ORDER BY 取前 10',
   upd_get:'更新后点查', upd_random:'随机更新 10 万行', del_100k:'删除 10 万行（一次提交）', get:'主键点查',
   conc1:'并发写 1 线程', conc4:'并发写 4 线程', big_get:'超内存点查（25 段）', big_put:'超内存批量写 200 万行',
   conc2:'并发写 2 线程', put_batch:'单事务批量写', count_10k:'范围扫描（只数行）',

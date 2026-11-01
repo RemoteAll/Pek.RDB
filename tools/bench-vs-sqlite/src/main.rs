@@ -641,6 +641,32 @@ fn main() -> rusqlite::Result<()> {
                 println!("sql_agg_sum,{},0", sum);
                 println!("sql_agg_minmax,{},{}", min, max);
             }
+
+            // HAVING + ORDER BY 聚合 + LIMIT（top-N）。与 Zig 侧同一条 SQL。
+            // 必须带次级排序键 g：只按 SUM(x) 排序时 100 个组并列，
+            // 两侧的并列顺序不一定相同，digest 就会“都对但对不上”。
+            {
+                let t0 = Instant::now();
+                let mut n: usize = 0;
+                let mut digest: i64 = 0;
+                {
+                    let mut stmt = ca.prepare(
+                        "SELECT g, COUNT(*), SUM(x) FROM agg GROUP BY g HAVING SUM(x) > 4500 \
+                         ORDER BY SUM(x) DESC, g ASC LIMIT 10",
+                    )?;
+                    let mut rows = stmt.query([])?;
+                    while let Some(r) = rows.next()? {
+                        let cnt: i64 = r.get(1)?;
+                        let sum: i64 = r.get(2)?;
+                        digest = digest.wrapping_add(cnt.wrapping_mul(1_000_003).wrapping_add(sum));
+                        n += 1;
+                    }
+                }
+                let secs = t0.elapsed().as_secs_f64();
+                println!("sql_having_top10,{},{}", N, N as f64 / secs);
+                println!("sql_having_rows,{},0", n);
+                println!("sql_having_digest,{},{}", n, digest);
+            }
         }
         drop(c3);
     }

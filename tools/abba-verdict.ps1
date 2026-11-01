@@ -30,36 +30,38 @@ if (-not $DataDir) {
 # Metric pairs: zig name, sqlite name, higher-is-better
 $pairs = @(
     @('put', 'put', $true),
-    # 同持久化档位：我方每行立即 write 到 OS（wal_buf_bytes=0，不 fsync）
-    # vs SQLite 每笔提交 pwrite 到 WAL（synchronous=NORMAL，不 fsync）。两边都强杀不丢。
+    # Same durability tier: we write() each row straight to the OS (wal_buf_bytes=0, no fsync)
+    # vs SQLite pwrite on every commit to WAL (synchronous=NORMAL, no fsync). Both survive a kill.
     @('put_sync', 'put', $true),
     @('put_batch', 'put_txn', $true),
     @('get', 'get', $true),
     @('scan', 'scan_v', $true),
     @('count_10k', 'scan_big', $true),
-    # scan_refs 会「收集」命中记录（20 万 × 48B），旧配对用的是 scan_big（只推进游标、
-    # 一条不收）——那是不对等口径（曾因此得出假的 0.70x）。现改为 SQLite 也收集的 scan_big_collect。
+    # scan_refs COLLECTS the matching records (200k x 48B); the old pairing used scan_big, which only
+    # advances the cursor -- not the same criteria (that once produced a fake 0.70x). Now uses the
     @('scan_refs', 'scan_big_collect', $true),
-    # sql_put 是我方 **SQL 层逐行 INSERT**（main.zig 里每行一次 insertRows，无事务包裹），
-    # 所以必须对 SQLite 的 **put（逐行 autocommit）**，不能对 put_txn（单事务批量）。
-    # 旧映射错配到 put_txn，把 48.4x 压成 1.85x，并让人误以为“差距来自 SQL 层”—— 实际
-    # 存储 API 与 SQL 层只差约 7%（51.70x vs 48.4x），差距来自“每行一次完整提交”。
+    # sql_put is our SQL-layer per-row INSERT (one insertRows call per row, no transaction wrapper),
+    # so it must pair with SQLite put (per-row autocommit), NOT put_txn (single-transaction batch).
+    # The old map paired it with put_txn, crushing 48.4x into 1.85x and suggesting the gap came from
+    # the SQL layer -- storage API vs SQL layer differ by ~7%; the gap is one full commit per row.
     @('sql_put', 'put', $true),
     @('sql_get', 'sql_get', $true),
     @('sql_full', 'sql_full', $true),
-    # 我方 `sql_each` = 流式逐行、解码两列；SQLite `sql_full_touch` = 取两列值（不解码成行对象）。
-    # 两边都「解出两列」，是同口径。旧表里 `sql_full_touch` 被配到自己（我方根本没这个指标），
-    # 等于这一项从来没被比较过 —— 补上。
+    # Ours sql_each = streaming, decodes 2 columns; SQLite sql_full_touch = reads 2 column values.
+    # Both decode two columns, so it is the same criteria. In the old table sql_full_touch was paired
+    # with itself (we never had that metric), so this item had never been compared at all.
     @('sql_each', 'sql_full_touch', $true),
-    # LIMIT 提前终止：两边都是 `SELECT * FROM t LIMIT 10`，我方读到 10 行就停。
+    # LIMIT early exit: both run `SELECT * FROM t LIMIT 10`; we stop after 10 rows.
     @('sql_limit10', 'sql_limit10', $true),
-    # 聚合：两侧同一张逻辑表（100 万行，id / g=id%100000 / x=id%1000）、同一条 SQL、
-    # 同样把结果集全部取出来算一个 digest（结果一致性另有断言）。
+    # Aggregate: same logical table on both sides (1M rows, id / g=id%100000 / x=id%1000), same SQL,
+    # and both pull the whole result set to compute a digest (consistency is asserted separately).
     @('sql_group_by', 'sql_group_by', $true),
     @('sql_agg_full', 'sql_agg_full', $true),
-    # 以下三项我方是**逐行**写，SQLite 侧用的是**单事务**（它最有利的形态）——
-    # 属于**对 SQLite 有利的保守口径**（我方可测值只会更高）。保留是因为 SQLite
-    # 没有同量级的逐行变体（200 万行 autocommit 要跑几十秒），且方向不损对方。
+    # HAVING + ORDER BY aggregate + LIMIT (top-N): same SQL, with a tie-breaker key so the result
+    @('sql_having_top10', 'sql_having_top10', $true),
+    # The three items below are per-row writes on our side vs a single transaction on SQLite (its
+    # most favourable form) -- a conservative choice that favours SQLite. Kept because SQLite has
+    # no per-row variant at this scale (2M autocommit takes tens of seconds) and it never flatters us.
     @('conc_put_1t', 'conc_put_1t_txn', $true),
     @('conc_put_2t', 'conc_put_2t_txn', $true),
     @('conc_put_4t', 'conc_put_4t_txn', $true),
@@ -68,7 +70,7 @@ $pairs = @(
     @('big_count', 'big_count', $true),
     @('big_count_range', 'big_count_range', $true),
     @('upd_random', 'upd_random_txn', $true),
-    # DELETE：两边都是「一次提交删 10 万行」，同事务粒度；字节量另行报（del_wal_bytes）。
+    # DELETE: both delete 100k rows in one commit (same transaction scope); bytes reported separately.
     @('del_100k', 'del_100k', $true),
     @('upd_get', 'upd_get', $true),
     @('recover', 'recover', $false),
