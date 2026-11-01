@@ -496,8 +496,11 @@ pub const Table = struct {
         errdefer self.alloc.free(records);
 
         // 第二遍：边遍历边填，不再产生中间数组。
-        // 两遍必须产出一致的结果 —— MergeIter 对同一 snapshot 是确定性的，
-        // 且约定「扫描期间不得写」；下面的 assert 就是这个不变量的守门人。
+        //
+        // 两遍必须产出一致的结果：`MergeIter` 对同一 snapshot 是确定性的，且约定
+        // 「扫描期间不得写」。但 **`std.debug.assert` 在 ReleaseFast 下会被抹掉** ——
+        // 万一真有人违反契约（并发写让 memtable 变大），第二遍就会**越界写**
+        // records/buf，那是静默的内存破坏而不是报错。所以用运行时检查 + 明确错误。
         var off: usize = 0;
         var i: usize = 0;
         {
@@ -505,7 +508,8 @@ pub const Table = struct {
             try it.init(self, start, end);
             defer it.deinit();
             while (it.next()) |r| {
-                std.debug.assert(i < n);
+                if (i >= n) return error.ConcurrentModification;
+                if (off + r.key.len + r.value.len > total) return error.ConcurrentModification;
                 const k = buf[off..][0..r.key.len];
                 @memcpy(k, r.key);
                 off += r.key.len;
@@ -516,7 +520,8 @@ pub const Table = struct {
                 i += 1;
             }
         }
-        std.debug.assert(i == n);
+        // 变少了也算违约：否则返回的 records 会是 n 条、后半段是未初始化内存。
+        if (i != n) return error.ConcurrentModification;
         std.debug.assert(off == total);
         return .{ .alloc = self.alloc, .buf = buf, .records = records };
     }
@@ -600,12 +605,19 @@ pub const Table = struct {
 
         // 关键次序：**先在内存里建好新段**（验证索引可解析），再改磁盘，最后才清理旧段。
         // 若反过来（先清旧段再建新段），中途失败会让 Table 变成空表，而磁盘上归档已指向新段。
-        const new_seg = try segmod.Segment.fromBytes(self.io, self.dir, self.base_path, id, fin.bytes, self.alloc, true, self.opts.mmap_preheat);
+        var new_seg = try segmod.Segment.fromBytes(self.io, self.dir, self.base_path, id, fin.bytes, self.alloc, true, self.opts.mmap_preheat);
+        // errdefer 必须在 ensureParsed **之前**注册：校验失败时段的 `entries` 已经分配，
+        // 而 `fromBytes` 内部的 errdefer 只覆盖它自己那一段，管不到这里。
         errdefer {
             var s = new_seg;
             s.owns_idx = false; // 字节由上面的 errdefer 释放
             s.close();
         }
+        // **懒解析之后这一句是关键**：`fromBytes` 现在只读头部、不做 CRC 校验，
+        // 而 compact 的整个安全性都建立在「动手改磁盘之前，先确认新段索引真能解析」之上
+        // （上面那条注释写的就是这件事）。不在这里强制全量校验，就等于把
+        // 「归档已指向新段」和「新段索引是否完好」这两件事脱钩了。
+        try new_seg.ensureParsed();
 
         // 重建归档（临时文件 + 原子 rename）：成功后磁盘才指向新段
         const records = [_]segmod.ArchiveRecord{.{ .id = @intCast(id), .payload = fin.bytes }};

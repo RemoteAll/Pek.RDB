@@ -93,8 +93,8 @@ pub const Replay = struct {
     }
 
     pub fn deinit(self: *Replay) void {
-        for (self.batches.items) |b| self.alloc.free(b.ops);
-        self.batches.deinit(self.alloc);
+        // 复用 `freeBatches`：同一逻辑不能有两份（否则将来改一处漏一处）。
+        freeBatches(&self.batches, self.alloc);
         self.alloc.free(self.buf);
         self.* = undefined;
     }

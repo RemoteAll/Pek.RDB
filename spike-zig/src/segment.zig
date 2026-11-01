@@ -699,6 +699,10 @@ pub const Segment = struct {
     }
 
     fn mayContain(self: *const Segment, key: []const u8) bool {
+        // 未解析时 `bits_len` 还是 0，会误以为「没有 Bloom、一律放行」——
+        // 结果不丢数据但会静默退化成「每段全扫」。所有入口都已 `ensureParsed`，
+        // 这里用断言守住，防将来新增入口时漏调。
+        std.debug.assert(self.parsed);
         if (self.bits_len == 0) return true;
         const bits = self.idx[self.bits_off..];
         const hp = hashPair(key);
@@ -711,6 +715,9 @@ pub const Segment = struct {
     }
 
     fn candidateIndex(self: *const Segment, key: []const u8) usize {
+        // 未解析时 `entries` 只有头部装的那 1 条，二分会在 1 条里找 → **结果错**。
+        // 这是懒解析最危险的一处静默错误，用断言守住。
+        std.debug.assert(self.parsed);
         var lo: usize = 0;
         var hi: usize = self.entries.items.len;
         while (lo < hi) {
