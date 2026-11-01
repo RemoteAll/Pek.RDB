@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
 // 个人使用免费；商业使用需商业授权，或同样以 AGPL-3.0 开源（见 LICENSE）。
 const std = @import("std");
 const Skiplist = @import("skiplist.zig").Skiplist;
@@ -166,6 +166,9 @@ pub const Table = struct {
     /// 扫描/归并**实际产出**的行数（累计）。
     /// 确定性指标：用来证明「LIMIT 提前终止」真的没白读，而不是靠计时猜。
     scan_rows_read: u64 = 0,
+    /// 最近一次 `MergeIter.init` **实际建了几个游标**（段裁剪是否生效的可观测证据）。
+    /// 「不裁剪只是慢、结果一样」，只看结果永远看不出裁剪有没有生效 —— 必须有这个计数。
+    merge_cursors_built: usize = 0,
 
     pub fn open(
         io: std.Io,
@@ -666,6 +669,9 @@ pub const MergeIter = struct {
                 }
             }
         }
+        // 诊断：本次归并实际建了几个游标。段裁剪有没有生效必须**能观测**，
+        // 否则「结果对」不代表「真的剪了整段」（不剪只是慢，结果一样）。
+        table.merge_cursors_built = self.cursors.items.len;
     }
 
     /// 堆内比较必须用 `refLess`（它含「同 key 时 seq 大的在前」），
@@ -1319,3 +1325,125 @@ test "table scanRefs merges multiple segments" {
 }
 
 
+
+test "MergeIter 堆化：多段 key 交错时顺序正确，且部分游标先耗尽不影响结果" {
+    // 堆化（O(log k) 替代每行线性扫全部游标）是纯新增逻辑，靠 compaction/scan 的
+    // 间接用例覆盖不够 —— 这里直接构造「key 交错 + 各段长度不等」的最刁钻形态：
+    //   seg0: 00 03 06        （3 条，最早耗尽）
+    //   seg1: 01 04 07 09     （4 条）
+    //   seg2: 02 05 08        （3 条）
+    // 正确输出必须是 00..09 严格升序、不重不漏。
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-heap-order";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+
+    const pat = [3][]const u8{
+        &.{ 0, 3, 6 },
+        &.{ 1, 4, 7, 9 },
+        &.{ 2, 5, 8 },
+    };
+    for (pat) |keys| {
+        for (keys) |k| {
+            var kb: [8]u8 = @splat(0);
+            kb[7] = k;
+            try t.put(&kb, "v");
+        }
+        try t.flush(); // 每批一段
+    }
+    try std.testing.expectEqual(@as(usize, 3), t.segs.items.len);
+
+    var refs: std.ArrayList(segmod.Segment.RefRecord) = .empty;
+    defer refs.deinit(alloc);
+    try t.scanRefs(&.{}, &.{}, &refs);
+    try std.testing.expectEqual(@as(usize, 10), refs.items.len);
+    for (refs.items, 0..) |r, i| {
+        try std.testing.expectEqual(@as(u8, @intCast(i)), r.key[7]);
+    }
+}
+
+test "MergeIter 段裁剪：查询只落在一段内时结果与全量过滤一致" {
+    // 段裁剪靠「稀疏索引第 0 条 = 段内最小 key」跳过排在查询之后的整段。
+    // 这里把 5 段写成 key 递增不重叠的形态，再对每个区间扫一遍，
+    // 断言「裁剪后的结果」与「按 key 全量过滤的期望值」逐条一致。
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-seg-prune";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+
+    // 5 段 × 10 行，key = 段号*10 + 行号，段间不重叠
+    var seg_i: u8 = 0;
+    while (seg_i < 5) : (seg_i += 1) {
+        var r: u8 = 0;
+        while (r < 10) : (r += 1) {
+            var kb: [8]u8 = @splat(0);
+            kb[7] = seg_i * 10 + r;
+            try t.put(&kb, "v");
+        }
+        try t.flush();
+    }
+    try std.testing.expectEqual(@as(usize, 5), t.segs.items.len);
+
+    // 覆盖四种形态：段内、跨段、全区间、空区间
+    const cases = [_]struct { lo: u8, hi: u8 }{
+        .{ .lo = 0, .hi = 50 },
+        .{ .lo = 13, .hi = 27 },
+        .{ .lo = 22, .hi = 23 },
+        .{ .lo = 45, .hi = 50 },
+        .{ .lo = 100, .hi = 120 },
+    };
+
+    var refs: std.ArrayList(segmod.Segment.RefRecord) = .empty;
+    defer refs.deinit(alloc);
+
+    for (cases, 0..) |c, ci| {
+        refs.clearRetainingCapacity();
+        var lo: [8]u8 = @splat(0);
+        lo[7] = c.lo;
+        var hi: [8]u8 = @splat(0);
+        hi[7] = c.hi;
+        try t.scanRefs(&lo, &hi, &refs);
+
+        // **裁剪是否真的生效**：不裁剪只是慢、结果一样，光看结果看不出来。
+        // 5 段、每段 10 行、段间 key 不重叠：第 i 段的段首 key 是 i*10，
+        // 只有「段首 key < hi」的段需要建游标 —— 即 ceil(hi/10) 段，上限 5。
+        const expect_cursors: usize = @min(@as(usize, 5), (@as(usize, c.hi) + 9) / 10);
+        if (t.merge_cursors_built != expect_cursors) {
+            std.debug.print("case {d}: 期望建 {d} 个游标，实际 {d} 个\n", .{ ci, expect_cursors, t.merge_cursors_built });
+            return error.CursorCountMismatch;
+        }
+
+        const want: usize = blk: {
+            if (c.hi <= c.lo) break :blk 0;
+            if (c.lo >= 50) break :blk 0; // 落在全部数据之后
+            break :blk @min(@as(usize, c.hi), 50) - c.lo;
+        };
+        if (refs.items.len != want) {
+            std.debug.print("case {d}: 期望 {d} 行，实际 {d} 行\n", .{ ci, want, refs.items.len });
+            return error.RowCountMismatch;
+        }
+        for (refs.items, 0..) |r, i| {
+            const expect_key: u8 = c.lo + @as(u8, @intCast(i));
+            if (r.key[7] != expect_key) {
+                std.debug.print("case {d}: 第 {d} 条期望 {d}，实际 {d}\n", .{ ci, i, expect_key, r.key[7] });
+                return error.KeyMismatch;
+            }
+        }
+    }
+}

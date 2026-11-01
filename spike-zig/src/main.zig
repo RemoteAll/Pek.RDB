@@ -336,6 +336,22 @@ fn benchMain() !void {
             std.debug.print("sql_each,{d},{d:.0}\n", .{ cnt, opsPerSec(@intCast(cnt), ns) });
             std.debug.print("sql_each_readrows,{d},0\n", .{t4.scan_rows_read});
         }
+        // 低选择性 WHERE（审计 P1 的度量）：200 万行表上跑一个命中 0 行的条件。
+        // 修复前 `keep.ensureTotalCapacity(cap)` 会按全表上界预分配 200万×16B = 32MB，
+        // 白交分配与缺页的代价；修复后只给 4096 初值。这个指标专门盯住它。
+        {
+            var items_w = [_]spike.sql.SelectItem{.{ .star = {} }};
+            const sel_w = spike.sql.Select{
+                .items = &items_w,
+                .table = "bench_sql",
+                .where = .{ .column = "v", .op = .eq, .value = .{ .text = "nonexistent-value" } },
+            };
+            const t0 = nowNs(io);
+            var rows_w = try spike.exec.selectRows(&t4, &s, sel_w, alloc);
+            const ns = nowNs(io) - t0;
+            defer rows_w.deinit();
+            std.debug.print("sql_where_rare,{d},{d:.0}\n", .{ rows_w.rows.len, opsPerSec(@intCast(t4.scan_rows_read), ns) });
+        }
         // 物化成本拆解：把 selectRows 的四个阶段分别计时，**不猜**。
         // 只有知道 61ms 花在哪一段，才知道该优化什么（§16.1.11 的起点）。
         // 本段会重新分配约 136MB，放在 t4 生命周期最后。

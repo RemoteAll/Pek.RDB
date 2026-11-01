@@ -406,7 +406,10 @@ pub fn selectRows(
             const widx = s.indexOf(w.column) orelse return error.ColumnNotFound;
             const scratch = try alloc.alloc(sql.Value, s.columns.len);
             defer alloc.free(scratch);
-            try keep.ensureTotalCapacity(alloc, cap);
+            // **不要按全表上界预分配**：WHERE 的选择性事先完全未知，而 `cap` 是全表行数
+            // 上界 —— 200 万行的表跑一个只命中几行的条件会白占 32MB（审计 P1）。
+            // 命中多时 ArrayList 会按 2× 自然增长，那点拷贝远小于白占的内存。
+            try keep.ensureTotalCapacity(alloc, @min(cap, 4096));
             var it = tablemod.MergeIter{};
             try it.init(t, &.{}, &hi);
             defer it.deinit();
@@ -416,8 +419,9 @@ pub fn selectRows(
             }
             src = keep.items;
         } else {
-            // 无 WHERE：只收 value，不收 key。
-            try all_vals.ensureTotalCapacity(alloc, cap);
+            // 无 WHERE：cap 接近实际行数，预分配能避免重分配；
+            // 但段合并过（大量覆盖/墓碑）时 cap 可能远大于实际，所以封顶 100 万条（16MB）。
+            try all_vals.ensureTotalCapacity(alloc, @min(cap, 1 << 20));
             try t.scanValues(&[_]u8{}, &hi, &all_vals);
             src = all_vals.items;
         }
