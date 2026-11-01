@@ -1133,6 +1133,11 @@ fn benchMain() !void {
                 if (cnt >= 500_000) break;
             }
             std.debug.print("cm_count_before,{d},{d:.0}\n", .{ cnt, opsPerSec(cnt, nowNs(io) - t0) });
+            // 确定性观测：25 段到底建了几个游标、比了多少次。
+            // 25 路归并每行约 log2(25)≈4.6 次比较 + 每行一次 `cur[bi] = cursor.next()`，
+            // 而单段路径是内联紧循环 —— 这才是 cm_count_before 比 cm_count_after 慢的来源。
+            std.debug.print("cm_cursors_before,1,{d}\n", .{kt.merge_cursors_built});
+            std.debug.print("cm_compares_before,{d},{d}\n", .{ cnt, itc.compares });
         }
 
         // 合并前点查
@@ -1174,6 +1179,11 @@ fn benchMain() !void {
                 if (cnt >= 500_000) break;
             }
             std.debug.print("cm_count_after,{d},{d:.0}\n", .{ cnt, opsPerSec(cnt, nowNs(io) - t0) });
+            // 与 cm_cursors_before / cm_compares_before 配对：段数从 25 降到 1 后，
+            // 游标数应为 1、比较次数应为 0（单游标快路径根本不比较）——
+            // 两个指标一起才能证明「归并代价的来源确实是 k 路选择」。
+            std.debug.print("cm_cursors_after,1,{d}\n", .{kt.merge_cursors_built});
+            std.debug.print("cm_compares_after,{d},{d}\n", .{ cnt, itc2.compares });
         }
 
         // 合并后点查
