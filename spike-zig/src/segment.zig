@@ -5,7 +5,7 @@ const codec = @import("codec.zig");
 
 pub const INDEX_STRIDE: usize = 64;
 const FLUSH_BYTES: usize = 1 << 20;
-const IDX_MAGIC = "PEKZIX03";
+const IDX_MAGIC = "PEKZIX04";
 
 /// `push` 的升序不变量检查用（只在 Debug/ReleaseSafe 生效）。
 fn keyCmpLessEq(a: []const u8, b: []const u8) bool {
@@ -227,10 +227,14 @@ pub const Writer = struct {
         }
 
         self.scratch.clearRetainingCapacity();
-        try codec.putU32le(&self.scratch, self.alloc, @intCast(key.len));
-        try codec.putU32le(&self.scratch, self.alloc, @intCast(value.len));
-        try codec.putU64le(&self.scratch, self.alloc, seq);
-        try self.scratch.append(self.alloc, flags);
+        // 行头：7 字节定长 + 哨兵逃逸（§16.1.26）。旧的 `klen4+vlen4+seq8+flags1 = 17 B`
+        // 每行白扔 10 B —— 换算成磁盘就是「比 SQLite 多占 41%」里的大头。
+        // 编解码只有 `codec.writeRecHdr` / `codec.readRec` 这一对，两边必须同改。
+        {
+            var hdr: [7 + 30]u8 = undefined;
+            const hn = codec.writeRecHdr(&hdr, key.len, value.len, seq, flags);
+            try self.scratch.appendSlice(self.alloc, hdr[0..hn]);
+        }
         try self.scratch.appendSlice(self.alloc, key);
         try self.scratch.appendSlice(self.alloc, value);
         try self.buf.appendSlice(self.alloc, self.scratch.items);
@@ -332,7 +336,7 @@ pub const Finished = struct {
 // 格式：ARCHIVE_MAGIC(8) 之后为连续 record：{ u32 len, u32 crc32Fast(payload), payload[len] }；
 // payload 就是单段 `.idx` 的完整内容（自带 magic 与尾部 CRC，读取时仍逐段校验、能定位损坏段）。
 // 只追加不改写，所以 flush 的代价仍是一段索引的大小。
-pub const ARCHIVE_MAGIC = "PEKZAG04";
+pub const ARCHIVE_MAGIC = "PEKZAG05";
 
 /// 校验归档文件头。空文件（新建库）视为合法。
 pub fn archiveCheckMagic(bytes: []const u8) !void {
@@ -796,25 +800,16 @@ pub const Segment = struct {
         const data = view[@intCast(begin)..@intCast(end)];
 
         var pos: usize = 0;
-        while (pos + 17 <= data.len) {
-            const klen = std.mem.readInt(u32, data[pos..][0..4], .little);
-            const vlen = std.mem.readInt(u32, data[pos + 4 ..][0..4], .little);
-            const seq = std.mem.readInt(u64, data[pos + 8 ..][0..8], .little);
-            const flags = data[pos + 16];
-            const total = 17 + @as(usize, klen) + @as(usize, vlen);
-            if (pos + total > data.len) break;
-            const k = data[pos + 17 ..][0..@as(usize, klen)];
-            const v = data[pos + 17 + @as(usize, klen) ..][0..@as(usize, vlen)];
-            pos += total;
-
-            switch (keyCmp(k, key)) {
+        while (codec.readRec(data, pos)) |rec| {
+            pos = rec.next;
+            switch (keyCmp(rec.key, key)) {
                 .lt => continue,
                 .gt => return null,
                 .eq => {
-                    if (seq <= snapshot) {
+                    if (rec.seq <= snapshot) {
                         out.clearRetainingCapacity();
-                        try out.appendSlice(self.alloc, v);
-                        return flags;
+                        try out.appendSlice(self.alloc, rec.value);
+                        return rec.flags;
                     }
                 },
             }
@@ -840,31 +835,22 @@ pub const Segment = struct {
         var have_cur = false;
         var decided = false;
 
-        while (pos + 17 <= data.len) {
-            const klen: usize = @intCast(std.mem.readInt(u32, data[pos..][0..4], .little));
-            const vlen: usize = @intCast(std.mem.readInt(u32, data[pos + 4 ..][0..4], .little));
-            const seq = std.mem.readInt(u64, data[pos + 8 ..][0..8], .little);
-            const flags = data[pos + 16];
-            const total = 17 + klen + vlen;
-            if (pos + total > data.len) break;
-            const k = data[pos + 17 ..][0..klen];
-            const v = data[pos + 17 + klen ..][0..vlen];
-            pos += total;
-
-            switch (keyCmp(k, end)) {
+        while (codec.readRec(data, pos)) |rec| {
+            pos = rec.next;
+            switch (keyCmp(rec.key, end)) {
                 .gt, .eq => return,
                 .lt => {},
             }
-            if (keyCmp(k, start) == .lt) continue;
-            if (!have_cur or !std.mem.eql(u8, k, cur_key)) {
-                cur_key = k;
+            if (keyCmp(rec.key, start) == .lt) continue;
+            if (!have_cur or !std.mem.eql(u8, rec.key, cur_key)) {
+                cur_key = rec.key;
                 have_cur = true;
                 decided = false;
             }
             if (decided) continue;
-            if (seq <= snapshot) {
+            if (rec.seq <= snapshot) {
                 decided = true;
-                if (flags == 0) try out.append(self.alloc, .{ .key = k, .seq = seq, .flags = flags, .value = v });
+                if (rec.flags == 0) try out.append(self.alloc, .{ .key = rec.key, .seq = rec.seq, .flags = rec.flags, .value = rec.value });
             }
         }
     }
@@ -896,28 +882,19 @@ pub const Segment = struct {
         var pos: usize = begin;
         const data = try self.dataView();
 
-        while (pos + 17 <= data.len) {
-            const klen: usize = @intCast(std.mem.readInt(u32, data[pos..][0..4], .little));
-            const vlen: usize = @intCast(std.mem.readInt(u32, data[pos + 4 ..][0..4], .little));
-            const seq = std.mem.readInt(u64, data[pos + 8 ..][0..8], .little);
-            const flags = data[pos + 16];
-            const total = 17 + klen + vlen;
-            if (pos + total > data.len) break;
-            const k = data[pos + 17 ..][0..klen];
-            const v = data[pos + 17 + klen ..][0..vlen];
-            pos += total;
-
-            switch (keyCmp(k, end)) {
+        while (codec.readRec(data, pos)) |rec| {
+            pos = rec.next;
+            switch (keyCmp(rec.key, end)) {
                 .gt, .eq => return,
                 .lt => {},
             }
-            if (keyCmp(k, start) == .lt) continue;
-            if (seq > snapshot) continue;
+            if (keyCmp(rec.key, start) == .lt) continue;
+            if (rec.seq > snapshot) continue;
             try out.append(self.alloc, .{
-                .key = try self.alloc.dupe(u8, k),
-                .seq = seq,
-                .flags = flags,
-                .value = try self.alloc.dupe(u8, v),
+                .key = try self.alloc.dupe(u8, rec.key),
+                .seq = rec.seq,
+                .flags = rec.flags,
+                .value = try self.alloc.dupe(u8, rec.value),
             });
         }
     }
@@ -935,30 +912,22 @@ pub const RefCursor = struct {
 
     pub fn next(self: *RefCursor) ?Segment.RefRecord {
         const data = self.seg.data;
-        while (self.pos + 17 <= data.len) {
-            const klen: usize = @intCast(std.mem.readInt(u32, data[self.pos..][0..4], .little));
-            const vlen: usize = @intCast(std.mem.readInt(u32, data[self.pos + 4 ..][0..4], .little));
-            const seq = std.mem.readInt(u64, data[self.pos + 8 ..][0..8], .little);
-            const flags = data[self.pos + 16];
-            const total = 17 + klen + vlen;
-            if (self.pos + total > data.len) return null;
-            const k = data[self.pos + 17 ..][0..klen];
-            const v = data[self.pos + 17 + klen ..][0..vlen];
-            self.pos += total;
+        while (codec.readRec(data, self.pos)) |rec| {
+            self.pos = rec.next;
 
             // 空 end = 无上界（compaction 全量归并时用）
             if (self.end.len > 0) {
-                switch (keyCmp(k, self.end)) {
+                switch (keyCmp(rec.key, self.end)) {
                     .gt, .eq => return null,
                     .lt => {},
                 }
             }
             if (!self.passed_start) {
-                if (keyCmp(k, self.start) == .lt) continue;
+                if (keyCmp(rec.key, self.start) == .lt) continue;
                 self.passed_start = true;
             }
-            if (seq > self.snapshot) continue;
-            return .{ .key = k, .seq = seq, .flags = flags, .value = v };
+            if (rec.seq > self.snapshot) continue;
+            return .{ .key = rec.key, .seq = rec.seq, .flags = rec.flags, .value = rec.value };
         }
         return null;
     }

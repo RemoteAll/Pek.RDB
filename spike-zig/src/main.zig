@@ -26,6 +26,30 @@ fn keyOf(v: i64) [8]u8 {
     return b;
 }
 
+/// **只给基准用**：旧版定长行头（`klen4+vlen4+seq8+flags1 = 17 B`）的解析。
+///
+/// 存在的唯一目的是和 `codec.readRec`（varint 头，6 B）做**同进程、背靠背**的配对对比 ——
+/// 跨批次比扫描吞吐在这台机器上一点都不可信（批内波动 20–40%）。
+/// 生产代码里不再有这条路径，别拿它当参考实现。
+///
+/// 返回值形状与 `codec.readRec` 一致（key/value 都借用 `buf`），保证两边做的工作相同。
+fn readRecLegacy(buf: []const u8, pos: usize) ?codec.RecView {
+    if (pos + 17 > buf.len) return null;
+    const klen: usize = @intCast(std.mem.readInt(u32, buf[pos..][0..4], .little));
+    const vlen: usize = @intCast(std.mem.readInt(u32, buf[pos + 4 ..][0..4], .little));
+    const total = 17 + klen + vlen;
+    if (pos + total > buf.len) return null;
+    const flags = buf[pos + 16];
+    const seq = std.mem.readInt(u64, buf[pos + 8 ..][0..8], .little);
+    return .{
+        .key = buf[pos + 17 ..][0..klen],
+        .value = buf[pos + 17 + klen ..][0..vlen],
+        .seq = seq,
+        .flags = flags,
+        .next = pos + total,
+    };
+}
+
 pub fn main() void {
     benchMain() catch |e| {
         std.debug.print("bench_failed,{s},1\n", .{@errorName(e)});
@@ -1349,6 +1373,90 @@ fn benchMain() !void {
     // 自动 compaction 的基准已移到独立入口：zig build run-bench-ac（src/bench_ac.zig）。
     // 放在整套 bench 末尾时，前面 big_* 留下的脏页与页缓存让同配置波动达 84%~435%，
     // 中位数不可信；独立进程从干净状态起跑才测得准。
+
+    // **行头格式：旧定长(17B) vs 新定长(7B+逃逸) 的解码成本**（§16.1.26）。
+    //
+    // 纯内存、不碰磁盘；两种格式各建一份同样的内容，**同进程交替**跑、奇偶轮换顺序。
+    // 跨批次比扫描吞吐在这台机器上不可信（批内波动 20–40%），配对才是唯一能用的口径。
+    //
+    // **缓冲区必须小到能待在 L3 里**：第一版用 100 万条 × 57B = 57MB，一趟跑完是
+    // 13 GB/s —— 那是在测内存带宽，不是测解码，两种格式的差异被淹没。
+    // 200k 条（11.4MB / 9.2MB）放进 32MB L3，再重复 20 趟，测到的才是解码本身。
+    {
+        const RN: usize = 200_000;
+        const REP: usize = 20;
+        var old_buf: std.ArrayList(u8) = .empty;
+        defer old_buf.deinit(alloc);
+        var new_buf: std.ArrayList(u8) = .empty;
+        defer new_buf.deinit(alloc);
+        try old_buf.ensureTotalCapacity(alloc, RN * 57);
+        try new_buf.ensureTotalCapacity(alloc, RN * 48);
+
+        {
+            var i: usize = 0;
+            while (i < RN) : (i += 1) {
+                const kb = keyOf(@intCast(i));
+                const seq: u64 = i + 1;
+                // 旧格式
+                try codec.putU32le(&old_buf, alloc, kb.len);
+                try codec.putU32le(&old_buf, alloc, value.len);
+                try codec.putU64le(&old_buf, alloc, seq);
+                try old_buf.append(alloc, 0);
+                try old_buf.appendSlice(alloc, &kb);
+                try old_buf.appendSlice(alloc, &value);
+                // 新格式
+                var hdr: [7 + 30]u8 = undefined;
+                const hn = codec.writeRecHdr(&hdr, kb.len, value.len, seq, 0);
+                try new_buf.appendSlice(alloc, hdr[0..hn]);
+                try new_buf.appendSlice(alloc, &kb);
+                try new_buf.appendSlice(alloc, &value);
+            }
+        }
+        // 对拍：两边解出来的内容必须完全一致（否则下面的计时毫无意义）
+        {
+            var po: usize = 0;
+            var pn: usize = 0;
+            while (true) {
+                const a = readRecLegacy(old_buf.items, po);
+                const b = codec.readRec(new_buf.items, pn);
+                if (a == null or b == null) {
+                    if (a != null or b != null) return error.RecFmtMismatch;
+                    break;
+                }
+                if (!std.mem.eql(u8, a.?.key, b.?.key) or !std.mem.eql(u8, a.?.value, b.?.value) or
+                    a.?.seq != b.?.seq or a.?.flags != b.?.flags) return error.RecFmtMismatch;
+                po = a.?.next;
+                pn = b.?.next;
+            }
+        }
+
+        var round: usize = 0;
+        while (round < 5) : (round += 1) {
+            const order: [2]bool = if (round % 2 == 0) .{ true, false } else .{ false, true };
+            for (order) |use_old| {
+                const buf = if (use_old) old_buf.items else new_buf.items;
+                const t0 = nowNs(io);
+                var acc: u64 = 0;
+                var total: u64 = 0;
+                var rep: usize = 0;
+                while (rep < REP) : (rep += 1) {
+                    var pos: usize = 0;
+                    while (true) {
+                        const rec = if (use_old) readRecLegacy(buf, pos) else codec.readRec(buf, pos);
+                        const r = rec orelse break;
+                        acc +%= r.seq +% r.key.len +% r.value.len +% r.key[0] +% r.flags;
+                        pos = r.next;
+                        total += 1;
+                    }
+                }
+                const ns = nowNs(io) - t0;
+                const tag = if (use_old) "old17" else "hdr7";
+                std.debug.print("recdec_{s},{d},{d:.0}\n", .{ tag, total, opsPerSec(total, ns) });
+                if (acc == 0xDEADBEEF) std.debug.print("recdec_guard,1,0\n", .{});
+            }
+        }
+        std.debug.print("recdec_bytes,{d},{d}\n", .{ old_buf.items.len, new_buf.items.len });
+    }
 
     std.debug.print("bench_done,1,1\n", .{});
     out.deinit(alloc);
