@@ -1274,6 +1274,77 @@ fn benchMain() !void {
         }
     }
 
+    // DELETE：100 万行已落段的表上，按主键删 10 万行。
+    //
+    // 口径（与 SQLite `del_100k` 完全一致，逐条对齐）：
+    // - 同一个 xorshift64 随机序列（种子 88172645463325252）、同样取 `x % n`；
+    // - **一次提交**：我方循环里只 append 到 WAL，循环结束后统一 flush + sync；
+    //   SQLite 侧是 BEGIN … COMMIT；
+    // - 同时报 **每行写入 WAL 的字节数**（`del_wal_bytes`）——
+    //   删除的写放大和插入不同（我方删除记录只带 key，SQLite 仍按页写），
+    //   不报字节量就又变成第七十九节那个坑。
+    // - 正确性用两条确定性计数守住：删完点查必须 0 命中，剩余行数必须 = n - get_n。
+    {
+        const path_del = "bench-data-del";
+        dir.deleteTree(io, path_del) catch {};
+        defer dir.deleteTree(io, path_del) catch {};
+
+        var td = try tablemod.Table.open(io, dir, path_del, alloc, .{ .wal_sync_every = 0, .flush_bytes = 1 << 30 });
+        defer td.deinit();
+
+        var di: u64 = 0;
+        while (di < n) : (di += 1) {
+            const kb = keyOf(@intCast(di));
+            try td.put(&kb, &value);
+        }
+        // 先全部落段，让删除阶段只反映删除本身
+        try td.flush();
+
+        const wal_before = td.wal.total_written;
+        {
+            const t0 = nowNs(io);
+            var x: u64 = 88172645463325252;
+            di = 0;
+            while (di < get_n) : (di += 1) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                const kb = keyOf(@intCast(x % n));
+                try td.delete(&kb);
+            }
+            // 一次提交：落段 + 清 WAL + fsync
+            try td.flush();
+            const ns = nowNs(io) - t0;
+            std.debug.print("del_100k,{d},{d:.0}\n", .{ get_n, opsPerSec(get_n, ns) });
+        }
+        std.debug.print("del_wal_bytes,{d},{d}\n", .{ get_n, td.wal.total_written - wal_before });
+
+        // 正确性：被删的 key 必须全部查不到
+        {
+            var x: u64 = 88172645463325252;
+            var hits: u64 = 0;
+            di = 0;
+            while (di < get_n) : (di += 1) {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                const kb = keyOf(@intCast(x % n));
+                if (try td.get(&kb, &out) != null) hits += 1;
+            }
+            std.debug.print("del_deleted_hits,{d},{d}\n", .{ get_n, hits });
+        }
+        // 正确性：剩余行数必须正好是 n - get_n（扫描全表数一遍）
+        {
+            var hi_d: [16]u8 = @splat(0xFF);
+            var it_d = tablemod.MergeIter{};
+            try it_d.init(&td, &.{}, &hi_d);
+            defer it_d.deinit();
+            var c: u64 = 0;
+            while (it_d.next()) |_| c += 1;
+            std.debug.print("del_remaining,{d},{d}\n", .{ n, c });
+        }
+    }
+
     // 段数曲线：**同一份数据**（200 万行）、不同 flush_bytes → 不同段数，
     // 量出「段数 → 点查 / 扫描 / 冷重开」的代价。这是 compaction 触发策略的依据（先量再做）。
     {

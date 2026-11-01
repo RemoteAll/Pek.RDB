@@ -64,6 +64,8 @@ $pairs = @(
     @('big_count', 'big_count', $true),
     @('big_count_range', 'big_count_range', $true),
     @('upd_random', 'upd_random_txn', $true),
+    # DELETE：两边都是「一次提交删 10 万行」，同事务粒度；字节量另行报（del_wal_bytes）。
+    @('del_100k', 'del_100k', $true),
     @('upd_get', 'upd_get', $true),
     @('recover', 'recover', $false),
     @('big_recover', 'big_recover', $false)

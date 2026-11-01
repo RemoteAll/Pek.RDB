@@ -78,14 +78,16 @@ function Samples([string]$side, [string]$metric) {
 
 # name(latin), zig metric, sqlite metric, unit, higher-is-better
 # FULL list used for the headline count (must match tools\abba-verdict.ps1).
+#
+# 故意**不**把 `put` / `sql_put` / `del_100k` 放进来：这三项都是跨口径（字节量差
+# 67× / 67× / 14×），按「口径一样」四条不得计入「全胜」数，否则页顶数字就与
+# 表内条目对不上、也违背了第七十九/八十节的结论。
 $defs = @(
-    @('put', 'put', 'put', '/s', $true),
     @('put_batch', 'put_batch', 'put_txn', '/s', $true),
     @('get', 'get', 'get', '/s', $true),
     @('scan', 'scan', 'scan_v', '/s', $true),
     @('count_10k', 'count_10k', 'scan_big', '/s', $true),
     @('scan_refs', 'scan_refs', 'scan_big_collect', '/s', $true),
-    @('sql_put', 'sql_put', 'put', '/s', $true),
     @('sql_each', 'sql_each', 'sql_full_touch', '/s', $true),
     @('sql_limit10', 'sql_limit10', 'sql_limit10', '/s', $true),
     # SQL 点查：两边走 SQL 接口 + 同一 xorshift64 主键序列（不是存储 API 的 get）。
@@ -114,7 +116,7 @@ $defs = @(
 # the cross-criteria claim the user rejected.
 $show = @('upd_get', 'upd_random', 'get', 'big_get', 'sql_limit10', 'sql_each', 'sql_get',
           'big_put', 'conc4', 'conc2', 'conc1', 'put_batch', 'count_10k',
-          'big_count', 'big_count_range', 'scan', 'scan_refs',
+          'big_count', 'big_count_range', 'scan', 'scan_refs', 'sql_full',
           'recover', 'big_recover')
 
 # Chinese labels live in the UTF-8 HTML template (this file must stay ASCII).
@@ -188,6 +190,10 @@ if ($bprRow) { $bprRow = [math]::Round($bprRow / 1000000.0, 1) }
 if ($bprBatch) { $bprBatch = [math]::Round($bprBatch / 1000000.0, 1) }
 $bprRowS = Read-WalBytes $HS 'wal_bytes_per_row'
 $bprBatchS = Read-WalBytes $HS 'wal_bytes_per_row_txn'
+$bprDelS = Read-WalBytes $HS 'wal_bytes_per_row_del'
+# 我方删除每行字节量：p17 批的 del_wal_bytes / 删除行数
+$delZRaw = Read-Metric (Join-Path $DataDir "zig-$Date-$Tag-run1-a.csv") 'del_wal_bytes'
+$bprDelZ = if ($delZRaw) { [math]::Round($delZRaw / 100000.0, 1) } else { $null }
 
 # Batch-vs-batch paired ratio (same transaction scope AND same bytes/row).
 # Rounds where the bare-write probe collapsed are A(env) and are excluded -- but
@@ -225,6 +231,8 @@ $payload = [pscustomobject]@{
     bprRowS    = $bprRowS
     bprBatch   = $bprBatch
     bprBatchS  = $bprBatchS
+    bprDelZ    = $bprDelZ
+    bprDelS    = $bprDelS
     batchRatio = $batchRatio
     rows       = @($rows | Sort-Object -Property ratio -Descending)
     reopen = [pscustomobject]@{ z = [math]::Round($zr, 2); s = [math]::Round($sr, 2) }

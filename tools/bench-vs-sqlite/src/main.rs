@@ -448,6 +448,52 @@ fn main() -> rusqlite::Result<()> {
         println!("upd_get,{},{}", GET_N, GET_N as f64 / secs);
         println!("upd_get_hits,{},{}", GET_N, hits);
 
+        // DELETE：100 万行表上按主键删 10 万行，一次提交。
+        //
+        // 口径与 Zig 侧 `del_100k` 逐条对齐：同一个 xorshift64 序列（种子 88172645463325252）、
+        // 同样取 `x % N`、同样「循环内只记账、末尾一次提交」。
+        // 注意 id 可能重复（随机序列会撞），两边都一样，所以剩余行数要实测而不是算。
+        {
+            let t0 = Instant::now();
+            c3.execute_batch("BEGIN")?;
+            {
+                let mut stmt = c3.prepare("DELETE FROM t WHERE id = ?1")?;
+                let mut x: u64 = 88_172_645_463_325_252;
+                for _ in 0..GET_N {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let id = (x % N as u64) as i64;
+                    stmt.execute([id])?;
+                }
+            }
+            c3.execute_batch("COMMIT")?;
+            let secs = t0.elapsed().as_secs_f64();
+            println!("del_100k,{},{}", GET_N, GET_N as f64 / secs);
+        }
+        // 正确性 1：被删的 key 必须查不到
+        {
+            let mut hits: i64 = 0;
+            let mut stmt = c3.prepare("SELECT 1 FROM t WHERE id = ?1")?;
+            let mut x: u64 = 88_172_645_463_325_252;
+            for _ in 0..GET_N {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let id = (x % N as u64) as i64;
+                let mut rows = stmt.query([id])?;
+                if rows.next()?.is_some() {
+                    hits += 1;
+                }
+            }
+            println!("del_deleted_hits,{},{}", GET_N, hits);
+        }
+        // 正确性 2：剩余行数（实测，不用 n - get_n 推算 —— 随机序列有重复值）
+        {
+            let cnt: i64 = c3.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))?;
+            println!("del_remaining,{},{}", N, cnt);
+        }
+
         // 分页查询（与 Zig 侧 sql_limit10 / sql_full 同口径，同一张 100 万行表）
         {
             let t0 = Instant::now();

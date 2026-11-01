@@ -18,6 +18,9 @@ use rusqlite::{params, Connection};
 const N_BYTES: i64 = 20_000;
 /// 测吞吐用的行数
 const N_SPEED: i64 = 200_000;
+/// 测删除写放大：表里先装 N_DEL_TABLE 行，再一次事务删 N_DEL 行
+const N_DEL_TABLE: i64 = 200_000;
+const N_DEL: i64 = 20_000;
 
 const VALUE: [u8; 32] = [b'x'; 32];
 
@@ -115,6 +118,45 @@ fn bytes_per_row_txn(page_size: u32) -> rusqlite::Result<f64> {
     Ok(bytes as f64 / N_BYTES as f64)
 }
 
+/// 一次事务里删除 N_DEL 行，每行写入 WAL 的字节数（对照 Zig 侧 `del_wal_bytes`）。
+///
+/// 删除的写放大和插入不同：我方删除记录只带 key，SQLite 仍是整页写。
+fn bytes_per_row_del(page_size: u32) -> rusqlite::Result<f64> {
+    let (conn, path) = open(page_size, true, "del")?;
+    // 先把表装满（一次提交，避免把插入的写放大混进来）
+    {
+        conn.execute_batch("BEGIN")?;
+        {
+            let mut stmt = conn.prepare("INSERT INTO t(id, v) VALUES (?1, ?2)")?;
+            for i in 0..N_DEL_TABLE {
+                stmt.execute(params![i, &VALUE[..]])?;
+            }
+        }
+        conn.execute_batch("COMMIT")?;
+    }
+    let before = wal_len(&path);
+    {
+        conn.execute_batch("BEGIN")?;
+        {
+            let mut stmt = conn.prepare("DELETE FROM t WHERE id = ?1")?;
+            let mut x: u64 = 88_172_645_463_325_252;
+            for _ in 0..N_DEL {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let id = (x % N_DEL_TABLE as u64) as i64;
+                stmt.execute([id])?;
+            }
+        }
+        conn.execute_batch("COMMIT")?;
+    }
+    let after = wal_len(&path);
+    let bytes = after.saturating_sub(before);
+    drop(conn);
+    cleanup(&path);
+    Ok(bytes as f64 / N_DEL as f64)
+}
+
 fn main() -> rusqlite::Result<()> {
     println!("metric,page_size,tag,count,value");
     for ps in [4096u32, 512] {
@@ -125,6 +167,8 @@ fn main() -> rusqlite::Result<()> {
         println!("rows_per_sec,{ps},speed,{N_SPEED},{rps:.0}");
         let txn = bytes_per_row_txn(ps)?;
         println!("wal_bytes_per_row_txn,{ps},txn,{N_BYTES},{txn:.2}");
+        let del = bytes_per_row_del(ps)?;
+        println!("wal_bytes_per_row_del,{ps},del,{N_DEL},{del:.2}");
     }
     Ok(())
 }

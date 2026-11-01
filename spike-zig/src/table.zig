@@ -1,6 +1,7 @@
 ﻿// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
 // 个人使用免费；商业使用需商业授权，或同样以 AGPL-3.0 开源（见 LICENSE）。
 const std = @import("std");
+const builtin = @import("builtin");
 const Skiplist = @import("skiplist.zig").Skiplist;
 const walmod = @import("wal.zig");
 const segmod = @import("segment.zig");
@@ -197,6 +198,17 @@ pub const Table = struct {
     io: std.Io,
     dir: std.Io.Dir,
     alloc: std.mem.Allocator,
+    /// **创建这张表的线程 id**。`Table` 没有任何锁（`seq += 1`、`mem.insert`、
+    /// `wal.append` 全是裸操作），因此**只能由创建它的那个线程使用**。
+    ///
+    /// 为什么要有这个字段：多线程误用会造成**静默数据竞争**（两个线程拿到同一个 seq、
+    /// skiplist 被并发修改）——这类问题事后极难定位，且看起来完全像“数据自己错乱”了。
+    /// 在 Debug/ReleaseSafe 下用 `checkThread()` 把它变成立刻 panic（ReleaseFast 下断言被
+    /// 编译器消除，基准零成本）。
+    ///
+    /// 需要并发写怎么办：每个线程各开一张表（基准里的 `concWriter` 就是这么做的），
+    /// 或者由上层加锁。**不要**在多个线程间共享同一个 `Table`。
+    owner: std.Thread.Id,
     base_path: []u8,
     wal_path: []u8,
     /// 索引聚合文件路径（`seg/index.bin`）
@@ -386,6 +398,7 @@ pub const Table = struct {
             .io = io,
             .dir = dir,
             .alloc = alloc,
+            .owner = std.Thread.getCurrentId(),
             .base_path = base_path,
             .wal_path = wal_path,
             .index_path = index_path,
@@ -403,6 +416,7 @@ pub const Table = struct {
     }
 
     pub fn deinit(self: *Table) void {
+        self.checkThread();
         for (self.segs.items) |*s| s.close();
         self.segs.deinit(self.alloc);
         if (self.idx_map) |*m| m.destroy();
@@ -467,7 +481,22 @@ pub const Table = struct {
         return @intCast(ts.nanoseconds);
     }
 
+    /// 单线程不变量：`Table` 没有锁，只能由创建它的线程使用（见 `owner` 字段）。
+    ///
+    /// Debug/ReleaseSafe 下误用会直接 panic；ReleaseFast 下整段被编译器消除（零成本）。
+    /// 这是有意为之：并发写同一张表会 **静默** 抢同一个 seq、并发改 skiplist，
+    /// 事后表现得像「数据自己错乱了」，极难定位 —— 宁可开发期直接炸。
+    inline fn checkThread(self: *const Table) void {
+        // `std.debug.runtime_safety`：Debug / ReleaseSafe 为 true，ReleaseFast / ReleaseSmall 为 false。
+        // 用它而不是比 `builtin.mode` 的枚举名 —— 后者在 Zig 版本间改过写法（0.17 是小写下划线）。
+        if (comptime !std.debug.runtime_safety) return;
+        if (std.Thread.getCurrentId() != self.owner) {
+            @panic("Table 不是线程安全的：检测到非创建线程在操作同一张表（请每线程各开一张表）");
+        }
+    }
+
     pub fn put(self: *Table, key: []const u8, value: []const u8) !void {
+        self.checkThread();
         self.seq += 1;
         const seq = self.seq;
         _ = try self.wal.append(seq, &.{.{ .flags = 0, .key = key, .value = value }});
@@ -484,6 +513,7 @@ pub const Table = struct {
     }
 
     pub fn delete(self: *Table, key: []const u8) !void {
+        self.checkThread();
         self.seq += 1;
         const seq = self.seq;
         _ = try self.wal.append(seq, &.{.{ .flags = 1, .key = key, .value = "" }});
@@ -493,6 +523,7 @@ pub const Table = struct {
 
     /// 批量写：一批一个 WAL 提交（对应 SQLite 的单事务批量插入）。
     pub fn putBatch(self: *Table, keys: []const []const u8, values: []const []const u8) !void {
+        self.checkThread();
         std.debug.assert(keys.len == values.len);
         self.seq += 1;
         const seq = self.seq;
@@ -511,6 +542,7 @@ pub const Table = struct {
     }
 
     pub fn get(self: *Table, key: []const u8, out: *std.ArrayList(u8)) !?[]const u8 {
+        self.checkThread();
         if (self.mem.get(key, self.visible)) |e| {
             if (e.flags != 0) return null;
             out.clearRetainingCapacity();
@@ -534,6 +566,7 @@ pub const Table = struct {
     /// 于是这一次 flush 的耗时可从微秒级变成数百毫秒（200 万行约 0.4–0.7 s）。
     /// 合并失败不影响本次 flush 成功（数据已落盘），错误记在 `auto_compact_error`。
     pub fn flush(self: *Table) !void {
+        self.checkThread();
         const t_flush = self.nowNs();
         defer {
             const d = self.nowNs() - t_flush;
@@ -743,6 +776,7 @@ pub const Table = struct {
     /// - 删除旧段数据文件
     /// 内存是流式的：不为全部结果分配缓冲（200 万行时那是 100MB+）。
     pub fn compact(self: *Table) !CompactResult {
+        self.checkThread();
         if (self.segs.items.len <= 1) {
             return .{ .before = self.segs.items.len, .after = self.segs.items.len, .rows = 0, .did = false };
         }
@@ -1609,6 +1643,225 @@ test "bloom_bits 0 与 10 的读写结果必须一致" {
         try std.testing.expectEqual(@as(usize, 20), refs.items.len);
         try std.testing.expectEqualStrings("k000", refs.items[0].key);
         try std.testing.expectEqualStrings("v019", refs.items[19].value);
+    }
+}
+
+// ---------------------------------------------------------------- 墓碑（删除）的正确性
+//
+// 「删除的成本延后到 compaction」不等于「结果可以不一致」。真正会出错的是这三条，
+// 全部用用例钉住：
+//   ① 删除只在 WAL 里、还没落段就崩溃重开 → 回放出来的墓碑必须仍然生效；
+//   ② 删除后再插入同一个 key（复活）→ 新版本必须可见，墓碑不得压住它；
+//   ③ compact 丢弃墓碑之后 → 结果不变，且**空间真的被回收**（行数降到存活数）。
+
+test "墓碑：删除只在 WAL 里就重开，回放后必须仍然删除" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-tombstone-wal";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        try t.put("a", "va");
+        try t.put("b", "vb");
+        try t.delete("a");
+        // **故意不 flush**：删除只存在于 WAL 里。等价于「进程在落段前就退出」。
+        t.deinit();
+    }
+
+    var t2 = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t2.deinit();
+    try std.testing.expect((try t2.get("a", &out)) == null); // 墓碑必须仍然生效
+    try std.testing.expectEqualStrings("vb", (try t2.get("b", &out)).?);
+}
+
+test "墓碑：删除后重新插入必须复活，墓碑不得压住新版本（跨 3 段 + compact）" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-tombstone-resurrect";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        defer t.deinit();
+        // 同一个 key 依次经历：写入 → 删除 → 再写入，各自独立成段，
+        // 段之间 key 范围完全重叠 → 强制走 k 路堆归并（不是顺序拼接）。
+        try t.put("k", "v1");
+        try t.flush();
+        try t.delete("k");
+        try t.flush();
+        try t.put("k", "v2");
+        try t.flush();
+        try std.testing.expectEqual(@as(usize, 3), t.segs.items.len);
+
+        // 归并必须按 (key asc, seq desc)：最先看到的是 v2 → 可见；不能是墓碑先出。
+        try std.testing.expectEqualStrings("v2", (try t.get("k", &out)).?);
+
+        // 合并后仍然必须是 v2（墓碑与 v1 都该被淘汰）
+        const res = try t.compact();
+        try std.testing.expect(res.did);
+        try std.testing.expectEqual(@as(usize, 1), res.rows); // 只剩 1 条存活
+        try std.testing.expectEqualStrings("v2", (try t.get("k", &out)).?);
+    }
+
+    // 重开后仍然一致
+    var t2 = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t2.deinit();
+    try std.testing.expectEqualStrings("v2", (try t2.get("k", &out)).?);
+}
+
+test "墓碑：同一批既有删除又有新写，memtable / 落段 / 合并三条路径结果必须一致" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-tombstone-mixed-batch";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+
+    try t.put("a", "va1");
+    try t.put("b", "vb");
+    try t.put("c", "vc");
+
+    // 尚未落盘的一批里混着：删除 b、新写 d、更新 a
+    try t.delete("b");
+    try t.put("d", "vd");
+    try t.put("a", "va2");
+
+    // ① memtable 路径
+    try std.testing.expectEqualStrings("va2", (try t.get("a", &out)).?);
+    try std.testing.expect((try t.get("b", &out)) == null);
+    try std.testing.expectEqualStrings("vc", (try t.get("c", &out)).?);
+    try std.testing.expectEqualStrings("vd", (try t.get("d", &out)).?);
+
+    // ② 落段后（墓碑与更新各成一条记录）—— 结果必须一模一样
+    try t.flush();
+    try std.testing.expectEqualStrings("va2", (try t.get("a", &out)).?);
+    try std.testing.expect((try t.get("b", &out)) == null);
+    try std.testing.expectEqualStrings("vc", (try t.get("c", &out)).?);
+    try std.testing.expectEqualStrings("vd", (try t.get("d", &out)).?);
+
+    // ③ 再写一批（首段 b 已被删，这里写 b 的新值 = 复活），然后合并
+    try t.put("b", "vb2");
+    try t.flush();
+    _ = try t.compact();
+    try std.testing.expectEqualStrings("va2", (try t.get("a", &out)).?);
+    try std.testing.expectEqualStrings("vb2", (try t.get("b", &out)).?); // 复活
+    try std.testing.expectEqualStrings("vc", (try t.get("c", &out)).?);
+    try std.testing.expectEqualStrings("vd", (try t.get("d", &out)).?);
+}
+
+test "墓碑：compact 丢弃墓碑之后，同一 key 的新写入必须正常可见" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-tombstone-after-compact-write";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        defer t.deinit();
+        try t.put("k", "v1");
+        try t.flush();
+        try t.delete("k");
+        try t.flush();
+        // 合并后墓碑与 v1 都被丢弃 → 磁盘上根本没有 k
+        const res = try t.compact();
+        try std.testing.expectEqual(@as(usize, 0), res.rows);
+        try std.testing.expect((try t.get("k", &out)) == null);
+
+        // 紧接着再写 k：必须正常可见（不能因为「曾经删过」而失效）
+        try t.put("k", "v3");
+        try std.testing.expectEqualStrings("v3", (try t.get("k", &out)).?);
+        try t.flush();
+        try std.testing.expectEqualStrings("v3", (try t.get("k", &out)).?);
+    }
+
+    // 重开后仍然可见
+    var t2 = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t2.deinit();
+    try std.testing.expectEqualStrings("v3", (try t2.get("k", &out)).?);
+}
+
+test "墓碑：compact 丢弃墓碑后结果不变，且空间确实被回收" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-tombstone-reclaim";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+
+    // 200 行 → 删掉一半 → 分两段落盘
+    var i: u32 = 0;
+    while (i < 200) : (i += 1) {
+        var kb: [16]u8 = undefined;
+        var vb: [16]u8 = undefined;
+        try t.put(try std.fmt.bufPrint(&kb, "k{d:0>4}", .{i}), try std.fmt.bufPrint(&vb, "v{d:0>4}", .{i}));
+    }
+    try t.flush();
+    i = 0;
+    while (i < 200) : (i += 2) {
+        var kb: [16]u8 = undefined;
+        try t.delete(try std.fmt.bufPrint(&kb, "k{d:0>4}", .{i}));
+    }
+    try t.flush();
+    try std.testing.expectEqual(@as(usize, 2), t.segs.items.len);
+
+    const res = try t.compact();
+    // 关键断言：合并产出的行数 = 存活行数（100）。墓碑被丢弃，不是被当成数据留下来。
+    try std.testing.expectEqual(@as(usize, 100), res.rows);
+
+    // 数据仍然正确：偶数 key 全没了，奇数 key 都在
+    i = 0;
+    while (i < 200) : (i += 1) {
+        var kb: [16]u8 = undefined;
+        var vb: [16]u8 = undefined;
+        const got = try t.get(try std.fmt.bufPrint(&kb, "k{d:0>4}", .{i}), &out);
+        if (i % 2 == 0) {
+            try std.testing.expect(got == null);
+        } else {
+            try std.testing.expectEqualStrings(try std.fmt.bufPrint(&vb, "v{d:0>4}", .{i}), got.?);
+        }
     }
 }
 
