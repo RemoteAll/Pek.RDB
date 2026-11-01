@@ -43,6 +43,17 @@ fn bareWriteMbPerSec(io: std.Io, dir: std.Io.Dir, path: []const u8, mb: usize) f
     return @as(f64, @floatFromInt(mb)) / (@as(f64, @floatFromInt(ns)) / 1e9);
 }
 
+/// 时间轴标记：打印「距进程启动多少秒」。
+///
+/// 为什么需要：写抖动分两类，其中 A 类（裸写也崩、环境级）没法靠代码解决，
+/// 但**能不能规避**取决于它出现得规律不规律 —— 固定时刻（比如每 N 秒一次的写回周期）
+/// 可以靠调整基准节奏避开；随机时刻就只能靠多轮 + 好坏窗口分离。
+/// 没有时间轴就没法区分这两者，只能拍脑袋。
+fn benchMark(io: std.Io, t0: u64, name: []const u8) void {
+    const ns = nowNs(io) - t0;
+    std.debug.print("t_sec,{s},{d:.2}\n", .{ name, @as(f64, @floatFromInt(ns)) / 1e9 });
+}
+
 /// 流式基准的消费回调：只数行，不保留任何东西。
 /// 真实系统里对应「边读边算 / 边读边发」——这正是 SQLite `while rows.next()` 的用法。
 fn countRow(cnt: *usize, row: []const spike.sql.Value) anyerror!void {
@@ -151,6 +162,7 @@ fn benchMain() !void {
 
     var out: std.ArrayList(u8) = .empty;
     std.debug.print("metric,count,value\n", .{});
+    const t_bench = nowNs(io);
 
     // 裸文件写探针：基准的**起点**。与后面两个点对比就能看出「是否某个时间窗口写盘变慢」。
     std.debug.print("bare_write_mbps,{d},{d:.1}\n", .{ 64, bareWriteMbPerSec(io, dir, "bench-bare-1.tmp", 64) });
@@ -173,6 +185,7 @@ fn benchMain() !void {
         try t.wal.sync();
         const ns = nowNs(io) - t0;
         std.debug.print("put,{d},{d:.0}\n", .{ n, opsPerSec(n, ns) });
+        benchMark(io, t_bench, "after_put");
     }
 
     {
@@ -455,6 +468,7 @@ fn benchMain() !void {
         }
         const ns_put = nowNs(io) - t_sql_put;
         std.debug.print("sql_put,{d},{d:.0}\n", .{ n, opsPerSec(n, ns_put) });
+        benchMark(io, t_bench, "after_sql_put");
         std.debug.print("sql_put_segs,{d},0\n", .{t4.segs.items.len});
 
         const t_sql_get = nowNs(io);
@@ -652,6 +666,7 @@ fn benchMain() !void {
             std.debug.print("conc_put_{d}t,{d},{d:.0}\n", .{ nt, total, opsPerSec(total, ns) });
             if (any_fail) std.debug.print("conc_put_{d}t_failed,1,1\n", .{nt});
         }
+        benchMark(io, t_bench, "after_conc");
     }
 
     // 超内存数据集：小 memtable → 大量段，考察多段 k 路归并的点查/扫描
@@ -704,6 +719,7 @@ fn benchMain() !void {
             std.debug.print("big_put_fb64,{d},{d:.0}\n", .{ big_n, r64.ops });
             std.debug.print("big_put_fb64_flushes,{d},{d}\n", .{ r64.flushes, r64.ns_seg_sync });
         }
+        benchMark(io, t_bench, "after_big_put");
 
         // **强耐久档参考**：`wal_sync_every = 10_000` = 每 1 万条 put 做一次 WAL fsync。
         //
@@ -1040,6 +1056,7 @@ fn benchMain() !void {
         try t9.flush();
         std.debug.print("b8_put,{d},{d:.0}\n", .{ bn, opsPerSec(bn, nowNs(io) - t_nb_put) });
         std.debug.print("b8_segs,{d},0\n", .{t9.segs.items.len});
+        benchMark(io, t_bench, "after_b8_put");
         // 裸文件写探针：**紧接着 b8_put**（同配置的第二次 200 万行写完之后）
         std.debug.print("bare_write3_mbps,{d},{d:.1}\n", .{ 64, bareWriteMbPerSec(io, dir, "bench-bare-3.tmp", 64) });
 
@@ -1862,6 +1879,7 @@ fn benchMain() !void {
         }
     }
 
+    benchMark(io, t_bench, "end");
     std.debug.print("bench_done,1,1\n", .{});
     out.deinit(alloc);
     // threaded.deinit() 会让进程收尾更慢，基准进程直接靠 OS 回收；这里保留但注释说明
