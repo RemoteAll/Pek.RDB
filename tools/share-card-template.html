@@ -5,7 +5,7 @@
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   body {
-    width:1080px; height:1420px; overflow:hidden;
+    width:1080px; height:1470px; overflow:hidden;
     background:
       radial-gradient(900px 600px at 12% -8%, rgba(56,189,248,.20), transparent 60%),
       radial-gradient(700px 520px at 105% 8%, rgba(167,139,250,.18), transparent 62%),
@@ -72,7 +72,7 @@
 <script>
 const DATA = __DATA__;
 const LABELS = {
-  put:'逐行写入（存储 API）', sql_put:'逐行写入（SQL 层）',
+  put:'逐行写入（组提交档）', put_sync:'逐行写入（逐行落盘档·与 SQLite 同档）', sql_put:'逐行写入（SQL 层）',
   upd_get:'更新后点查', upd_random:'随机更新 10 万行', get:'主键点查',
   conc4:'并发写 4 线程', big_get:'超内存点查（25 段）', big_put:'超内存批量写 200 万行',
   conc2:'并发写 2 线程', put_batch:'单事务批量写', count_10k:'范围扫描（只数行）',
@@ -100,9 +100,8 @@ DATA.rows.forEach(r => {
 
 document.getElementById('foot').innerHTML =
   '<span class="tag">同批 ABBA</span>交替采样 ' + DATA.rounds + ' 轮，每引擎 2 次共 10 个样本取中位；同机同数据。下表为其中 ' + DATA.rows.length + ' 项代表场景。<br>' +
-  '前两行是同一件事的两个层级：存储 API 与 SQL 层各逐行写一行，两者只差约 7%，<br>' +
-  '说明差距<b>不来自 SQL 层</b>，而来自「SQLite 每行一次完整提交（WAL frame + wal-index + 锁）」<br>' +
-  '对「我方每行只追加到缓冲」。需要逐行落盘时把缓冲设为 0，属另一个持久化档位。<br>' +
+  '前三行都是「逐行写一行」：组提交档 51.70× 与 SQL 层 48.36× 只差约 7%，说明差距<b>不来自 SQL 层</b>；<br>' +
+  '真正的变量是持久化档位——<b>双方同档</b>（都每行落到操作系统、都不 fsync）时为 <b>' + DATA.putSync + '×</b>。<br>' +
   '冷重开 100 万行 <b>' + DATA.reopen.z.toFixed(2) + ' ms</b> vs <b>' + DATA.reopen.s.toFixed(2) + ' ms</b>' +
   '；磁盘 <b>' + DATA.disk.z.toFixed(2) + ' B/行</b> vs <b>' + DATA.disk.s.toFixed(2) + ' B/行</b>（越低越好）。<br>' +
   '另有 1 项（SQL SELECT * 物化）区间跨 1，判为持平，未计入全胜数。原始 CSV 全部入库，可逐轮复核。';

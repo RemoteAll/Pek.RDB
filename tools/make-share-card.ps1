@@ -145,6 +145,35 @@ foreach ($d in $defs) {
     }
 }
 
+# Same-durability row: zig `put_sync` (wal_buf_bytes=0, one write per row, no fsync)
+# vs sqlite `put` (synchronous=NORMAL, one pwrite per commit, no fsync).
+#
+# These three pairs come from a dedicated batch (p15-run1-a / psync-run2 / psync-run3)
+# because the full ABBA batch cannot finish on this machine: sqlite's 4-thread write
+# step stalls (observed in p14 and p15). Values are read from the raw CSVs -- never
+# typed in by hand -- and the row is omitted entirely if the files are missing.
+$syncPairs = @()
+foreach ($f in @('p15-run1-a', 'psync-run2', 'psync-run3')) {
+    $zn = Read-Metric (Join-Path $DataDir "zig-$Date-$f.csv") 'put_sync'
+    $sn = Read-Metric (Join-Path $DataDir "sqlite-$Date-$f.csv") 'put'
+    if ($null -ne $zn -and $null -ne $sn -and $sn -gt 0) { $syncPairs += , @($zn, $sn) }
+}
+if ($syncPairs.Count -ge 3) {
+    $zt = @(); $st = @()
+    foreach ($p in $syncPairs) { $zt += $p[0]; $st += $p[1] }
+    $zm = Median $zt
+    $sm = Median $st
+    $worst = ($zt | Measure-Object -Minimum).Minimum / ($st | Measure-Object -Maximum).Maximum
+    Write-Host ("same-durability put: {0}x  (worst-case {1}x, n={2})" -f [math]::Round($zm / $sm, 2), [math]::Round($worst, 2), $syncPairs.Count)
+    $rows += [pscustomobject]@{
+        k     = 'put_sync'
+        z     = [math]::Round($zm, 0)
+        s     = [math]::Round($sm, 0)
+        unit  = '/s'
+        ratio = [math]::Round($zm / $sm, 2)
+    }
+}
+
 # Cold reopen (lower is better) and disk footprint are factual and measured too.
 $zr = Median (Samples 'zig' 'recover')
 $sr = Median (Samples 'sqlite' 'recover')
@@ -154,10 +183,11 @@ $zPerRow = $zdisk / 2000000.0
 $sPerRow = $sdisk / 2000000.0
 
 $payload = [pscustomobject]@{
-    ahead  = $aheadTotal
-    behind = 0
-    rounds = $Rounds
-    rows   = @($rows | Sort-Object -Property ratio -Descending)
+    ahead   = $aheadTotal
+    behind  = 0
+    rounds  = $Rounds
+    putSync = $(if ($syncPairs.Count -ge 3) { [math]::Round($zm / $sm, 2) } else { 'n/a' })
+    rows    = @($rows | Sort-Object -Property ratio -Descending)
     reopen = [pscustomobject]@{ z = [math]::Round($zr, 2); s = [math]::Round($sr, 2) }
     disk   = [pscustomobject]@{ z = [math]::Round($zPerRow, 2); s = [math]::Round($sPerRow, 2) }
 }
@@ -174,7 +204,7 @@ if (-not (Test-Path $edge)) { Write-Host 'no headless browser found; keep the HT
 
 $uri = 'file:///' + ($OutHtml -replace '\\', '/')
 & $edge --headless=new --disable-gpu --hide-scrollbars --force-device-scale-factor=1 `
-    --window-size=1080,1420 --screenshot=$OutPng $uri 2>$null | Out-Null
+    --window-size=1080,1470 --screenshot=$OutPng $uri 2>$null | Out-Null
 if (Test-Path $OutPng) {
     $kb = [math]::Round((Get-Item $OutPng).Length / 1KB, 1)
     Write-Host "png  -> $OutPng  ($kb KB)"
