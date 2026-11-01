@@ -5,7 +5,7 @@ const codec = @import("codec.zig");
 
 pub const INDEX_STRIDE: usize = 64;
 const FLUSH_BYTES: usize = 1 << 20;
-const IDX_MAGIC = "PEKZIX02";
+const IDX_MAGIC = "PEKZIX03";
 
 pub const IndexEntry = struct {
     offset: u64,
@@ -143,6 +143,11 @@ pub const Writer = struct {
     bits_len: usize = 0,
     min_seq: u64 = std.math.maxInt(u64),
     max_seq: u64 = 0,
+    /// 最后一个 `push` 的 key（= 本段最大 key，因为 push 按 key 升序调用）。
+    /// **存的是引用而不是拷贝** —— 与 `entries` 里 key 的约定一致：
+    /// 调用方保证它在 `finish` 之前有效（`MergeIter` / memtable 的切片都满足）。
+    /// 不能每行 dupe：200 万行那是 32MB 的无谓拷贝。
+    last_key: []const u8 = &.{},
     scratch: std.ArrayList(u8) = .empty,
     /// 文件句柄是否还开着（`finishBytes` 关掉后置 false）
     file_open: bool = true,
@@ -223,6 +228,7 @@ pub const Writer = struct {
         self.rows += 1;
         self.min_seq = @min(self.min_seq, seq);
         self.max_seq = @max(self.max_seq, seq);
+        self.last_key = key;
 
         if (self.buf.items.len >= FLUSH_BYTES) try self.flushBuf();
     }
@@ -263,6 +269,10 @@ pub const Writer = struct {
         try codec.putU64le(&idx, self.alloc, if (self.rows == 0) 0 else self.min_seq);
         try codec.putU64le(&idx, self.alloc, self.max_seq);
         try codec.putU32le(&idx, self.alloc, @intCast(self.entries.items.len));
+        // 段内最大 key（空段写 0 长度）。有了它才能判定「两段 key 范围是否重叠」，
+        // 从而在 `MergeIter` 里走顺序拼接快路径（§16.1.21：25 路归并 → 单游标，+34%）。
+        try codec.putU32le(&idx, self.alloc, @intCast(self.last_key.len));
+        try idx.appendSlice(self.alloc, self.last_key);
         for (self.entries.items) |e| {
             try codec.putU64le(&idx, self.alloc, e.offset);
             try codec.putU32le(&idx, self.alloc, @intCast(e.key.len));
@@ -310,7 +320,7 @@ pub const Finished = struct {
 // 格式：ARCHIVE_MAGIC(8) 之后为连续 record：{ u32 len, u32 crc32Fast(payload), payload[len] }；
 // payload 就是单段 `.idx` 的完整内容（自带 magic 与尾部 CRC，读取时仍逐段校验、能定位损坏段）。
 // 只追加不改写，所以 flush 的代价仍是一段索引的大小。
-pub const ARCHIVE_MAGIC = "PEKZAG03";
+pub const ARCHIVE_MAGIC = "PEKZAG04";
 
 /// 校验归档文件头。空文件（新建库）视为合法。
 pub fn archiveCheckMagic(bytes: []const u8) !void {
@@ -466,6 +476,9 @@ pub const Segment = struct {
     entries: std.ArrayList(Entry) = .empty,
     /// 稀疏索引总条数（来自段头部，**不需要解析全量 entries 就能知道**）。
     n_entries: u32 = 0,
+    /// 段内最大 key 在 `idx` 里的偏移/长度（0 长度 = 空段）。
+    max_key_off: u32 = 0,
+    max_key_len: u32 = 0,
     /// `entries` / `bits_*` / CRC 是否已真正解析。
     /// 对齐 SQLite：`sqlite3BtreeOpen` 只读第 1 页（`pPage1`），叶页/索引页按需缺页。
     /// 我们同样只读段头部（magic + 行数/seq 水位 + 第 1 条稀疏索引），
@@ -490,6 +503,13 @@ pub const Segment = struct {
         if (self.entries.items.len == 0) return null;
         const e = self.entries.items[0];
         return self.idx[e.key_off..][0..e.key_len];
+    }
+
+    /// 段内最大 key（头部就有）。空段返回 null。
+    /// 与 `firstKey()` 配合就能判定「两段 key 范围是否重叠」（顺序拼接的前提）。
+    pub fn maxKey(self: *const Segment) ?[]const u8 {
+        if (self.max_key_len == 0) return null;
+        return self.idx[self.max_key_off..][0..self.max_key_len];
     }
 
     /// 首次真正使用本段（扫描/点查/Bloom）前调用：完成 CRC 校验 + entries + Bloom 解析。
@@ -579,6 +599,12 @@ pub const Segment = struct {
         self.max_seq = try r.u64le();
         self.n_entries = @intCast(try r.u32le());
 
+        // 段内最大 key（§16.1.21）：顺序拼接判定靠它，所以必须在头部读出来。
+        const mklen: usize = @intCast(try r.u32le());
+        const mk = try r.bytes(mklen);
+        self.max_key_off = @intCast(@intFromPtr(mk.ptr) - @intFromPtr(idx_bytes.ptr));
+        self.max_key_len = @intCast(mklen);
+
         // 第 1 条稀疏索引就是段内最小 key —— 段裁剪只需要它。
         // 先把它装进 `entries`，这样「只 open 不查询」的路径也能正确裁剪。
         if (self.n_entries > 0) {
@@ -614,6 +640,9 @@ pub const Segment = struct {
         _ = try r.u64le(); // min_seq
         _ = try r.u64le(); // max_seq
         const n: usize = @intCast(try r.u32le());
+        // 跳过头部已读的 max_key（它已在 `parseIdxHeader` 里记好偏移）
+        const mklen: usize = @intCast(try r.u32le());
+        _ = try r.bytes(mklen);
         try self.entries.ensureTotalCapacity(self.alloc, n);
         var i: usize = 0;
         while (i < n) : (i += 1) {
@@ -936,11 +965,16 @@ test "segment idx 被翻位后必须报错（不静默返回错误结果）" {
         _ = try w.finish(dir, tmp ++ "/000001.idx");
     }
 
-    // 改中间一个字节（既不破坏 magic，也与尾部哈希不符）
+    // 改 bloom 尾部一个字节（既不破坏 magic，也与尾部哈希不符）。
+    //
+    // **不能翻 `len/2`**：头部（rows/min_seq/max_seq/n/max_key 长度）不参加 CRC 校验
+    // （懒解析只在 `ensureParsed` 校验），翻到那里的长度字段会先报 `error.Truncated`，
+    // 而不是这里要验证的 `BadIndexChecksum`。这是「open 只读头部」的固有代价：
+    // 头部结构性损坏可能先以解析错误的形式暴露。
     {
         const bytes = try readWholeFile(io, dir, tmp ++ "/000001.idx", alloc, 1 << 20);
         defer alloc.free(bytes);
-        bytes[bytes.len / 2] ^= 0xFF;
+        bytes[bytes.len - 16] ^= 0xFF;
         var f = try dir.createFile(io, tmp ++ "/000001.idx", .{ .truncate = true });
         defer f.close(io);
         try f.writePositionalAll(io, bytes, 0);

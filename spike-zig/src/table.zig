@@ -59,6 +59,28 @@ fn refLess(_: void, a: segmod.Segment.RefRecord, b: segmod.Segment.RefRecord) bo
     return a.seq > b.seq;
 }
 
+/// 能否走「顺序拼接」：memtable 为空，且相邻段的 `[firstKey, maxKey]` 严格不重叠。
+///
+/// 为什么值得单独判：§16.1.21 的确定性计数器显示，即使 25 段范围不重叠，
+/// 堆归并仍要**每行 2 次比较 + 一次跨游标间接调用**（siftDown 首轮就 return，
+/// 所以不是 log k）；而拼接后走单游标路径，比较次数为 0。
+///
+/// **memtable 非空时一律不走拼接**：它的 key 可能插在任意两段之间，拼接会乱序。
+fn canConcat(table: *Table) bool {
+    if (table.mem.len() > 0) return false;
+    const segs = table.segs.items;
+    if (segs.len <= 1) return false;
+    var i: usize = 1;
+    while (i < segs.len) : (i += 1) {
+        // 空段（刚 flush 完还没写？）不影响顺序，直接跳过它
+        const amax = segs[i - 1].maxKey() orelse continue;
+        const bmin = segs[i].firstKey() orelse return false;
+        // 前一段的最大 key 必须**严格小于**后一段的最小 key，否则可能有重叠 key
+        if (segmod.keyCmp(amax, bmin) != .lt) return false;
+    }
+    return true;
+}
+
 const MemCursor = struct {    it: Skiplist.Iterator,
     end: []const u8,
     snapshot: u64,
@@ -671,6 +693,10 @@ pub const MergeIter = struct {
     table: *Table = undefined,
     cursors: std.ArrayList(ScanCursor) = .empty,
     cur: []?segmod.Segment.RefRecord = &.{},
+    /// 顺序拼接：段 key 范围两两不重叠时，同一时刻只需 1 个活跃游标
+    /// （见 `canConcat`）。此时完全不走堆，直接复用单游标逻辑。
+    concat: bool = false,
+    concat_i: usize = 0,
     /// 最小堆，存的是 `cur` 的下标（按当前记录 key 排序）。
     ///
     /// 原来每产出一行要**线性扫一遍全部游标**找最小 —— O(k)/行。实测 200 万行 25 段时
@@ -722,7 +748,13 @@ pub const MergeIter = struct {
             const c = try s.cursor(start, end, table.visible);
             try self.cursors.append(alloc, .{ .seg = c });
         }
-        if (self.cursors.items.len > 1) {
+        if (self.cursors.items.len > 1 and canConcat(table)) {
+            // 顺序拼接：段 key 范围两两不重叠且有序 → 按段依次耗尽游标。
+            // §16.1.21 实测：25 路归并每行 2 次比较 + 一次跨游标间接调用，
+            // 走拼接后这些全免（与单段同速）。
+            // **不建 cur** —— 建了就得预读，而拼接路径要自己控制游标。
+            self.concat = true;
+        } else if (self.cursors.items.len > 1) {
             self.cur = try alloc.alloc(?segmod.Segment.RefRecord, self.cursors.items.len);
             for (self.cursors.items, 0..) |*c, i| self.cur[i] = c.next();
 
@@ -754,6 +786,22 @@ pub const MergeIter = struct {
         return refLess({}, self.cur[self.heap[a]].?, self.cur[self.heap[b]].?);
     }
 
+
+    /// 顺序拼接：段间 key 范围不重叠时，同一时刻只需 1 个活跃游标，
+    /// 走与单游标完全相同的逻辑（无比较、无堆维护）。
+    fn nextConcat(self: *MergeIter) ?segmod.Segment.RefRecord {
+        while (true) {
+            if (self.concat_i >= self.cursors.items.len) return null;
+            while (self.cursors.items[self.concat_i].next()) |rec| {
+                if (self.have_last and std.mem.eql(u8, rec.key, self.last_key)) continue;
+                self.last_key = rec.key;
+                self.have_last = true;
+                self.table.scan_rows_read += 1;
+                if (rec.flags == 0) return rec;
+            }
+            self.concat_i += 1;
+        }
+    }
 
     fn siftDown(self: *MergeIter, start: usize) void {
         var i = start;
@@ -788,6 +836,7 @@ pub const MergeIter = struct {
             }
             return null;
         }
+        if (self.concat) return self.nextConcat();
         while (true) {
             if (self.heap_len == 0) return null;
             const bi = self.heap[0];
