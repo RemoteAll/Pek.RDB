@@ -18,6 +18,17 @@ pub const Wal = struct {
     io: std.Io,
     file: std.Io.File,
     written: u64 = 0,
+    /// 用户态缓冲上限（字节）。**`0` = 每次 `append` 立即 `write` 到 OS**。
+    ///
+    /// 这个值直接决定「进程被强杀（任务管理器结束任务 / `kill -9` / 系统关机强杀）
+    /// 时，**调用方已确认成功的写**会丢多少」：
+    /// - `> 0`：最多丢 `buf_bytes`（还在用户态缓冲里）；
+    /// - `== 0`：一条都不丢（数据已进 OS 页缓存，进程死了内核还在；只有**掉电**才丢）。
+    ///
+    /// 为什么要有这个：SQLite 的 WAL 提交 **每笔都 `pwrite` 到 WAL 文件**，
+    /// `synchronous=NORMAL` 只是不 `fsync`（`sqlite3.c:63192` 原文）。
+    /// 也就是说默认的 256 KB 缓冲档 **比 SQLite 弱** —— 跨引擎比吞吐时必须把这条对齐。
+    buf_bytes: usize = 256 * 1024,
     buf: std.ArrayList(u8) = .empty,
     payload: std.ArrayList(u8) = .empty,
     alloc: std.mem.Allocator,
@@ -58,7 +69,7 @@ pub const Wal = struct {
         try self.buf.appendSlice(self.alloc, &hdr);
         try self.buf.appendSlice(self.alloc, self.payload.items);
         const n = 8 + self.payload.items.len;
-        if (self.buf.items.len >= 256 * 1024) try self.flushBuf();
+        if (self.buf_bytes == 0 or self.buf.items.len >= self.buf_bytes) try self.flushBuf();
         return n;
     }
 
@@ -96,7 +107,13 @@ pub const Wal = struct {
     }
 
     pub fn close(self: *Wal) void {
-        self.flushBuf() catch {};
+        // 收尾写盘失败**不能吞**：缓冲里的行是调用方已确认成功的写，写不出去就是真丢。
+        // `close` 是资源释放路径（调用链上是 `deinit`，返回 void），没法把错误往上抛，
+        // 所以至少必须留下可检索的日志并说清后果 —— 静默吞掉等于让数据消失且没人知道。
+        self.flushBuf() catch |e| std.log.err(
+            "WAL 收尾写盘失败：缓冲 {d} 字节未能落盘，已确认的写将丢失（原因：{s}）",
+            .{ self.buf.items.len, @errorName(e) },
+        );
         self.buf.deinit(self.alloc);
         self.payload.deinit(self.alloc);
         self.file.close(self.io);

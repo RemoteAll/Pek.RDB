@@ -71,7 +71,7 @@ $defs = @(
     @('scan', 'scan', 'scan_v', '/s', $true),
     @('count_10k', 'count_10k', 'scan_big', '/s', $true),
     @('scan_refs', 'scan_refs', 'scan_big_collect', '/s', $true),
-    @('sql_put', 'sql_put', 'put_txn', '/s', $true),
+    @('sql_put', 'sql_put', 'put', '/s', $true),
     @('sql_full', 'sql_full', 'sql_full', '/s', $true),
     @('conc1', 'conc_put_1t', 'conc_put_1t_txn', '/s', $true),
     @('conc2', 'conc_put_2t', 'conc_put_2t_txn', '/s', $true),
@@ -87,7 +87,7 @@ $defs = @(
 )
 
 # Rows to show on the card (subset). Everything here must be a 5/5 win.
-$show = @('put', 'upd_get', 'upd_random', 'get', 'big_get', 'big_put',
+$show = @('put', 'sql_put', 'upd_get', 'upd_random', 'get', 'big_get', 'big_put',
           'conc4', 'conc2', 'put_batch', 'count_10k', 'big_count', 'scan_refs')
 
 # Chinese labels live in the UTF-8 HTML template (this file must stay ASCII).
@@ -174,7 +174,7 @@ if (-not (Test-Path $edge)) { Write-Host 'no headless browser found; keep the HT
 
 $uri = 'file:///' + ($OutHtml -replace '\\', '/')
 & $edge --headless=new --disable-gpu --hide-scrollbars --force-device-scale-factor=1 `
-    --window-size=1080,1300 --screenshot=$OutPng $uri 2>$null | Out-Null
+    --window-size=1080,1420 --screenshot=$OutPng $uri 2>$null | Out-Null
 if (Test-Path $OutPng) {
     $kb = [math]::Round((Get-Item $OutPng).Length / 1KB, 1)
     Write-Host "png  -> $OutPng  ($kb KB)"

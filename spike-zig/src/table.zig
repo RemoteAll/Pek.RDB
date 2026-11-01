@@ -45,6 +45,16 @@ pub const Options = struct {
     /// 删+建文件是写路径上唯一会增删目录项的操作，也是 Windows 实时扫描最容易插进来的点，
     /// 但「怀疑」不够 —— 必须同进程背靠背配对才能把 200 次元数据操作的代价从噪声里分出来。
     wal_rotate_recreate: bool = false,
+    /// 用户态 WAL 缓冲上限（字节）；**`0` = 每次写入立即 `write` 到 OS**。
+    ///
+    /// 它定义的是**持久化强度**，不是性能旋钮：
+    /// - 默认 `256 KB`：进程被强杀（任务管理器结束 / `kill -9` / 关机强杀）时
+    ///   最多丢最后 256 KB（约 5000 行）**已返回成功的写**；
+    /// - `0`：强杀一条不丢（数据已进 OS 页缓存，进程死了内核还在，只有**掉电**才丢）
+    ///   —— 与 SQLite `synchronous=NORMAL` 对等（它每笔提交都 `pwrite` 到 WAL）。
+    ///
+    /// 跨引擎比吞吐前必须先对齐这一条，否则比的不是同一个持久化级别。
+    wal_buf_bytes: usize = 256 * 1024,
 };
 
 /// 自动 compaction 连续失败上限：到顶就停手，避免每次 flush 都白跑一遍合并。
@@ -348,7 +358,8 @@ pub const Table = struct {
 
         // open 与 replay 已合并，`wal_open` 恒为 0；字段保留是为了不打断
         // 基准与文档里已有的分段口径（`big_recover_breakdown_ms`）。
-        const wal = rw.wal;
+        var wal = rw.wal;
+        wal.buf_bytes = opts.wal_buf_bytes;
 
         if (segmod.timing_enabled) {
             const t1 = @as(u64, @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds));
@@ -404,6 +415,50 @@ pub const Table = struct {
         self.alloc.free(self.wal_path);
         self.alloc.free(self.index_path);
         self.* = undefined;
+    }
+
+    /// 把用户态 WAL 缓冲写进 OS 并 `fsync`。
+    ///
+    /// `put` 返回成功只保证「进了缓冲」（`wal_buf_bytes > 0` 时），
+    /// 只有这个调用才保证「已经在盘上」。宿主在收到退出信号、或需要「写到哪儿算哪儿」的
+    /// 检查点时调它。
+    pub fn sync(self: *Table) !void {
+        const t = self.nowNs();
+        try self.wal.sync();
+        self.ns_wal_sync += self.nowNs() - t;
+        self.pending = 0;
+    }
+
+    /// 收尾动作本体（**不释放资源**，运行期可当 checkpoint 反复调用）。
+    ///
+    /// 1. `flush()`：memtable 全部落成段（段数据与索引归档各自 `fsync`），随后 WAL 原地清空；
+    /// 2. `wal.sync()` 兜底：即使 memtable 为空、`flush` 走了只轮换 WAL 的路径，
+    ///    也保证残留缓冲落盘并在盘上。
+    ///
+    /// 为什么第 2 步不能省：`flush` 的 WAL 轮换是 `setLength(0)`，
+    /// 它丢的是「已经进段的数据」对应的那批 WAL —— 但如果 memtable 为空而用户态缓冲里
+    /// 还有没 `write` 出去的行，轮换会把它们直接丢掉。先 sync 再轮换才是安全的。
+    pub fn checkpoint(self: *Table) !void {
+        try self.sync();
+        try self.flush();
+        try self.wal.sync();
+        self.pending = 0;
+    }
+
+    /// **有序收尾**：checkpoint（落段 + 清 WAL + 全部 `fsync`）后释放资源。
+    ///
+    /// 这是「数据库层面」应有的正常退出路径。宿主收到 SIGTERM / SIGINT /
+    /// 控制台 Ctrl+C / Windows 服务停止 / 系统关机时应当调它，**而不是**只等进程
+    /// 退出时的 `deinit`：
+    /// - `deinit` 只做资源释放 + 一次尽力写（不 `fsync`、失败只记日志）；
+    /// - `wal_buf_bytes > 0` 时，被强杀的进程会在缓冲里丢最多 `buf_bytes` 字节
+    ///   **已返回成功的写**。信号处理的参考实现在 `shutdown.zig`。
+    ///
+    /// 失败时**仍然释放资源**（避免泄漏），错误往上抛给调用方决定怎么上报。
+    pub fn close(self: *Table) !void {
+        const r = self.checkpoint();
+        self.deinit();
+        try r;
     }
 
     /// 单调纳秒时钟（`Table` 内部计时用；不依赖外部注入）。
@@ -584,6 +639,7 @@ pub const Table = struct {
             self.wal.close();
             self.dir.deleteFile(self.io, self.wal_path) catch {};
             self.wal = try walmod.Wal.create(self.io, self.dir, self.wal_path, self.alloc);
+            self.wal.buf_bytes = self.opts.wal_buf_bytes;
         } else {
             try self.wal.reset();
         }
@@ -1077,6 +1133,278 @@ test "flush 后 WAL 原地截断：多次 flush 后重开数据完整（truncate
             try std.testing.expectEqualStrings("v", v.?);
         }
     }
+}
+
+// ---------------------------------------------------------------- 崩溃一致性
+//
+// 这三条守的是「掉电后能不能正确还原」这条线。现有用例覆盖了「归档尾部残片」
+// （index.bin 尾部残片后新增段必须仍可见），但**没有**覆盖下面三种真实崩溃态：
+//   ① put 已提交到 WAL、memtable 还没落段 → 必须靠 WAL 回放恢复；
+//   ② WAL 尾部只写了半条批次 → 只能回放完整批次，半条要丢弃，且之后还能继续写；
+//   ③ 段文件存在但归档没有它的记录（崩溃在 archiveAppend 之前）→ 该段必须被忽略、不得报错
+//      （归档是权威；这种情况数据仍在 WAL 里，由 ① 那条路径恢复）。
+
+test "崩溃：WAL 里有已提交批次但未落段，重开必须回放出来" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-crash-wal-replay";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    // 先建出目录骨架（wal/ 目录由 Table.open 创建）
+    {
+        var t0 = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        t0.deinit();
+    }
+
+    // 直接往 WAL 写两个已提交批次 —— 等价于「put 返回了，但 memtable 还没 flush 就掉电」
+    {
+        var wp: [128]u8 = undefined;
+        const wpath = try std.fmt.bufPrint(&wp, "{s}/wal/000001.wal", .{tmp});
+        var w = try walmod.Wal.create(io, dir, wpath, alloc);
+        defer w.close();
+        _ = try w.append(1, &.{.{ .flags = 0, .key = "k1", .value = "v1" }});
+        _ = try w.append(2, &.{.{ .flags = 0, .key = "k2", .value = "v2" }});
+        try w.sync();
+    }
+
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+    try std.testing.expectEqualStrings("v1", (try t.get("k1", &out)).?);
+    try std.testing.expectEqualStrings("v2", (try t.get("k2", &out)).?);
+
+    // 回放出来的行必须能正常落段，且落段后重开仍在
+    try t.flush();
+    var t2 = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t2.deinit();
+    try std.testing.expectEqualStrings("v1", (try t2.get("k1", &out)).?);
+    try std.testing.expectEqualStrings("v2", (try t2.get("k2", &out)).?);
+}
+
+test "崩溃：WAL 尾部撕裂（半条批次）只回放完整批次，且之后仍可继续写" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-crash-wal-torn";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    {
+        var t0 = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        t0.deinit();
+    }
+
+    var wp: [128]u8 = undefined;
+    const wpath = try std.fmt.bufPrint(&wp, "{s}/wal/000001.wal", .{tmp});
+    {
+        var w = try walmod.Wal.create(io, dir, wpath, alloc);
+        defer w.close();
+        _ = try w.append(1, &.{.{ .flags = 0, .key = "ok1", .value = "v1" }});
+        try w.sync();
+        _ = try w.append(2, &.{.{ .flags = 0, .key = "torn", .value = "v2" }});
+        try w.sync();
+    }
+    // 砍掉尾部 5 个字节 —— 模拟写到一半掉电
+    {
+        const f = try dir.openFile(io, wpath, .{ .mode = .read_write });
+        defer f.close(io);
+        const sz = (try f.stat(io)).size;
+        try f.setLength(io, sz - 5);
+        try f.sync(io);
+    }
+
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+    // 完整的那条必须在，被撕裂的那条必须被丢弃（不能被当成有效数据）
+    try std.testing.expectEqualStrings("v1", (try t.get("ok1", &out)).?);
+    try std.testing.expect((try t.get("torn", &out)) == null);
+
+    // 撕裂之后仍能继续写并 flush，重开数据一致
+    try t.put("after", "v3");
+    try t.flush();
+    var t2 = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t2.deinit();
+    try std.testing.expectEqualStrings("v1", (try t2.get("ok1", &out)).?);
+    try std.testing.expectEqualStrings("v3", (try t2.get("after", &out)).?);
+}
+
+test "崩溃：段文件存在但归档无记录时被忽略且不报错（归档是权威）" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-crash-orphan-seg";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        defer t.deinit();
+        try t.put("a", "va");
+        try t.flush();
+        try std.testing.expectEqual(@as(usize, 1), t.segs.items.len);
+    }
+
+    // 把归档砍回「只有 magic」，等于「崩溃发生在 archiveAppend 之前」：
+    // 段文件留在盘上，但归档没有引用它。
+    {
+        var ip: [128]u8 = undefined;
+        const ipath = try std.fmt.bufPrint(&ip, "{s}/seg/index.bin", .{tmp});
+        const f = try dir.openFile(io, ipath, .{ .mode = .read_write });
+        defer f.close(io);
+        try f.setLength(io, 8);
+        try f.sync(io);
+    }
+
+    // 必须能打开（不报错），且那个孤儿段被忽略
+    var t2 = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t2.deinit();
+    try std.testing.expectEqual(@as(usize, 0), t2.segs.items.len);
+    try std.testing.expect((try t2.get("a", &out)) == null);
+
+    // 之后新建的段必须仍可见（残留的孤儿文件不能让 next_seg 复用同名文件而丢数据）
+    try t2.put("b", "vb");
+    try t2.flush();
+    var t3 = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t3.deinit();
+    try std.testing.expectEqualStrings("vb", (try t3.get("b", &out)).?);
+}
+
+// ---------------------------------------------------------------- 有序收尾 / 持久化档位
+//
+// 这一组守的是「宿主收到退出信号之后该怎么做」以及「不做会丢多少」。
+// 两条命题必须**分别**有证据，不能只凭「有 WAL 所以安全」：
+//   ① `close()` 之后数据全部落段、WAL 归零 —— 这是有序收尾的有效性；
+//   ② `wal_buf_bytes` 的两档差别 —— 这是「强杀会不会丢」的量化口径。
+
+/// 取磁盘上某个文件的字节数（不存在返 0）。
+fn fileSizeOnDisk(io: std.Io, dir: std.Io.Dir, path: []const u8) !u64 {
+    const f = dir.openFile(io, path, .{ .mode = .read_only }) catch |e| switch (e) {
+        error.FileNotFound => return 0,
+        else => return e,
+    };
+    defer f.close(io);
+    return (try f.stat(io)).size;
+}
+
+test "有序收尾：close() 后数据全部落段、WAL 归零，重开一致" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-graceful-close";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var wp: [128]u8 = undefined;
+    const wpath = try std.fmt.bufPrint(&wp, "{s}/wal/000001.wal", .{tmp});
+
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        var i: u32 = 0;
+        while (i < 200) : (i += 1) {
+            var kb: [32]u8 = undefined;
+            var vb: [32]u8 = undefined;
+            try t.put(try std.fmt.bufPrint(&kb, "k{d:0>4}", .{i}), try std.fmt.bufPrint(&vb, "v{d:0>4}", .{i}));
+        }
+        // 收尾之前：数据还在 WAL / memtable 里
+        try std.testing.expectEqual(@as(usize, 0), t.segs.items.len);
+
+        try t.close();
+        // 注意：close() 内部已 deinit（`self.* = undefined`），之后**不能再碰 `t`**。
+    }
+    // 收尾之后：WAL 归零。此时数据只可能在段里（WAL 是空的），
+    // 下面重开能读全 200 行就证明「确实落到了段」而不是靠 WAL 回放。
+    try std.testing.expectEqual(@as(u64, 0), try fileSizeOnDisk(io, dir, wpath));
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    var t2 = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t2.deinit();
+    var i: u32 = 0;
+    while (i < 200) : (i += 1) {
+        var kb: [32]u8 = undefined;
+        var vb: [32]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            try std.fmt.bufPrint(&vb, "v{d:0>4}", .{i}),
+            (try t2.get(try std.fmt.bufPrint(&kb, "k{d:0>4}", .{i}), &out)).?,
+        );
+    }
+}
+
+test "持久化档位：wal_buf_bytes=0 时 put 返回即已落盘（强杀不丢，与 SQLite NORMAL 对等）" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-walbuf-zero";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var wp: [128]u8 = undefined;
+    const wpath = try std.fmt.bufPrint(&wp, "{s}/wal/000001.wal", .{tmp});
+
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0, .wal_buf_bytes = 0 });
+    defer t.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0), try fileSizeOnDisk(io, dir, wpath));
+    try t.put("a", "1");
+    // **第一次 put 返回后 WAL 文件就必须非 0** —— 这就是「强杀不丢」的定义：
+    // 数据已经不在进程里了，进程此刻被结束也不影响。
+    try std.testing.expect(try fileSizeOnDisk(io, dir, wpath) > 0);
+
+    const after_first = try fileSizeOnDisk(io, dir, wpath);
+    try t.put("b", "2");
+    try std.testing.expect(try fileSizeOnDisk(io, dir, wpath) > after_first);
+}
+
+test "持久化档位：默认缓冲下 put 返回时数据仍在用户态（强杀会丢，必须靠 close/sync 兜）" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-walbuf-default";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var wp: [128]u8 = undefined;
+    const wpath = try std.fmt.bufPrint(&wp, "{s}/wal/000001.wal", .{tmp});
+
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0, .wal_buf_bytes = 1 << 20 });
+    defer t.deinit();
+
+    try t.put("a", "1");
+    // 缓冲没满：数据**一个字节都还没出进程**。此刻被强杀 = 这条已返回成功的写丢失。
+    // 这条断言不是「应该如此」，而是把「必须调 close()/sync()」的代价量化出来 ——
+    // 没有它，默认档的丢失风险就只是文档里的一句空话。
+    try std.testing.expectEqual(@as(u64, 0), try fileSizeOnDisk(io, dir, wpath));
+
+    try t.sync();
+    try std.testing.expect(try fileSizeOnDisk(io, dir, wpath) > 0);
 }
 
 test "table put/get/flush/reopen" {

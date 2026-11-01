@@ -30,6 +30,9 @@ if (-not $DataDir) {
 # Metric pairs: zig name, sqlite name, higher-is-better
 $pairs = @(
     @('put', 'put', $true),
+    # 同持久化档位：我方每行立即 write 到 OS（wal_buf_bytes=0，不 fsync）
+    # vs SQLite 每笔提交 pwrite 到 WAL（synchronous=NORMAL，不 fsync）。两边都强杀不丢。
+    @('put_sync', 'put', $true),
     @('put_batch', 'put_txn', $true),
     @('get', 'get', $true),
     @('scan', 'scan_v', $true),
@@ -37,10 +40,17 @@ $pairs = @(
     # scan_refs 会「收集」命中记录（20 万 × 48B），旧配对用的是 scan_big（只推进游标、
     # 一条不收）——那是不对等口径（曾因此得出假的 0.70x）。现改为 SQLite 也收集的 scan_big_collect。
     @('scan_refs', 'scan_big_collect', $true),
-    @('sql_put', 'put_txn', $true),
+    # sql_put 是我方 **SQL 层逐行 INSERT**（main.zig 里每行一次 insertRows，无事务包裹），
+    # 所以必须对 SQLite 的 **put（逐行 autocommit）**，不能对 put_txn（单事务批量）。
+    # 旧映射错配到 put_txn，把 48.4x 压成 1.85x，并让人误以为“差距来自 SQL 层”—— 实际
+    # 存储 API 与 SQL 层只差约 7%（51.70x vs 48.4x），差距来自“每行一次完整提交”。
+    @('sql_put', 'put', $true),
     @('sql_get', 'sql_get', $true),
     @('sql_full', 'sql_full', $true),
     @('sql_full_touch', 'sql_full_touch', $true),
+    # 以下三项我方是**逐行**写，SQLite 侧用的是**单事务**（它最有利的形态）——
+    # 属于**对 SQLite 有利的保守口径**（我方可测值只会更高）。保留是因为 SQLite
+    # 没有同量级的逐行变体（200 万行 autocommit 要跑几十秒），且方向不损对方。
     @('conc_put_1t', 'conc_put_1t_txn', $true),
     @('conc_put_2t', 'conc_put_2t_txn', $true),
     @('conc_put_4t', 'conc_put_4t_txn', $true),

@@ -203,6 +203,32 @@ fn benchMain() !void {
         std.debug.print("flush,{d},{d:.0}\n", .{ n, opsPerSec(n, ns) });
     }
 
+    // 同持久化档位对照：`wal_buf_bytes = 0` → 每行立即 `write` 到 OS（不 fsync），
+    // 与 SQLite `synchronous=NORMAL`「每笔提交都 pwrite 到 WAL 文件、不 fsync」**完全对等**。
+    //
+    // 为什么必须单独测这一档：默认 256 KB 缓冲档比它**弱** —— 进程被强杀时会丢缓冲里
+    // 已返回成功的写（SQLite 那一档一条不丢）。所以对外报 `put` 的 51.7× 时，
+    // 必须同时给出这一档的数字，否则等于拿「更弱的持久化」换吞吐。
+    {
+        const path_sync = "bench-data-walsync";
+        dir.deleteTree(io, path_sync) catch {};
+        var ts = try tablemod.Table.open(io, dir, path_sync, alloc, .{ .wal_sync_every = 0, .wal_buf_bytes = 0 });
+        defer {
+            ts.deinit();
+            dir.deleteTree(io, path_sync) catch {};
+        }
+
+        const t0 = nowNs(io);
+        var i: u64 = 0;
+        while (i < n) : (i += 1) {
+            const kb = keyOf(@intCast(i));
+            try ts.put(&kb, &value);
+        }
+        try ts.wal.sync();
+        const ns = nowNs(io) - t0;
+        std.debug.print("put_sync,{d},{d:.0}\n", .{ n, opsPerSec(n, ns) });
+    }
+
     // 批量写：与 SQLite 单事务批量插入同口径（1M 行一次提交）
     {
         const path2 = "bench-data-batch";
