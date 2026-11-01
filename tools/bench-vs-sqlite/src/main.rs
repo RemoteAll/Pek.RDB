@@ -156,6 +156,28 @@ fn main() -> rusqlite::Result<()> {
         println!("scan_v_big,{},{}", bytes / 32, (bytes as f64 / 32.0) / secs);
     }
 
+    // 范围扫描（20 万行）· **收集引用**：对等 Zig 的 `scan_refs`。
+    //
+    // 为什么必须有这一档：`scan_refs` 会把每条命中记录收进数组（20 万 × 48B = 9.6MB 写入），
+    // 而 `scan_big` 只推进游标、一条都不收 —— 拿这两个比得出「我们 0.70×」是**口径不对等**的产物。
+    // 这里补上「SQLite 也收集」的版本：用 `get_ref` 取引用（**不复制 payload**），
+    // 与 `RefRecord{key 指针,len, seq, flags, value 指针,len}` 做的工作等价。
+    {
+        let t0 = Instant::now();
+        let mut out: Vec<(i64, i64)> = Vec::with_capacity(200_000);
+        {
+            let mut stmt = conn.prepare("SELECT id, v FROM t WHERE id >= ?1 AND id < ?2")?;
+            let mut rows = stmt.query(params![0i64, 200_000i64])?;
+            while let Some(row) = rows.next()? {
+                let id: i64 = row.get(0)?;
+                let vlen = row.get_ref(1)?.as_blob().map(|b| b.len()).unwrap_or(0) as i64;
+                out.push((id, vlen));
+            }
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        println!("scan_big_collect,{},{}", out.len(), out.len() as f64 / secs);
+    }
+
     drop(conn);
 
     // 重开 + 首查

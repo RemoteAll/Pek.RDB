@@ -2,6 +2,7 @@
 // 个人使用免费；商业使用需商业授权，或同样以 AGPL-3.0 开源（见 LICENSE）。
 const std = @import("std");
 const spike = @import("pek_rdb_spike");
+const build_options = @import("build_options");
 const codec = spike.codec;
 const tablemod = spike.table;
 
@@ -149,6 +150,13 @@ fn benchMain() !void {
     var threaded = std.Io.Threaded.init(alloc, .{});
     const io = threaded.io();
     const dir = std.Io.Dir.cwd();
+
+    // **lite 模式**（编译期 `-Dlite=true`）：跳过重型诊断探针，只跑与 SQLite 对比的那些指标。
+    //
+    // 为什么需要：加上 `big_put_strong` / `fb32` / `fb64` / `walab` 这四组之后，一次跑的写入量
+    // 从约 1.0GB 涨到约 2.5GB —— **这本身就把机器写到饱和，是 A 类写抖动的触发源之一**。
+    // 官方对比用 lite（每轮 ~1.0GB），重型探针用单独批次跑，不要混在一起。
+    const lite = build_options.lite;
 
     const path = "bench-data";
     dir.deleteTree(io, path) catch {};
@@ -711,7 +719,8 @@ fn benchMain() !void {
         // **`flush_bytes` 敏感度实验**：同样 200 万行 / 同一时间窗口，只改段大小。
         // 8MB（`big_put`）→ 约 25 次 flush；32MB/64MB → 约 7/4 次。
         // 判据看两点：① 吞吐是否更高（fsync 次数少）；② **同轮内**是否比 `big_put` 更稳。
-        {
+        // 注意：结论是「**不是解药**」（见决策记录七十三），保留只为重评估；lite 模式跳过。
+        if (!lite) {
             const r32 = try bulkWrite(io, dir, "bench-data-fb32", alloc, &value, big_n, 32 << 20);
             std.debug.print("big_put_fb32,{d},{d:.0}\n", .{ big_n, r32.ops });
             std.debug.print("big_put_fb32_flushes,{d},{d}\n", .{ r32.flushes, r32.ns_seg_sync });
@@ -731,7 +740,7 @@ fn benchMain() !void {
         // 对等口径下（p8 批 7 轮交替配对）`big_put` vs SQLite `big_put_txn` **7/7 全胜**，
         // 中位 1,421,424 vs 612,163 = 2.32×，波动 1.56× 反而小于 SQLite 的 3.97×。
         // 这一行留作「开强耐久要付多少」的证据，不参与 vs-SQLite 判定。
-        {
+        if (!lite) {
             const path_strong = "bench-data-bigstrong";
             dir.deleteTree(io, path_strong) catch {};
             defer dir.deleteTree(io, path_strong) catch {};
@@ -1844,7 +1853,8 @@ fn benchMain() !void {
     // **必须放在整套基准的最末尾**（§16.1.7 的教训）：本探针要写 14 × 100 万行 ≈ 570MB，
     // 放在中间会把脏页与页缓存占满，让后面的 `big_*` 读指标波动从 20% 放大到 400%+。
     // 第一版就是放在 `big_put_strong` 后面的，审计时已挪到 `bench_done` 之前。
-    {
+    // lite 模式跳过（官方对比不做重型探针：单轮写入量从 ~2.5GB 降到 ~1.0GB）。
+    if (!lite) {
         const ab_n: u64 = 1_000_000;
         var pair: usize = 0;
         while (pair < 7) : (pair += 1) {

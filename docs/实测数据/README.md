@@ -76,6 +76,7 @@ $dir = '..\docs\实测数据'
 1. **禁止手填数字**：对比表只能是 `tools/compare-bench.ps1` 的输出。
 2. **禁止单轮下结论**：至少三轮，看中位与 min–max。这台机器上 SQLite 逐行写实测 16K–40K 行/s（2.4× 波动），
    单轮会给出完全相反的结论。
+2b. **vs SQLite 的正式结论一律用 ABBA 批次**（见下），不用顺序跑法。
 3. **禁止沿用旧数字**：换轮次就重新跑；旧轮次文件保留（可追溯），但文档只引用最新一期。
 4. **异常先查环境**：曾出现 `sql_put` 单轮掉到 1/10（后台编译/杀毒干扰），`git stash` A/B 证明与代码无关。
 
@@ -136,6 +137,33 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\round-quality.ps1 `
 `spike-bench` 输出 `t_sec,<名称>,<距进程启动秒数>`，用于判断坏轮次是**固定时刻**（可调节奏避开）
 还是**随机时刻**（只能多轮 + 好坏窗口分离）。采样点：`after_put`、`after_sql_put`、
 `after_conc`、`after_big_put`、`after_b8_put`、`end`。
+
+## ABBA 跑法（2026-11-01 起，vs-SQLite 正式结论唯一跑法）
+
+**旧顺序跑法有窗口偏差**：`round = [我方 18–30s] → [SQLite 25s]`，两个引擎永远不在同一时间窗口采样，
+而写抖动可持续数十秒 —— 实测 `fbsize` r6 我方裸写 8s 时已从 339 掉到 27 MB/s，SQLite 是 30s 之后的另一个窗口。
+判据详见 `docs/架构设计.md` §16.1.33。
+
+```powershell
+# 1) 官方对比用 lite（跳过 strong/fb32/fb64/walab，单轮写入量 ~2.5GB -> ~1.0GB）
+cd spike-zig; zig build -Doptimize=ReleaseFast -Dlite=true
+
+# 2) ABBA：一轮内 zig,sqlite,sqlite,zig（偶数轮反向）
+powershell -File tools\run-abba.ps1 -Date <日期> -Tag <标签> -Rounds 5
+
+# 3) 判定：每引擎两样本取中位 -> 配对比值
+powershell -File tools\abba-verdict.ps1 -Tag <标签> -Date <日期>
+```
+
+**对等口径**：每条指标都要能回答「两边做的工作是否相同」。反例：`scan_refs`（收集 20 万条）
+曾配对 `scan_big`（只推进游标）→ 假的 0.702× 全输；补 `scan_big_collect`（同样收集、
+`get_ref` 不复制 payload）后变为 **1.197× 全胜**。
+
+| 批次 | 用途 |
+|---|---|
+| `zig|sqlite-2026-11-01-p13-run{1..5}-{a,b}.csv` | **正式结论批次**：18 全胜 / 0 落后 / 1 持平 |
+| `zig|sqlite-2026-11-01-p12-run{1..5}-{a,b}.csv` | 第一版 ABBA，**对等口径修正前**，只留档不得引用 |
+
 
 
 

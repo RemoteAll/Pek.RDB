@@ -9,6 +9,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    // **lite 模式**（`-Dlite=true`）：跳过重型诊断探针，只跑与 SQLite 对比的指标。
+    // 为什么要它：加上 strong/fb32/fb64/walab 四组后，一次基准的写入量从约 1.0GB 涨到约 2.5GB，
+    // 这本身就容易把机器写到饱和（A 类写抖动的触发源）。官方对比用 lite，
+    // 重型探针用单独批次跑。
+    // 用编译期开关而不是环境变量：Zig 0.17 的 `std.process` 已经没有 `getEnvVarOwned`，
+    // 而编译期常量零开销、也进不了热路径。
+    const lite = b.option(bool, "lite", "Skip heavy diagnostic probes (official vs-SQLite runs)") orelse false;
+    const opts = b.addOptions();
+    opts.addOption(bool, "lite", lite);
+
     const exe = b.addExecutable(.{
         .name = "spike-bench",
         .root_module = b.createModule(.{
@@ -17,6 +27,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "pek_rdb_spike", .module = mod },
+                .{ .name = "build_options", .module = opts.createModule() },
             },
         }),
     });

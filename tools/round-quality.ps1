@@ -99,7 +99,10 @@ foreach ($f in $files) {
         $r = $v / $med
         $row += ('{0,10:N2}' -f $r)
         if ($m -like 'bare_write*') { $bareSeen = $true }
-        if ($m -like 'bare_write*' -and $r -lt $Threshold) { $bareBad = $true }
+        # `bare_write_mbps` 是进程的第一个动作，系统性偏慢（文件系统/杀毒首次触达）。
+        # 拿它当 A 类判据会把「冷启动」误报成「环境抖动」—— 实测 p13 r3/r4 就是 bare1 0.16/0.20
+        # 而 bare2/bare3 全部正常。所以 A 类只用中段探针（bare2/bare3）。
+        if (($m -eq 'bare_write2_mbps' -or $m -eq 'bare_write3_mbps') -and $r -lt $Threshold) { $bareBad = $true }
         if ($m -notlike 'bare_write*' -and $r -lt $Threshold) { $engineBad = $true }
     }
     $class = 'OK'
