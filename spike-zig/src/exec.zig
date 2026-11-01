@@ -57,6 +57,9 @@ const Materialized = struct {
     buf: []u8 = &.{},
     flat: []sql.Value = &.{},
     hdrs: [][]sql.Value = &.{},
+    /// `flat` 每行实际解码的列数。等于 `schema.columns.len` 时是全列解码；
+    /// 小于它说明已按投影解码（`flat` 就是最终布局，`buildOutput` 无需再挑列）。
+    ncols: usize = 0,
 
     fn deinit(self: *Materialized) void {
         self.alloc.free(self.flat);
@@ -70,8 +73,9 @@ fn decodeAll(
     alloc: std.mem.Allocator,
     s: *const schema_mod.Schema,
     values: []const []const u8,
+    want: ?[]const usize,
 ) !Materialized {
-    const ncols = s.columns.len;
+    const ncols = if (want) |w| w.len else s.columns.len;
     var total: usize = 0;
     for (values) |v| total += v.len;
 
@@ -88,10 +92,11 @@ fn decodeAll(
         @memcpy(raw, v);
         off += v.len;
         const vals = flat[i * ncols ..][0..ncols];
-        try s.decodeRowInto(vals, raw);
+        // `want` 非空时只解投影列，其余列仅跳过（SQLite `OP_Column` 的惰性）
+        if (want) |w| try s.decodeRowProjected(vals, w, raw) else try s.decodeRowInto(vals, raw);
         hdrs[i] = vals;
     }
-    return .{ .alloc = alloc, .buf = buf, .flat = flat, .hdrs = hdrs };
+    return .{ .alloc = alloc, .buf = buf, .flat = flat, .hdrs = hdrs, .ncols = ncols };
 }
 
 /// 结果装配：按投影产出 Rows；恒等投影直接复用扁平数组（零拷贝）。
@@ -131,6 +136,29 @@ fn buildOutput(
         m.flat = &.{};
         m.buf = &.{};
         return .{ .alloc = alloc, .columns = proj.columns, .rows = out, .flat = flat, .buf = buf };
+    }
+
+    // `decodeAll` 已按投影解码（`m.ncols == 投影列数`）：`flat` 就是最终布局，
+    // 不用再从全列里挑。这是 `SELECT id` 比 `SELECT *` 还慢 16% 的根因修法 ——
+    // 旧路径会另分配一份 `pflat` 再逐行拷 Value（100 万行 16MB）。
+    if (m.ncols == proj.indices.len) {
+        if (start == 0 and end == m.hdrs.len) {
+            const out = m.hdrs;
+            const flat = m.flat;
+            const buf = m.buf;
+            m.hdrs = &.{};
+            m.flat = &.{};
+            m.buf = &.{};
+            return .{ .alloc = alloc, .columns = proj.columns, .rows = out, .flat = flat, .buf = buf };
+        }
+        const out_rows = try alloc.alloc([]sql.Value, n);
+        errdefer alloc.free(out_rows);
+        @memcpy(out_rows, m.hdrs[start..end]);
+        const flat = m.flat;
+        const buf = m.buf;
+        m.flat = &.{};
+        m.buf = &.{};
+        return .{ .alloc = alloc, .columns = proj.columns, .rows = out_rows, .flat = flat, .buf = buf };
     }
 
     const out_rows = try alloc.alloc([]sql.Value, n);
@@ -252,7 +280,8 @@ fn selectByPk(t: *tablemod.Table, s: *const schema_mod.Schema, sel: sql.Select, 
     };
 
     const one = [_][]const u8{raw};
-    var m = try decodeAll(alloc, s, &one);
+    // 点查只要一行，额外做投影裁剪没有意义（单行解码成本可忽略），保持全列。
+    var m = try decodeAll(alloc, s, &one, null);
     defer m.deinit();
     return buildOutput(alloc, s, &m, proj, 0, 1);
 }
@@ -434,7 +463,28 @@ pub fn selectRows(
         }
     }
 
-    var m = try decodeAll(alloc, s, src);
+    const proj = try buildProjection(alloc, s, sel.items);
+    errdefer {
+        for (proj.columns) |c| alloc.free(c);
+        alloc.free(proj.columns);
+        // `proj.indices` 平时由 `buildOutput` 的 defer 释放；但若下面提前返回（
+        // decodeAll 失败），这里必须自己收拾。
+        alloc.free(proj.indices);
+    }
+
+    // 有 ORDER BY 时排序键按**全列**索引取（`SortCtx` 用 `schema.indexOf`），
+    // 所以那种情况下不能按投影解码。
+    //
+    // 另外 `decodeRowProjected` 是「一趟顺序扫描时顺手跳过未投影列」，要求 want **严格升序**；
+    // 而 `SELECT v, id` 会给出 [1,0]、`SELECT id, id` 会给出重复下标 —— 这些都得退回全列解码。
+    const ascending = blk: {
+        for (proj.indices, 0..) |v, k| {
+            if (k > 0 and v <= proj.indices[k - 1]) break :blk false;
+        }
+        break :blk true;
+    };
+    const want: ?[]const usize = if (sel.order_by.len == 0 and ascending) proj.indices else null;
+    var m = try decodeAll(alloc, s, src, want);
     defer m.deinit();
 
     if (sel.order_by.len > 0) {
@@ -447,11 +497,6 @@ pub fn selectRows(
     var end: usize = m.hdrs.len;
     if (sel.limit) |l| end = @min(end, start + @as(usize, l));
 
-    const proj = try buildProjection(alloc, s, sel.items);
-    errdefer {
-        for (proj.columns) |c| alloc.free(c);
-        alloc.free(proj.columns);
-    }
     return buildOutput(alloc, s, &m, proj, start, end);
 }
 

@@ -387,6 +387,33 @@ fn benchMain() !void {
             std.debug.print("sql_full,{d},{d:.0}\n", .{ rows.rows.len, opsPerSec(@intCast(rows.rows.len), ns) });
             std.debug.print("sql_full_readrows,{d},0\n", .{t4.scan_rows_read});
         }
+        // 投影扫描：同一张表、同样全表范围，只取 1 列（`SELECT id`）。
+        //
+        // 为什么单独一档：SQLite 的 `OP_Column` 是惰性的（不调 `sqlite3_column_*` 就
+        // 不解码），而我们现在是「解码全部列再丢掉未投影的」。
+        // 这一档就是「惰性列解码到底值多少钱」的基准 —— 先量现状再决定改不改。
+        {
+            var items_p = [_]spike.sql.SelectItem{.{ .column = "id" }};
+            const sel_p = spike.sql.Select{ .items = &items_p, .table = "bench_sql" };
+            t4.scan_rows_read = 0;
+            const t0 = nowNs(io);
+            var rows_p = try spike.exec.selectRows(&t4, &s, sel_p, alloc);
+            const ns = nowNs(io) - t0;
+            defer rows_p.deinit();
+            std.debug.print("sql_proj1,{d},{d:.0}\n", .{ rows_p.rows.len, opsPerSec(@intCast(rows_p.rows.len), ns) });
+            std.debug.print("sql_proj1_cols,{d},0\n", .{if (rows_p.rows.len > 0) rows_p.rows[0].len else 0});
+        }
+        // 投影流式（不物化）：`SELECT id` 走 forEachRow，与 sql_each 同口径
+        {
+            var items_p2 = [_]spike.sql.SelectItem{.{ .column = "id" }};
+            const sel_p2 = spike.sql.Select{ .items = &items_p2, .table = "bench_sql" };
+            var cnt_p: usize = 0;
+            t4.scan_rows_read = 0;
+            const t0 = nowNs(io);
+            _ = try spike.exec.forEachRow(&t4, &s, sel_p2, alloc, &cnt_p, countRow);
+            const ns = nowNs(io) - t0;
+            std.debug.print("sql_each_proj1,{d},{d:.0}\n", .{ cnt_p, opsPerSec(@intCast(cnt_p), ns) });
+        }
         // 流式（不物化）：SQLite `while rows.next()` 的等价物。
         // 与上面的 sql_full 跑同一条语句、同一张表，唯一差别是**消费方式**：
         // 物化要 flat 48MB + buf 32MB + hdrs 16MB，流式只有几个复用槽位。

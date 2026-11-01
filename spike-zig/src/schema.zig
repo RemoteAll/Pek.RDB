@@ -201,6 +201,54 @@ pub const Schema = struct {
         try self.decodeRowInto(vals, bytes);
         return vals;
     }
+
+    /// 只解码 `want` 指定的列（**必须严格升序**），其余列仅按类型跳过。
+    ///
+    /// 这就是 SQLite `OP_Column` 的惰性：不取值就不解码。跳 text/blob 时只读长度
+    /// varint、不碰内容（`r.bytes` 返回的切片被丢弃，只推进游标）。
+    ///
+    /// 为什么它值钱：`SELECT id FROM t` 现在会解码全部列再把没投影的丢掉，
+    /// 而投影结果还要另分配一份 `pflat` 逐行拷贝 —— 实测比 `SELECT *` 还慢 16%
+    /// （14.68M vs 17.51M 行/s，§16.1.20）。按投影解码后 `flat` 直接就是最终布局。
+    pub fn decodeRowProjected(self: *const Schema, dst: []sql.Value, want: []const usize, bytes: []const u8) Error!void {
+        const n = self.columns.len;
+        const bitmap_len = (n + 7) / 8;
+        if (bytes.len < bitmap_len) return error.CorruptRow;
+        if (dst.len != want.len) return error.TypeMismatch;
+        var r = codec.Reader{ .buf = bytes[bitmap_len..] };
+        var wi: usize = 0;
+        for (self.columns, 0..) |col, i| {
+            const is_null = (bytes[i / 8] & (@as(u8, 1) << @intCast(i % 8))) != 0;
+            if (wi < want.len and want[wi] == i) {
+                if (is_null) {
+                    dst[wi] = .null;
+                } else {
+                    dst[wi] = switch (col.col_type) {
+                        .integer, .bigint, .datetime => .{ .integer = @bitCast(try r.u64le()) },
+                        .real, .double => .{ .real = @bitCast(try r.u64le()) },
+                        .boolean => .{ .integer = @intFromBool(try r.u8v() != 0) },
+                        .text, .blob => blk: {
+                            const len: usize = @intCast(try r.varint());
+                            const s = try r.bytes(len);
+                            break :blk if (col.col_type == .text) .{ .text = s } else .{ .blob = s };
+                        },
+                    };
+                }
+                wi += 1;
+                continue;
+            }
+            // 未投影：只前进游标，不解码也不拷贝
+            if (is_null) continue;
+            switch (col.col_type) {
+                .integer, .bigint, .datetime, .real, .double => _ = try r.u64le(),
+                .boolean => _ = try r.u8v(),
+                .text, .blob => {
+                    const len: usize = @intCast(try r.varint());
+                    _ = try r.bytes(len);
+                },
+            }
+        }
+    }
 };
 
 pub fn valueCmp(a: sql.Value, b: sql.Value) std.math.Order {
