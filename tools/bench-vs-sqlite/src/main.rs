@@ -256,6 +256,19 @@ fn main() -> rusqlite::Result<()> {
         let secs = t0.elapsed().as_secs_f64();
         println!("big_put_txn,{},{}", BIG, BIG as f64 / secs);
 
+        // 落盘占用：与 Zig 的 `big_disk_bytes` 对等。
+        //
+        // 先 `wal_checkpoint(TRUNCATE)` 把 WAL 归并回主库 —— 我们那边 flush 完会删掉 WAL，
+        // 不 checkpoint 就是拿「我们已收尾」比「SQLite 未收尾」，不公平。
+        // 统计 db + -wal + -shm 三个文件的实际字节数（不含任何我们的口径换算）。
+        {
+            let _ = c.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+            let fsz = |p: &str| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            let total = fsz(path) + fsz(&format!("{path}-wal")) + fsz(&format!("{path}-shm"));
+            println!("big_disk_bytes,{},{}", BIG, total);
+            println!("big_disk_bytes_row,1,{}", total / BIG as u64);
+        }
+
         // 随机点查
         let t0 = Instant::now();
         let mut hits: i64 = 0;

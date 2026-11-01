@@ -653,6 +653,36 @@ fn benchMain() !void {
             std.debug.print("big_idx_bytes,1,{d}\n", .{(try f.stat(io)).size});
         }
 
+        // **落盘占用**（确定性指标：不依赖计时，一轮即可）。
+        //
+        // 这是 LSM 的已知弱项，此前 20 多轮里**一次都没测过** —— 只知道读写快，
+        // 不知道代价是多少磁盘。SQLite 侧同档输出 `big_disk_bytes`（先做
+        // wal_checkpoint(TRUNCATE)，与我们「flush 后删 WAL」的稳态对齐）。
+        {
+            var total: u64 = 0;
+            {
+                const ip = try alloc.print("{s}/seg/index.bin", .{path6});
+                defer alloc.free(ip);
+                if (dir.openFile(io, ip, .{})) |ff| {
+                    defer ff.close(io);
+                    total += (try ff.stat(io)).size;
+                } else |_| {}
+            }
+            for (t6.segs.items) |s| {
+                const p = try alloc.print("{s}/seg/{d:0>6}.data", .{ path6, s.id });
+                defer alloc.free(p);
+                if (dir.openFile(io, p, .{})) |ff| {
+                    defer ff.close(io);
+                    total += (try ff.stat(io)).size;
+                } else |_| {}
+            }
+            std.debug.print("big_disk_bytes,{d},{d}\n", .{ big_n, total });
+            std.debug.print("big_disk_bytes_row,1,{d}\n", .{total / big_n});
+            // 写放大（千分比）：flush 产出 + 合并重写 ÷ 用户数据量。
+            // 本档不触发自动合并，所以 ≈1000（1.0×）；有合并的档位见 `cm_write_amp_milli`。
+            std.debug.print("big_write_amp_milli,1,{d}\n", .{(t6.flush_bytes_total + t6.compact_bytes_total) * 1000 / @max(1, t6.flush_bytes_total)});
+        }
+
         // 冷重开：默认（索引懒加载）vs 预热（全量读入页缓存）
         {
             t6.deinit();
@@ -1247,6 +1277,10 @@ fn benchMain() !void {
             const cmns = nowNs(io) - tcm;
             std.debug.print("cm_ms,{d},{d:.2}\n", .{ cr.rows, @as(f64, @floatFromInt(cmns)) / 1e6 });
             std.debug.print("cm_segs_after,{d},0\n", .{cr.after});
+            // 注意：这里**不要**算写放大。`kt` 在本轮的反向裁剪 A/B 里被重开过，
+            // `flush_bytes_total` 已经从 0 重新开始，拿它当分母得到的是个假的巨大值
+            // （第一次就是这么错的：分母被 `@max(1, …)` 兜成 1）。
+            // 写放大的可信口径在 §16.1.7（按 `compact_after_segs` 阈值 4/8/16 实测）。
         }
 
         // 合并成单段后再遍历一次（与 cm_count_before 完全同口径）

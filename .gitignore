@@ -20,7 +20,8 @@ tools/bench-vs-sqlite/*.db-wal
 tools/bench-vs-sqlite/*.db-shm
 
 # 基准产物（SQLite 对照工具在工作目录生成的库文件）
-/bench-sqlite.db
-/bench-sqlite.db-wal
-/bench-sqlite.db-shm
-/bench-zig.db*
+# 注意：工具用的是 `bench-sqlite.db` / `bench-big.db` / `bench-conc*.db` 等多个名字，
+# 一条通配比逐个列举可靠（2026-11-01 就因为只挡了 tools/ 下的前缀，把 82MB 的大库提交了）。
+/bench-*.db
+/bench-*.db-wal
+/bench-*.db-shm
