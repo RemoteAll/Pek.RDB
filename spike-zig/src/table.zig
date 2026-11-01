@@ -215,6 +215,19 @@ pub const Table = struct {
     /// 是**确定性量**：不受磁盘/CPU 噪声影响，比计时可靠得多。
     /// 失败的合并不计入（它没产出可用段）。
     compact_bytes_total: u64 = 0,
+    /// 累计花在 `wal.sync()`（fsync）上的纳秒数。
+    ///
+    /// 为什么要这个：7 轮交替配对里写指标偶发**整轮崩塌**（`big_put` 1.33M → 238K），
+    /// 而同轮读指标完全正常 —— 只看总吞吐只能看到「这一轮慢」，看不出慢在哪一段。
+    /// 把 fsync 与段 flush 分开计时，才能判定是「周期 fsync 抖动」还是「段落盘抖动」，
+    /// 否则任何优化都只能靠猜。
+    ns_wal_sync: u64 = 0,
+    /// 累计花在 `flush()`（段落盘 + 索引追加）上的纳秒数。
+    ns_flush: u64 = 0,
+    /// `flush()` 被调用次数（含 `put` 触发的与显式调用的）。
+    flush_calls: u64 = 0,
+    /// 单次 `flush()` 最长耗时（纳秒）：尾部抖动的直接证据。
+    ns_flush_max: u64 = 0,
     /// 扫描/归并**实际产出**的行数（累计）。
     /// 确定性指标：用来证明「LIMIT 提前终止」真的没白读，而不是靠计时猜。
     scan_rows_read: u64 = 0,
@@ -374,6 +387,12 @@ pub const Table = struct {
         self.* = undefined;
     }
 
+    /// 单调纳秒时钟（`Table` 内部计时用；不依赖外部注入）。
+    inline fn nowNs(self: *Table) u64 {
+        const ts = std.Io.Timestamp.now(self.io, .awake);
+        return @intCast(ts.nanoseconds);
+    }
+
     pub fn put(self: *Table, key: []const u8, value: []const u8) !void {
         self.seq += 1;
         const seq = self.seq;
@@ -382,7 +401,9 @@ pub const Table = struct {
         self.visible = seq;
         self.pending += 1;
         if (self.opts.wal_sync_every > 0 and self.pending >= self.opts.wal_sync_every) {
+            const t_sync = self.nowNs();
             try self.wal.sync();
+            self.ns_wal_sync += self.nowNs() - t_sync;
             self.pending = 0;
         }
         if (self.mem.sizeBytes() >= self.opts.flush_bytes) try self.flush();
@@ -439,6 +460,13 @@ pub const Table = struct {
     /// 于是这一次 flush 的耗时可从微秒级变成数百毫秒（200 万行约 0.4–0.7 s）。
     /// 合并失败不影响本次 flush 成功（数据已落盘），错误记在 `auto_compact_error`。
     pub fn flush(self: *Table) !void {
+        const t_flush = self.nowNs();
+        defer {
+            const d = self.nowNs() - t_flush;
+            self.ns_flush += d;
+            self.flush_calls += 1;
+            if (d > self.ns_flush_max) self.ns_flush_max = d;
+        }
         try self.flushImpl();
         self.maybeAutoCompact();
     }

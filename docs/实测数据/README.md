@@ -79,6 +79,29 @@ $dir = '..\docs\实测数据'
 3. **禁止沿用旧数字**：换轮次就重新跑；旧轮次文件保留（可追溯），但文档只引用最新一期。
 4. **异常先查环境**：曾出现 `sql_put` 单轮掉到 1/10（后台编译/杀毒干扰），`git stash` A/B 证明与代码无关。
 
+## 耐久口径（2026-11-01 起，硬性）
+
+**基准一律以 SQLite `synchronous=NORMAL` 为对等档**：所有基准表 `wal_sync_every = 0`
+（不做周期 WAL fsync；**段 flush 仍逐段 fsync**，严格程度仍高于 SQLite NORMAL）。
+`big_put_strong`（`wal_sync_every=10_000`）只作「开强耐久要付多少」的参考行，**不参与 vs-SQLite 判定**。
+对照表与实测数据见 `docs/架构设计.md` §16.1.31。
+
+**2026-11-01 及以前的批次**（`p7` 及更早）用的是 `wal_sync_every=10_000`，与 SQLite 不同口径，
+写指标不可直接引用；口径对齐后的正式批次是 **`p8` / `p9`**。
+
+### 写路径分解可观测项
+
+`spike-bench` 额外输出两行，专门用来定位「整轮写崩」发生在哪一段：
+
+| 指标 | 第 2 列 | 第 3 列 |
+|---|---|---|
+| `big_put_breakdown` | `ns_wal_sync`（累计 WAL fsync 纳秒） | `ns_flush`（累计段 flush 纳秒） |
+| `big_put_flushmax` | `flush_calls`（flush 次数） | `ns_flush_max`（**单次** flush 最长纳秒） |
+| `big_put_strong_breakdown` | 同上，强耐久档 | 同上，强耐久档 |
+
+实测：正常 `ns_flush_max` ≈ 22ms；出问题的轮次会到 **203ms（10 倍）**，同时整体吞吐掉 3–6 倍。
+**见到 `big_put` 环比掉一半以上，先看这两行再怀疑算法。**
+
 ## 要不要 git 过滤？（结论：**不要**，2026-11-01 定）
 
 用户问过「实时数据不用 git 过滤吗？」。结论是**这些 CSV 必须进 git**，因为它们是**证据**不是产物：
