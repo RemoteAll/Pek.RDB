@@ -259,6 +259,22 @@ fn main() -> rusqlite::Result<()> {
         let secs = t0.elapsed().as_secs_f64();
         println!("big_scan,{},{}", count, count as f64 / secs);
 
+        // 纯遍历计数（不取值）。与上面 big_scan 的差别只是样本从 1 万行放大到 50 万行 ——
+        // 1 万行的绝对耗时 <1µs，测的是固定开销而非扫描能力。
+        {
+            let t0 = Instant::now();
+            let mut n: usize = 0;
+            {
+                let mut stmt = c.prepare("SELECT id FROM t WHERE id >= 0 AND id < 500000")?;
+                let mut rows = stmt.query([])?;
+                while rows.next()?.is_some() {
+                    n += 1;
+                }
+            }
+            let secs = t0.elapsed().as_secs_f64();
+            println!("big_count,{},{}", n, n as f64 / secs);
+        }
+
         drop(c);
 
         let t0 = Instant::now();

@@ -96,7 +96,11 @@ $pairs = @(
     # 超内存数据集（200 万行）
     [pscustomobject]@{ Name = '超内存写 200 万行';        Zig = 'big_put';        Lite = 'big_put_txn'; Unit = '行/s'; Higher = $true },
     [pscustomobject]@{ Name = '超内存点查';               Zig = 'big_get';        Lite = 'big_get';     Unit = '次/s'; Higher = $true },
-    [pscustomobject]@{ Name = '超内存范围扫描（仅 key）'; Zig = 'big_scan_refs';  Lite = 'big_scan';    Unit = '行/s'; Higher = $true },
+    # 超内存扫描两档。**必须分开**（同 §16.1.10 的教训：先比「做的工作是否相同」）：
+    #   - big_scan_refs 是「我们收集 1 万条记录到数组」vs「SQLite 只推进游标」，不对等，留档；
+    #   - big_count 是两边都「只数行、不收集不取值」，样本 50 万行，这才是同口径。
+    [pscustomobject]@{ Name = '超内存小范围扫描（我们收集 / SQLite 只推进游标，不对等）'; Zig = 'big_scan_refs'; Lite = 'big_scan'; Unit = '行/s'; Higher = $true },
+    [pscustomobject]@{ Name = '超内存全表遍历（两边都只数行，50 万行）'; Zig = 'big_count'; Lite = 'big_count'; Unit = '行/s'; Higher = $true },
     [pscustomobject]@{ Name = '超内存冷重开';             Zig = 'big_recover';    Lite = 'big_recover'; Unit = 'ms';   Higher = $false },
     # 随机原地 UPDATE（§16.1 达标线：SQLite 强项）。主口径用 SQLite 单事务（最佳形态），逐行 auto 作参考。
     [pscustomobject]@{ Name = '随机原地 UPDATE（vs SQLite 单事务）'; Zig = 'upd_random'; Lite = 'upd_random_txn';  Unit = '次/s'; Higher = $true },

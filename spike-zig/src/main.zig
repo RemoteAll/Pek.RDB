@@ -501,6 +501,24 @@ fn benchMain() !void {
             std.debug.print("big_scan_refs,{d},{d:.0}\n", .{ refs6.items.len, opsPerSec(@intCast(refs6.items.len), ns) });
         }
 
+        // 纯遍历计数（不收集、不复制）：与 SQLite 的 `while rows.next()` 只数行**同口径**。
+        // 上面那档只扫 1 万行，绝对耗时 <1µs，测到的其实是固定开销与计时粒度，
+        // 不足以判断「扫描能力」；这里扫 50 万行，把绝对耗时推进到 ms 级。
+        {
+            var hi6: [16]u8 = @splat(0xFF);
+            var it6 = tablemod.MergeIter{};
+            try it6.init(&t6, &.{}, &hi6);
+            defer it6.deinit();
+            const t0 = nowNs(io);
+            var cnt6: u64 = 0;
+            while (it6.next()) |_| {
+                cnt6 += 1;
+                if (cnt6 >= 500_000) break;
+            }
+            const ns = nowNs(io) - t0;
+            std.debug.print("big_count,{d},{d:.0}\n", .{ cnt6, opsPerSec(cnt6, ns) });
+        }
+
         // 诊断：索引聚合文件大小（现在全部段索引在 seg/index.bin 里）
         {
             const ip = try alloc.print("{s}/seg/index.bin", .{path6});
@@ -892,6 +910,23 @@ fn benchMain() !void {
         try kt.flush();
         std.debug.print("cm_segs_before,{d},0\n", .{kt.segs.items.len});
 
+        // 全表遍历（与 big_count 同口径：只计数、不收集）。
+        // 与下面的 cm_count_after 配对，**同一张表、同一份数据，只差段数** ——
+        // 这是量化「k 路归并代价」最干净的对照。
+        {
+            var hic: [16]u8 = @splat(0xFF);
+            var itc = tablemod.MergeIter{};
+            try itc.init(&kt, &.{}, &hic);
+            defer itc.deinit();
+            const t0 = nowNs(io);
+            var cnt: u64 = 0;
+            while (itc.next()) |_| {
+                cnt += 1;
+                if (cnt >= 500_000) break;
+            }
+            std.debug.print("cm_count_before,{d},{d:.0}\n", .{ cnt, opsPerSec(cnt, nowNs(io) - t0) });
+        }
+
         // 合并前点查
         {
             const t0 = nowNs(io);
@@ -916,6 +951,21 @@ fn benchMain() !void {
             const cmns = nowNs(io) - tcm;
             std.debug.print("cm_ms,{d},{d:.2}\n", .{ cr.rows, @as(f64, @floatFromInt(cmns)) / 1e6 });
             std.debug.print("cm_segs_after,{d},0\n", .{cr.after});
+        }
+
+        // 合并成单段后再遍历一次（与 cm_count_before 完全同口径）
+        {
+            var hic2: [16]u8 = @splat(0xFF);
+            var itc2 = tablemod.MergeIter{};
+            try itc2.init(&kt, &.{}, &hic2);
+            defer itc2.deinit();
+            const t0 = nowNs(io);
+            var cnt: u64 = 0;
+            while (itc2.next()) |_| {
+                cnt += 1;
+                if (cnt >= 500_000) break;
+            }
+            std.debug.print("cm_count_after,{d},{d:.0}\n", .{ cnt, opsPerSec(cnt, nowNs(io) - t0) });
         }
 
         // 合并后点查
