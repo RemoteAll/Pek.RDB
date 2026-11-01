@@ -617,6 +617,124 @@ fn benchMain() !void {
             defer rows_w.deinit();
             std.debug.print("sql_where_rare,{d},{d:.0}\n", .{ rows_w.rows.len, opsPerSec(@intCast(t4.scan_rows_read), ns) });
         }
+        // ---------------------------------------------------------------- 聚合 / GROUP BY
+        //
+        // 用**独立表**（不改 bench_sql 的列数）：加列会改变 sql_full / sql_each 的
+        // 每行字节量，那些历史轮次就没法与新一轮对齐了。
+        // 数据两侧完全一致：id = 0..n-1，g = id % 100000，x = id % 1000。
+        {
+            const path5 = "bench-data-agg";
+            dir.deleteTree(io, path5) catch {};
+            const cols5 = [_]spike.schema.Column{
+                .{ .name = "id", .col_type = .integer, .primary_key = true },
+                .{ .name = "g", .col_type = .integer },
+                .{ .name = "x", .col_type = .integer },
+            };
+            var s5 = try spike.schema.Schema.init(alloc, "bench_agg", &cols5);
+            defer s5.deinit(alloc);
+            var t5 = try tablemod.Table.open(io, dir, path5, alloc, .{ .wal_sync_every = 0 });
+            defer {
+                t5.deinit();
+                dir.deleteTree(io, path5) catch {};
+            }
+
+            const group_card: i64 = 100_000;
+            {
+                // 分批灌数据（不在计时区间内）
+                var bvals: [512][3]spike.sql.Value = undefined;
+                var brows: [512][]spike.sql.Value = undefined;
+                var row_i: u64 = 0;
+                while (row_i < n) {
+                    const cnt: usize = @intCast(@min(@as(u64, 512), n - row_i));
+                    for (0..cnt) |k| {
+                        const id: i64 = @intCast(row_i + k);
+                        bvals[k] = .{
+                            .{ .integer = id },
+                            .{ .integer = @rem(id, group_card) },
+                            .{ .integer = @rem(id, 1000) },
+                        };
+                        brows[k] = &bvals[k];
+                    }
+                    const ins5 = spike.sql.Insert{
+                        .table = "bench_agg",
+                        .columns = &.{ "id", "g", "x" },
+                        .rows = brows[0..cnt],
+                    };
+                    _ = try spike.exec.insertRows(&t5, &s5, ins5, alloc);
+                    row_i += cnt;
+                }
+                t5.flush() catch {};
+            }
+
+            // 落盘占用（确定性指标）：SQLite 侧同档输出 `agg_disk_bytes`。
+            // 读基准里这条很关键 —— 若我们读得更快是因为「表更小」，必须写在明面上。
+            {
+                var total: u64 = 0;
+                {
+                    const ip = try alloc.print("{s}/seg/index.bin", .{path5});
+                    defer alloc.free(ip);
+                    if (dir.openFile(io, ip, .{})) |ff| {
+                        defer ff.close(io);
+                        total += (try ff.stat(io)).size;
+                    } else |_| {}
+                }
+                for (t5.segs.items) |sg| {
+                    const sp = try alloc.print("{s}/seg/{d:0>6}.data", .{ path5, sg.id });
+                    defer alloc.free(sp);
+                    if (dir.openFile(io, sp, .{})) |ff| {
+                        defer ff.close(io);
+                        total += (try ff.stat(io)).size;
+                    } else |_| {}
+                }
+                std.debug.print("agg_disk_bytes,{d},{d}\n", .{ n, total });
+            }
+
+            // GROUP BY g：10 万组
+            {
+                var items_g = [_]spike.sql.SelectItem{
+                    .{ .column = "g" },
+                    .{ .aggregate = .{ .func = .count, .column = null } },
+                    .{ .aggregate = .{ .func = .sum, .column = "x" } },
+                };
+                var gb = [_][]const u8{"g"};
+                const sel_g = spike.sql.Select{
+                    .items = &items_g,
+                    .table = "bench_agg",
+                    .group_by = &gb,
+                };
+                const t0 = nowNs(io);
+                var rows_g = try spike.exec.selectRows(&t5, &s5, sel_g, alloc);
+                const ns = nowNs(io) - t0;
+                defer rows_g.deinit();
+                std.debug.print("sql_group_by,{d},{d:.0}\n", .{ n, opsPerSec(n, ns) });
+                std.debug.print("sql_group_by_groups,{d},0\n", .{rows_g.rows.len});
+                // 确定性校验：两侧算出的 digest 必须一模一样（等价于结果集逐组相同）
+                var digest: i64 = 0;
+                for (rows_g.rows) |r| {
+                    digest +%= r[1].integer *% 1_000_003 +% r[2].integer;
+                }
+                std.debug.print("sql_group_by_digest,{d},{d}\n", .{ rows_g.rows.len, digest });
+            }
+
+            // 全表聚合（无 GROUP BY）：一行结果
+            {
+                var items_a = [_]spike.sql.SelectItem{
+                    .{ .aggregate = .{ .func = .count, .column = null } },
+                    .{ .aggregate = .{ .func = .sum, .column = "x" } },
+                    .{ .aggregate = .{ .func = .min, .column = "x" } },
+                    .{ .aggregate = .{ .func = .max, .column = "x" } },
+                };
+                const sel_a = spike.sql.Select{ .items = &items_a, .table = "bench_agg" };
+                const t0 = nowNs(io);
+                var rows_a = try spike.exec.selectRows(&t5, &s5, sel_a, alloc);
+                const ns = nowNs(io) - t0;
+                defer rows_a.deinit();
+                std.debug.print("sql_agg_full,{d},{d:.0}\n", .{ n, opsPerSec(n, ns) });
+                std.debug.print("sql_agg_cnt,{d},0\n", .{rows_a.rows[0][0].integer});
+                std.debug.print("sql_agg_sum,{d},0\n", .{rows_a.rows[0][1].integer});
+                std.debug.print("sql_agg_minmax,{d},{d}\n", .{ rows_a.rows[0][2].integer, rows_a.rows[0][3].integer });
+            }
+        }
         // 物化成本拆解：把 selectRows 的四个阶段分别计时，**不猜**。
         // 只有知道 61ms 花在哪一段，才知道该优化什么（§16.1.11 的起点）。
         // 本段会重新分配约 136MB，放在 t4 生命周期最后。

@@ -5,7 +5,7 @@
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   body {
-    width:1080px; height:1860px; overflow:hidden;
+    width:1080px; height:2113px; overflow:hidden;
     background:
       radial-gradient(900px 600px at 12% -8%, rgba(56,189,248,.20), transparent 60%),
       radial-gradient(700px 520px at 105% 8%, rgba(167,139,250,.18), transparent 62%),
@@ -70,11 +70,12 @@
   <div class="foot" id="foot"></div>
 
 <script>
-const DATA = {"ahead":19,"behind":0,"rounds":3,"bprRow":63,"bprRowS":4201.37,"bprBatch":43,"bprBatchS":41.2,"bprDelZ":28.8,"bprDelS":415.5,"batchRatio":2.27,"rows":[{"k":"upd_get","z":1233254,"s":152139,"unit":"/s","ratio":8.11},{"k":"upd_random","z":1424566,"s":212229,"unit":"/s","ratio":6.71},{"k":"get","z":946666,"s":145218,"unit":"/s","ratio":6.52},{"k":"sql_get","z":607246,"s":140754,"unit":"/s","ratio":4.31},{"k":"recover","z":0.53,"s":2.09,"unit":"ms","ratio":3.94},{"k":"big_get","z":561966,"s":144364,"unit":"/s","ratio":3.89},{"k":"sql_limit10","z":558659,"s":176057,"unit":"/s","ratio":3.17},{"k":"conc4","z":3659562,"s":1166680,"unit":"/s","ratio":3.14},{"k":"sql_each","z":25722110,"s":9133758,"unit":"/s","ratio":2.82},{"k":"conc2","z":2755871,"s":1295496,"unit":"/s","ratio":2.13},{"k":"big_put","z":1965592,"s":1012332,"unit":"/s","ratio":1.94},{"k":"count_10k","z":30354056,"s":16742084,"unit":"/s","ratio":1.81},{"k":"big_recover","z":0.64,"s":1.07,"unit":"ms","ratio":1.66},{"k":"conc1","z":1743678,"s":1071408,"unit":"/s","ratio":1.63},{"k":"put_batch","z":1497204,"s":917499,"unit":"/s","ratio":1.63},{"k":"big_count","z":25617288,"s":16571803,"unit":"/s","ratio":1.55},{"k":"big_count_range","z":25065628,"s":16834330,"unit":"/s","ratio":1.49},{"k":"scan","z":10789786,"s":8114850,"unit":"/s","ratio":1.33},{"k":"sql_full","z":15564473,"s":14169951,"unit":"/s","ratio":1.1}],"reopen":{"z":0.53,"s":2.09},"disk":{"z":40.92,"s":41.56}};
+const DATA = {"ahead":22,"behind":0,"rounds":3,"bprRow":63,"bprRowS":4201.37,"bprBatch":43,"bprBatchS":41.2,"bprDelZ":28.8,"bprDelS":415.5,"aggDiskZ":33.76,"aggDiskS":14.62,"batchRatio":2.27,"rows":[{"k":"upd_get","z":983489,"s":132527,"unit":"/s","ratio":7.42},{"k":"upd_random","z":1174682,"s":189658,"unit":"/s","ratio":6.19},{"k":"get","z":888802,"s":145587,"unit":"/s","ratio":6.1},{"k":"recover","z":0.44,"s":2.19,"unit":"ms","ratio":4.97},{"k":"big_get","z":569814,"s":140327,"unit":"/s","ratio":4.06},{"k":"sql_get","z":581094,"s":144705,"unit":"/s","ratio":4.02},{"k":"conc4","z":3956362,"s":1241977,"unit":"/s","ratio":3.19},{"k":"big_put","z":1888916,"s":649068,"unit":"/s","ratio":2.91},{"k":"sql_limit10","z":464167,"s":159242,"unit":"/s","ratio":2.91},{"k":"sql_each","z":26030383,"s":9581298,"unit":"/s","ratio":2.72},{"k":"conc2","z":2592800,"s":1255794,"unit":"/s","ratio":2.06},{"k":"big_recover","z":0.62,"s":1.18,"unit":"ms","ratio":1.92},{"k":"put_batch","z":1751286,"s":929955,"unit":"/s","ratio":1.88},{"k":"count_10k","z":28515070,"s":15409516,"unit":"/s","ratio":1.85},{"k":"conc1","z":1744862,"s":994793,"unit":"/s","ratio":1.75},{"k":"big_count_range","z":25412337,"s":16147794,"unit":"/s","ratio":1.57},{"k":"big_count","z":24935890,"s":16433694,"unit":"/s","ratio":1.52},{"k":"sql_group_by","z":6585482,"s":4673785,"unit":"/s","ratio":1.41},{"k":"sql_agg_full","z":18091348,"s":13592877,"unit":"/s","ratio":1.33},{"k":"scan","z":10277752,"s":8624789,"unit":"/s","ratio":1.19},{"k":"scan_refs","z":10094224,"s":8754232,"unit":"/s","ratio":1.15},{"k":"sql_full","z":15186460,"s":14229341,"unit":"/s","ratio":1.07}],"reopen":{"z":0.44,"s":2.19},"disk":{"z":40.92,"s":41.56}};
 const LABELS = {
   put:'逐行写入（组提交档・我方 256KB 缓冲）', put_sync:'逐行写入（逐行落盘档・与 SQLite 同档）', sql_put:'逐行写入（SQL 层）',
   sql_limit10:'SQL 取 10 行（LIMIT）', sql_each:'SQL 全表流式解两列', sql_get:'SQL 主键点查',
   sql_full:'SQL 全表把结果取回（物化）',
+    sql_group_by:'GROUP BY 分组聚合（10 万组）', sql_agg_full:'全表聚合 COUNT/SUM/MIN/MAX',
   upd_get:'更新后点查', upd_random:'随机更新 10 万行', del_100k:'删除 10 万行（一次提交）', get:'主键点查',
   conc1:'并发写 1 线程', conc4:'并发写 4 线程', big_get:'超内存点查（25 段）', big_put:'超内存批量写 200 万行',
   conc2:'并发写 2 线程', put_batch:'单事务批量写', count_10k:'范围扫描（只数行）',
@@ -111,6 +112,7 @@ document.getElementById('foot').innerHTML =
   '口径完全对齐（一次提交 N 行，我方 <b>' + DATA.bprBatch + ' B/行</b> vs SQLite <b>' + DATA.bprBatchS + ' B/行</b>）时，批量写领先 <b>' + DATA.batchRatio + '×</b>。<br>' +
   '<b>删除 10 万行</b>也不进表：我方 <b>' + DATA.bprDelZ + ' B/行</b> vs SQLite <b>' + DATA.bprDelS + ' B/行</b>（写放大 14×），同理只作写放大参考；' +
   '而且我方删除是<b>墓碑</b>，空间要等 compaction 才回收（成本延后，不是立即释放）。<br>' +
+        '<b>GROUP BY / 全表聚合</b>两项我方每行落盘 <b>' + DATA.aggDiskZ + ' B</b> vs SQLite <b>' + DATA.aggDiskS + ' B</b>（多 2.3×），读得更多却仍更快 —— 不是「读得少」换来的。<br>' +
   '冷重开 100 万行 <b>' + DATA.reopen.z.toFixed(2) + ' ms</b> vs <b>' + DATA.reopen.s.toFixed(2) + ' ms</b>' +
   '；磁盘 <b>' + DATA.disk.z.toFixed(2) + ' B/行</b> vs <b>' + DATA.disk.s.toFixed(2) + ' B/行</b>（越低越好）。<br>' +
   '另有未达「每轮全胜」的项不计入本表（原始值仍在 CSV 里，可逐轮复核）。';

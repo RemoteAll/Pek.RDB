@@ -81,9 +81,9 @@ function Samples([string]$side, [string]$metric) {
 # tools\abba-verdict.ps1: the verdict tool reports every pairing, while the card only
 # counts same-criteria ones (see the note below).
 #
-# 故意**不**把 `put` / `sql_put` / `del_100k` 放进来：这三项都是跨口径（字节量差
-# 67× / 67× / 14×），按「口径一样」四条不得计入「全胜」数，否则页顶数字就与
-# 表内条目对不上、也违背了第七十九/八十节的结论。
+# put / sql_put / del_100k are DELIBERATELY excluded: all three are cross-criteria
+# (bytes per row differ by 67x / 67x / 14x). Counting them would inflate the headline
+# and contradict the write-amplification findings (decision log sections 79-80).
 $defs = @(
     @('put_batch', 'put_batch', 'put_txn', '/s', $true),
     @('get', 'get', 'get', '/s', $true),
@@ -92,8 +92,12 @@ $defs = @(
     @('scan_refs', 'scan_refs', 'scan_big_collect', '/s', $true),
     @('sql_each', 'sql_each', 'sql_full_touch', '/s', $true),
     @('sql_limit10', 'sql_limit10', 'sql_limit10', '/s', $true),
-    # SQL 点查：两边走 SQL 接口 + 同一 xorshift64 主键序列（不是存储 API 的 get）。
-    # p13 及之前 SQLite 侧没有这个探针，会自动跳过。
+    # aggregate / GROUP BY (same table, same SQL, per-group digest cross-check)
+    @('sql_group_by', 'sql_group_by', 'sql_group_by', '/s', $true),
+    @('sql_agg_full', 'sql_agg_full', 'sql_agg_full', '/s', $true),
+    # SQL point lookup: both sides go through the SQL interface with the same
+    # xorshift64 key sequence (not the storage-level get).
+    # p13 and earlier had no such probe on the SQLite side; it is skipped automatically.
     @('sql_get', 'sql_get', 'sql_get', '/s', $true),
     @('sql_full', 'sql_full', 'sql_full', '/s', $true),
     @('conc1', 'conc_put_1t', 'conc_put_1t_txn', '/s', $true),
@@ -115,17 +119,18 @@ $defs = @(
 # Row-by-row writes ('put', 'sql_put') are deliberately EXCLUDED: SQLite's WAL is
 # page-granular, so one autocommit INSERT ships a whole 4096B page while we ship
 # ~63B. The resulting 51.7x / 9.96x measures write amplification, not engine
-# speed (see docs/决策记录.md 七十九). Showing them as "we are faster" is exactly
+# speed (see docs/architecture design section 16.1.36). Showing them as "we are faster" is exactly
 # the cross-criteria claim the user rejected.
 $show = @('upd_get', 'upd_random', 'get', 'big_get', 'sql_limit10', 'sql_each', 'sql_get',
+          'sql_group_by', 'sql_agg_full',
           'big_put', 'conc4', 'conc2', 'conc1', 'put_batch', 'count_10k',
           'big_count', 'big_count_range', 'scan', 'scan_refs', 'sql_full',
           'recover', 'big_recover')
 
 # Chinese labels live in the UTF-8 HTML template (this file must stay ASCII).
 
-# 实际存在几轮？ `-Rounds` 只是上限，不能直接当分母用：
-# 用它当分母会印出「每项 5/5 轮」而实际只跑了 3 轮 —— 那是凭空放大的分母。
+# How many rounds actually exist? -Rounds is only an upper bound, never a denominator:
+# using it printed "each metric 5/5 rounds" for a 3-round batch, i.e. a fabricated denominator.
 $actualRounds = 0
 for ($r = 1; $r -le $Rounds; $r++) {
     $zf = Join-Path $DataDir "zig-$Date-$Tag-run$r-a.csv"
@@ -185,8 +190,8 @@ foreach ($d in $defs) {
 
     $rows += [pscustomobject]@{
         k     = $key
-        # ms 类指标必须保留小数：recover 实测 0.44ms，按 0 位取整会显示成 0.00ms，
-        # 看起来像造假（而且 2.02x 的两边都显示 1.00ms）。
+        # ms metrics must keep decimals: recover is 0.44ms, rounding to 0 shows 0.00ms
+        # and looks like the numbers were invented (both sides showing 1.00ms).
         z     = if ($unit -eq 'ms') { [math]::Round($zm, 2) } else { [math]::Round($zm, 0) }
         s     = if ($unit -eq 'ms') { [math]::Round($sm, 2) } else { [math]::Round($sm, 0) }
         unit  = $unit
@@ -209,9 +214,16 @@ if ($bprBatch) { $bprBatch = [math]::Round($bprBatch / 1000000.0, 1) }
 $bprRowS = Read-WalBytes $HS 'wal_bytes_per_row'
 $bprBatchS = Read-WalBytes $HS 'wal_bytes_per_row_txn'
 $bprDelS = Read-WalBytes $HS 'wal_bytes_per_row_del'
-# 我方删除每行字节量：p17 批的 del_wal_bytes / 删除行数
+# bytes written per row by our DELETE (del_wal_bytes / rows deleted, from the batch CSV)
 $delZRaw = Read-Metric (Join-Path $DataDir "zig-$Date-$Tag-run1-a.csv") 'del_wal_bytes'
 $bprDelZ = if ($delZRaw) { [math]::Round($delZRaw / 100000.0, 1) } else { $null }
+
+# bytes written per row for the aggregate probes: GROUP BY is a READ benchmark, so
+# "we read less" is exactly what we must not be vague about. Both values come from CSVs.
+$aggDiskZ = Read-Metric (Join-Path $DataDir "zig-$Date-$Tag-run1-a.csv") 'agg_disk_bytes'
+$aggDiskS = Read-Metric (Join-Path $DataDir "sqlite-$Date-$Tag-run1-a.csv") 'agg_disk_bytes'
+if ($aggDiskZ) { $aggDiskZ = [math]::Round($aggDiskZ / 1000000.0, 2) }
+if ($aggDiskS) { $aggDiskS = [math]::Round($aggDiskS / 1000000.0, 2) }
 
 # Batch-vs-batch paired ratio (same transaction scope AND same bytes/row).
 # Rounds where the bare-write probe collapsed are A(env) and are excluded -- but
@@ -244,8 +256,8 @@ $sPerRow = $sdisk / 2000000.0
 $payload = [pscustomobject]@{
     ahead      = $aheadTotal
     behind     = 0
-    # 分母取「所有全胜项里最少的那个轮数」，不取参数：
-    # 只要有一项只有 3 轮，就不能写 5/5。
+    # denominator = the smallest round count among all-win metrics, never the parameter:
+    # one metric with only 3 rounds means we must not print 5/5.
     rounds     = if ($denoms.Count -gt 0) { ($denoms | Measure-Object -Minimum).Minimum } else { $actualRounds }
     bprRow     = $bprRow
     bprRowS    = $bprRowS
@@ -253,6 +265,8 @@ $payload = [pscustomobject]@{
     bprBatchS  = $bprBatchS
     bprDelZ    = $bprDelZ
     bprDelS    = $bprDelS
+    aggDiskZ   = $aggDiskZ
+    aggDiskS   = $aggDiskS
     batchRatio = $batchRatio
     rows       = @($rows | Sort-Object -Property ratio -Descending)
     reopen = [pscustomobject]@{ z = [math]::Round($zr, 2); s = [math]::Round($sr, 2) }
@@ -261,9 +275,16 @@ $payload = [pscustomobject]@{
 
 $tpl = Get-Content (Join-Path $PSScriptRoot 'share-card-template.html') -Raw -Encoding UTF8
 $json = $payload | ConvertTo-Json -Depth 6 -Compress
-$html = $tpl.Replace('__DATA__', $json)
+
+# Canvas height must follow the row count: with a fixed 1860 a 22-row card clips the
+# footer, and the footer carries the write-amplification disclosures (clipping hides them).
+# 19 rows <-> 1860px is the calibrated point; ~46px per extra row plus 115px spare.
+$canvasH = 1860
+if ($rows.Count -gt 19) { $canvasH = 1860 + ($rows.Count - 19) * 46 + 115 }
+
+$html = $tpl.Replace('__DATA__', $json).Replace('__CANVAS_H__', "$canvasH")
 [System.IO.File]::WriteAllText($OutHtml, $html, (New-Object System.Text.UTF8Encoding $false))
-Write-Host "html -> $OutHtml  (rows=$($rows.Count), excluded=$behind)"
+Write-Host "html -> $OutHtml  (rows=$($rows.Count), excluded=$behind, height=$canvasH)"
 
 $edge = 'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe'
 if (-not (Test-Path $edge)) { $edge = 'C:\Program Files\Google\Chrome\Application\chrome.exe' }
@@ -271,7 +292,7 @@ if (-not (Test-Path $edge)) { Write-Host 'no headless browser found; keep the HT
 
 $uri = 'file:///' + ($OutHtml -replace '\\', '/')
 & $edge --headless=new --disable-gpu --hide-scrollbars --force-device-scale-factor=1 `
-    --window-size=1080,1860 --screenshot=$OutPng $uri 2>$null | Out-Null
+    --window-size=1080,$canvasH --screenshot=$OutPng $uri 2>$null | Out-Null
 if (Test-Path $OutPng) {
     $kb = [math]::Round((Get-Item $OutPng).Length / 1KB, 1)
     Write-Host "png  -> $OutPng  ($kb KB)"

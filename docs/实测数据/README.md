@@ -113,6 +113,22 @@ SQLite 的 WAL 是**页粒度**：逐行 autocommit 时，一行 40 字节的数
 跨 WAL 轮换累计 —— 用 `Wal.written` 会在中途段 flush 后归零，读出偏小的假数）。
 详见 `docs/架构设计.md` §16.1.36 与 `docs/决策记录.md` 七十九。
 
+## 读基准的额外要求：结果集必须逐组对得上（2026-11-01 起）
+
+写指标看字节量，**读指标看结果**。聚合 / GROUP BY 这类「把 N 行压成 M 行」的查询，
+如果两边分组语义有偏差（NULL 是否计入、整数/浮点混算、MIN/MAX 忽略 NULL 的规则），
+吞吐再接近也没有意义。所以：
+
+- 两侧同一条 SQL、同一张逻辑表（1,000,000 行：`id` 0..n−1、`g = id % 100000`、`x = id % 1000`），
+  物理形态各自最优（我方每表一个目录 / SQLite 独立库文件 `bench-agg.db`）；
+- **两侧都把结果集全部取出来算一个 digest**：`Σ(count × 1000003 + sum)`，
+  以及 `sql_agg_cnt` / `sql_agg_sum` / `sql_agg_minmax` 三行单值；
+  这些是确定性指标，**必须逐项相等**才允许把吞吐写进对比表（实测 `p18`：全部一致）；
+- **同时报 `agg_disk_bytes`（每行落盘字节）**：读基准里「读得少」是真实优势，
+  但不能混进「引擎更快」里 —— 我方 33.76 B/行 vs SQLite 侧由 CSV 实测值给出；
+- 指标：`sql_group_by`（10 万组，单位「行/秒」= 扫描行数 ÷ 耗时）、
+  `sql_agg_full`（全表 COUNT/SUM/MIN/MAX，1 行结果）。
+
 ## 耐久口径（2026-11-01 起，硬性）
 
 **基准一律以 SQLite `synchronous=NORMAL` 为对等档**：所有基准表 `wal_sync_every = 0`
@@ -233,6 +249,7 @@ powershell -File tools\abba-verdict.ps1 -Tag <标签> -Date <日期>
 
 | 批次 | 内容 |
 |---|---|
+| `zig/sqlite-2026-11-01-p18` | **SQL 聚合 / GROUP BY 首次实测**（3 轮 ABBA）：`sql_group_by` 1.547×、`sql_agg_full` 1.306×；全批 26 胜 / 0 负 / **0 未决**；两侧 digest 与单值校验项全部相等；落盘 33.76 vs 14.62 B/行（我方多 2.31×） |
 | `zig/sqlite-2026-11-01-pfxblk2` + `zig-…-scan10k` | 块内前缀压缩后的同批全量对比：磁盘 40.92 vs 41.56 B/行；21/24 可判定、0 落后 |
 | `zig/sqlite-2026-11-01-p7` | **7 轮交替配对**（zig/sqlite 相邻测量），用于 `big_write` 的符号检验 |
 | `zig/sqlite-2026-11-01-full` | 第 6 轮审计后的同批全量复核 |

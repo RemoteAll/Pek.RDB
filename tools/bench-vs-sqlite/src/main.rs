@@ -571,6 +571,77 @@ fn main() -> rusqlite::Result<()> {
             println!("sql_full_touch,{},{}", n, n as f64 / secs);
             println!("sql_full_touch_acc,{},{}", n, acc);
         }
+
+        // 聚合 / GROUP BY：与 Zig 侧 `sql_group_by` / `sql_agg_full` 同数据集
+        // （id = 0..N-1、g = id % 100000、x = id % 1000）。
+        //
+        // 用**独立库文件**：① 不干扰 `t`（加列会改 sql_full / sql_each 的每行字节量，
+        // 历史轮次就没法对齐）；② 能单独量落盘占用（`agg_disk_bytes`），
+        // 因为「读得快」若要归因于「表更小」，两边都得给出字节数。
+        {
+            let agg_db = "bench-agg.db";
+            let agg_wal = "bench-agg.db-wal";
+            let agg_shm = "bench-agg.db-shm";
+            for p in [agg_db, agg_wal, agg_shm] {
+                let _ = std::fs::remove_file(p);
+            }
+            let ca = Connection::open(agg_db)?;
+            ca.pragma_update(None, "journal_mode", "WAL")?;
+            ca.pragma_update(None, "synchronous", "NORMAL")?;
+            ca.execute_batch("CREATE TABLE agg(id INTEGER PRIMARY KEY, g INTEGER, x INTEGER)")?;
+            {
+                // 灌数据不计时（与 Zig 侧一致：那是准备，不是被测行为）
+                ca.execute_batch("BEGIN")?;
+                {
+                    let mut stmt = ca.prepare("INSERT INTO agg(id, g, x) VALUES (?1, ?2, ?3)")?;
+                    for i in 0..N {
+                        stmt.execute(params![i, i % 100_000, i % 1_000])?;
+                    }
+                }
+                ca.execute_batch("COMMIT")?;
+            }
+            // 落盘占用：checkpoint 后取文件大小（与 Zig「flush 后 WAL 归零」的稳态对齐）
+            ca.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+            // io::Error 不能 `?` 成 rusqlite::Error（两边错误类型不同），显式取默认值
+            let agg_bytes = std::fs::metadata(agg_db).map(|m| m.len()).unwrap_or(0);
+            println!("agg_disk_bytes,{},{}", N, agg_bytes);
+
+            // GROUP BY g：10 万组
+            {
+                let t0 = Instant::now();
+                let mut groups: usize = 0;
+                let mut digest: i64 = 0;
+                {
+                    let mut stmt = ca.prepare("SELECT g, COUNT(*), SUM(x) FROM agg GROUP BY g")?;
+                    let mut rows = stmt.query([])?;
+                    while let Some(r) = rows.next()? {
+                        let cnt: i64 = r.get(1)?;
+                        let sum: i64 = r.get(2)?;
+                        digest = digest.wrapping_add(cnt.wrapping_mul(1_000_003).wrapping_add(sum));
+                        groups += 1;
+                    }
+                }
+                let secs = t0.elapsed().as_secs_f64();
+                println!("sql_group_by,{},{}", N, N as f64 / secs);
+                println!("sql_group_by_groups,{},0", groups);
+                println!("sql_group_by_digest,{},{}", groups, digest);
+            }
+
+            // 全表聚合（无 GROUP BY）
+            {
+                let t0 = Instant::now();
+                let (cnt, sum, min, max): (i64, i64, i64, i64) = ca.query_row(
+                    "SELECT COUNT(*), SUM(x), MIN(x), MAX(x) FROM agg",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )?;
+                let secs = t0.elapsed().as_secs_f64();
+                println!("sql_agg_full,{},{}", N, N as f64 / secs);
+                println!("sql_agg_cnt,{},0", cnt);
+                println!("sql_agg_sum,{},0", sum);
+                println!("sql_agg_minmax,{},{}", min, max);
+            }
+        }
         drop(c3);
     }
 

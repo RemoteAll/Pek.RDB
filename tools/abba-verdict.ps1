@@ -53,6 +53,10 @@ $pairs = @(
     @('sql_each', 'sql_full_touch', $true),
     # LIMIT 提前终止：两边都是 `SELECT * FROM t LIMIT 10`，我方读到 10 行就停。
     @('sql_limit10', 'sql_limit10', $true),
+    # 聚合：两侧同一张逻辑表（100 万行，id / g=id%100000 / x=id%1000）、同一条 SQL、
+    # 同样把结果集全部取出来算一个 digest（结果一致性另有断言）。
+    @('sql_group_by', 'sql_group_by', $true),
+    @('sql_agg_full', 'sql_agg_full', $true),
     # 以下三项我方是**逐行**写，SQLite 侧用的是**单事务**（它最有利的形态）——
     # 属于**对 SQLite 有利的保守口径**（我方可测值只会更高）。保留是因为 SQLite
     # 没有同量级的逐行变体（200 万行 autocommit 要跑几十秒），且方向不损对方。

@@ -230,6 +230,28 @@ pub const Insert = struct {
 pub const SelectItem = union(enum) {
     star,
     column: []const u8,
+    /// 聚合：`COUNT(*)` / `COUNT(col)` / `SUM(col)` / `AVG(col)` / `MIN(col)` / `MAX(col)`。
+    aggregate: Agg,
+};
+
+/// 聚合函数。只支持这五个；`GROUP BY` 之外用它们时整表当作一个组（SQL 语义）。
+pub const AggFunc = enum {
+    count,
+    sum,
+    avg,
+    min,
+    max,
+
+    /// 规范名（全小写）：既是输出列名的前缀，也是 `ORDER BY` 匹配的键。
+    pub fn name(self: AggFunc) []const u8 {
+        return @tagName(self);
+    }
+};
+
+pub const Agg = struct {
+    func: AggFunc,
+    /// `null` 只允许给 `COUNT(*)`（其余非法的在解析阶段就拒掉）。
+    column: ?[]const u8 = null,
 };
 
 pub const CmpOp = enum { eq, ne, lt, le, gt, ge };
@@ -249,6 +271,8 @@ pub const Select = struct {
     items: []SelectItem,
     table: []const u8,
     where: ?Expr = null,
+    /// `GROUP BY` 列（按书写顺序）；为空且含聚合时整表一个组。
+    group_by: [][]const u8 = &.{},
     order_by: []OrderItem = &.{},
     limit: ?u32 = null,
     offset: ?u32 = null,
@@ -537,16 +561,76 @@ const Parser = struct {
         return .{ .column = column, .op = op, .value = try self.parseValue() };
     }
 
+    fn parseAggFunc(text: []const u8) ?AggFunc {
+        const map = .{
+            .{ "count", AggFunc.count },
+            .{ "sum", AggFunc.sum },
+            .{ "avg", AggFunc.avg },
+            .{ "min", AggFunc.min },
+            .{ "max", AggFunc.max },
+        };
+        inline for (map) |entry| {
+            if (std.ascii.eqlIgnoreCase(text, entry[0])) return entry[1];
+        }
+        return null;
+    }
+
+    /// 一个选择项：`*` / 列名 / 聚合调用。
+    ///
+    /// 聚合的识别方式是「标识符后面紧跟 `(`」—— 与 SQLite 一致（函数名不是关键字）。
+    /// 未知函数名不当作列名硬吞：报 `UnsupportedStatement`，否则
+    /// `SELECT nosuchfunc(x) FROM t` 会被误解析成两列。
+    fn parseSelectItem(self: *Parser) Error!SelectItem {
+        if (self.tok.tag == .star) {
+            try self.advance();
+            return .star;
+        }
+        const name = try self.parseIdent();
+        if (self.tok.tag != .lparen) return .{ .column = name };
+
+        const func = parseAggFunc(name) orelse return error.UnsupportedStatement;
+        try self.advance(); // (
+        var col: ?[]const u8 = null;
+        if (self.tok.tag == .star) {
+            // 只有 COUNT(*) 合法：`SUM(*)` / `AVG(*)` 没有意义
+            if (func != .count) return error.UnsupportedStatement;
+            try self.advance();
+        } else {
+            col = try self.parseIdent();
+        }
+        _ = try self.expectTag(.rparen);
+        return .{ .aggregate = .{ .func = func, .column = col } };
+    }
+
+    /// `ORDER BY` 的排序键：列名或聚合表达式。
+    ///
+    /// 聚合表达式归一成与**输出列名**相同的文本（`count(*)` / `sum(x)`），
+    /// 这样 `selectGrouped` 排序时只需按列名匹配，不必再写一套表达式比较。
+    fn parseOrderTarget(self: *Parser) Error![]const u8 {
+        const name = try self.parseIdent();
+        if (self.tok.tag != .lparen) return name;
+
+        const func = parseAggFunc(name) orelse return error.UnsupportedStatement;
+        try self.advance(); // (
+        var col: ?[]const u8 = null;
+        if (self.tok.tag == .star) {
+            if (func != .count) return error.UnsupportedStatement;
+            try self.advance();
+        } else {
+            col = try self.parseIdent();
+        }
+        _ = try self.expectTag(.rparen);
+        return if (col) |c|
+            try std.fmt.allocPrint(self.arena, "{s}({s})", .{ func.name(), c })
+        else
+            try std.fmt.allocPrint(self.arena, "{s}(*)", .{func.name()});
+    }
+
     fn parseSelect(self: *Parser) Error!Statement {
         try self.expectKw("select");
         var items: std.ArrayList(SelectItem) = .empty;
         while (true) {
-            if (self.tok.tag == .star) {
-                try self.advance();
-                try items.append(self.arena, .star);
-            } else {
-                try items.append(self.arena, .{ .column = try self.parseIdent() });
-            }
+            try items.append(self.arena, try self.parseSelectItem());
             if (self.tok.tag == .comma) {
                 try self.advance();
                 continue;
@@ -567,11 +651,26 @@ const Parser = struct {
             sel.where = try self.parseExpr();
         }
 
+        if (try self.acceptKw("group")) {
+            try self.expectKw("by");
+            var gb: std.ArrayList([]const u8) = .empty;
+            while (true) {
+                try gb.append(self.arena, try self.parseIdent());
+                if (self.tok.tag == .comma) {
+                    try self.advance();
+                    continue;
+                }
+                break;
+            }
+            sel.group_by = try self.arena.dupe([]const u8, gb.items);
+            gb.deinit(self.arena);
+        }
+
         if (try self.acceptKw("order")) {
             try self.expectKw("by");
             var order: std.ArrayList(OrderItem) = .empty;
             while (true) {
-                var item = OrderItem{ .column = try self.parseIdent() };
+                var item = OrderItem{ .column = try self.parseOrderTarget() };
                 if (try self.acceptKw("desc")) {
                     item.desc = true;
                 } else {
@@ -779,4 +878,41 @@ test "parse update and delete" {
 
 test "unsupported statement rejected" {
     try std.testing.expectError(error.UnsupportedStatement, parse(std.testing.allocator, "WITH x AS (SELECT 1) SELECT * FROM x"));
+}
+
+test "parse group by with aggregates" {
+    var p = try parse(std.testing.allocator,
+        "SELECT g, COUNT(*), SUM(x), AVG(x), MIN(x), MAX(x) FROM t GROUP BY g ORDER BY g DESC LIMIT 3");
+    defer p.deinit();
+    const s = p.stmt.select;
+    try std.testing.expectEqual(@as(usize, 6), s.items.len);
+    try std.testing.expectEqualStrings("g", s.items[0].column);
+    try std.testing.expectEqual(AggFunc.count, s.items[1].aggregate.func);
+    try std.testing.expect(s.items[1].aggregate.column == null); // COUNT(*)
+    try std.testing.expectEqualStrings("x", s.items[2].aggregate.column.?);
+    try std.testing.expectEqual(AggFunc.avg, s.items[3].aggregate.func);
+    try std.testing.expectEqual(AggFunc.min, s.items[4].aggregate.func);
+    try std.testing.expectEqual(AggFunc.max, s.items[5].aggregate.func);
+    try std.testing.expectEqual(@as(usize, 1), s.group_by.len);
+    try std.testing.expectEqualStrings("g", s.group_by[0]);
+    try std.testing.expect(s.order_by[0].desc);
+    try std.testing.expectEqual(@as(u32, 3), s.limit.?);
+}
+
+test "aggregate without group by parses (whole table = one group)" {
+    var p = try parse(std.testing.allocator, "SELECT COUNT(*) FROM t WHERE x > 1");
+    defer p.deinit();
+    const s = p.stmt.select;
+    try std.testing.expectEqual(@as(usize, 0), s.group_by.len);
+    try std.testing.expectEqual(AggFunc.count, s.items[0].aggregate.func);
+}
+
+test "aggregate syntax errors are rejected, not silently read as columns" {
+    const a = std.testing.allocator;
+    // 未知函数名：不能当成列名吞掉
+    try std.testing.expectError(error.UnsupportedStatement, parse(a, "SELECT nosuchfunc(x) FROM t"));
+    // SUM(*) 没有意义
+    try std.testing.expectError(error.UnsupportedStatement, parse(a, "SELECT SUM(*) FROM t"));
+    // 缺右括号
+    try std.testing.expectError(error.UnexpectedToken, parse(a, "SELECT COUNT(x FROM t"));
 }
