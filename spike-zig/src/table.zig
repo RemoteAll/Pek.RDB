@@ -233,9 +233,13 @@ pub const Table = struct {
         errdefer mem.deinit();
 
         var seq: u64 = 0;
-        var replayed = try walmod.replay(io, dir, wal_path, alloc);
-        defer replayed.deinit();
-        for (replayed.batches.items) |b| {
+        // 一次 open 同时拿到「重放内容」与「追加句柄」——旧代码是 `replay()` 读一次、
+        // `openAppend()` 再开一次，同一个文件两次 open + 两次 stat
+        // （Windows 上单次 open 实测 0.1–0.15ms，冷重开只剩 0.67ms 时占比过半）。
+        var rw = try walmod.openReplay(io, dir, wal_path, alloc);
+        defer rw.replay.deinit();
+        errdefer rw.wal.close();
+        for (rw.replay.batches.items) |b| {
             for (b.ops) |op| {
                 try mem.insert(op.key, b.seq, op.flags, op.value);
             }
@@ -248,7 +252,9 @@ pub const Table = struct {
             t0 = t1;
         }
 
-        const wal = try walmod.Wal.openAppend(io, dir, wal_path, alloc);
+        // open 与 replay 已合并，`wal_open` 恒为 0；字段保留是为了不打断
+        // 基准与文档里已有的分段口径（`big_recover_breakdown_ms`）。
+        const wal = rw.wal;
 
         if (segmod.timing_enabled) {
             const t1 = @as(u64, @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds));
