@@ -4,10 +4,33 @@
 // 结构体尺寸报告：`zig build sizes` 输出 `metric,item,bytes`，供嵌入式 RAM 预算核算。
 // 注意：这里报的是**类型布局实测值**（@sizeOf，编译期真实计算），不是估算。
 const std = @import("std");
+const builtin = @import("builtin");
 const spike = @import("pek_rdb_spike");
 
 fn row(name: []const u8, bytes: usize) void {
     std.debug.print("sizeof,{s},{d}\n", .{ name, bytes });
+}
+
+// **编译期守门**：只做 `@sizeOf` 不会分析函数体，于是「某个入口在目标平台上
+// 引入了不可用依赖」这类问题会被完整漏掉（真实踩过：`Table.checkThread` 调
+// `std.Thread.getCurrentId()`，而它在 freestanding 上是 `@compileError`）。
+// 取地址会强迫语义分析。
+//
+// **只对「有 OS」的目标设这道门**：主引擎目前在 freestanding 上还编不了
+// （`std.heap.page_size_min` 未定义，与 `/sizes` 无关、也不是本轮引入），
+// 那是 §16.5 M8 的工作。硬约束 §16.5 目前只对 `m0` 成立 —— 已写入决策记录。
+comptime {
+    if (builtin.os.tag != .freestanding and builtin.os.tag != .uefi and builtin.os.tag != .other) {
+        _ = &spike.table.Table.open;
+        _ = &spike.table.Table.put;
+        _ = &spike.table.Table.putBatch;
+        _ = &spike.table.Table.delete;
+        _ = &spike.table.Table.get;
+        _ = &spike.table.Table.flush;
+        _ = &spike.table.Table.checkpoint;
+        _ = &spike.table.Table.close;
+        _ = &spike.table.Table.compact;
+    }
 }
 
 pub fn main() void {

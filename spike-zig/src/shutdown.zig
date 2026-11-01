@@ -65,16 +65,21 @@ pub fn reset() void {
 }
 
 /// 安装退出信号处理器（幂等：重复调用不会重复注册）。
+///
+/// **注册失败不置位**：Windows 上 `SetConsoleCtrlHandler` 会返回 0 表示失败，
+/// 此时保留 `installed = false`，调用方修好环境后可以重试。
+/// （旧写法是“先置位再注册”，一旦失败就永远无法重试 —— 而没处理器等于强杀。）
 pub fn install() void {
     if (installed) return;
-    installed = true;
 
     if (comptime builtin.os.tag == .windows) {
         // 返回 0 表示注册失败 —— 不该静默当成功：没有处理器就等于强杀。
         if (kernel32.SetConsoleCtrlHandler(&handleWindowsCtrl, 1) == 0) {
             std.log.err("注册控制台控制处理器失败：进程被 Ctrl+C / 关窗口 / 关机时将直接终止，" ++
                 "WAL 用户态缓冲中未落盘的数据会丢失（wal_buf_bytes 越大丢得越多）", .{});
+            return; // 不置位，允许重试
         }
+        installed = true;
     } else if (comptime has_posix_signals) {
         const posix = std.posix;
         const act: posix.Sigaction = .{
@@ -121,7 +126,41 @@ fn handleWindowsCtrl(ctrl_type: u32) callconv(.winapi) i32 {
 
 // ---------------------------------------------------------------- POSIX
 
-fn handlePosixSignal(_: c_int) callconv(.c) void {
+/// 信号处理器的参数类型 —— 不能硬写 `c_int`。
+///
+/// 0.17 里 `std.posix.SIG` 在 Linux 上是**枚举**（`os.linux.SIG__enum_1`），
+/// 而不是整数；`Sigaction.handler` 的期望类型因此是
+/// `*align(1) const fn (SIG__enum_1) callconv(.c) void`。
+/// 硬写 `c_int` 在 Windows 上永远验不出来（那边走另一分支），**一交叉到 Linux 就报**：
+/// `expected type '... fn (os.linux.SIG__enum_1) ...', found '... fn (c_int) ...'`。
+///
+/// 解包路径（实测得出，不是猜）：
+/// `Sigaction.handler` 是 **C 侧 union**（`os.linux.Sigaction__union_0`，含 `handler` /
+/// `sigaction` 两支，对应 SA_SIGINFO）→ 取 `.handler` → `?sigaction_fn` → 函数 → `params[0]`。
+const SigArg = if (has_posix_signals) sigArgOf(@FieldType(std.posix.Sigaction, "handler")) else c_int;
+
+fn sigArgOf(comptime HandlerField: type) type {
+    const arm: type = switch (@typeInfo(HandlerField)) {
+        .@"union" => @FieldType(HandlerField, "handler"),
+        else => HandlerField,
+    };
+    const maybe_fn: type = switch (@typeInfo(arm)) {
+        .optional => |o| o.child,
+        else => arm,
+    };
+    const fn_type: type = switch (@typeInfo(maybe_fn)) {
+        .pointer => |p| p.child,
+        .@"fn" => maybe_fn,
+        else => @compileError("Sigaction.handler 解不出函数类型：" ++ @typeName(maybe_fn)),
+    };
+    return switch (@typeInfo(fn_type)) {
+        // 0.17：`Fn.params` 已改成 `param_types: []const ?type`（null = 泛型/anytype）
+        .@"fn" => |f| f.param_types[0] orelse c_int,
+        else => @compileError("Sigaction.handler 解不出函数类型：" ++ @typeName(fn_type)),
+    };
+}
+
+fn handlePosixSignal(_: SigArg) callconv(.c) void {
     // async-signal-safe：只置一个原子标志，别的一律不做。
     request();
 }
@@ -147,7 +186,12 @@ test "退出标志：信号处理器置位后主循环能看见（模拟真实�
     if (comptime builtin.os.tag == .windows) {
         try std.testing.expectEqual(@as(i32, 1), handleWindowsCtrl(CTRL_C));
     } else if (comptime has_posix_signals) {
-        handlePosixSignal(2); // SIGINT
+        // 直接调处理器本体（等于「信号到了」）。参数类型随平台变（见 SigArg），
+        // 枚举型 SIG 用 @enumFromInt，整数型照原样传。
+        handlePosixSignal(if (@typeInfo(SigArg) == .@"enum")
+            @as(SigArg, @enumFromInt(2)) // SIGINT
+        else
+            2);
     } else {
         request(); // 无信号平台：只能验标志本身
     }

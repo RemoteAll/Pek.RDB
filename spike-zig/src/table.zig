@@ -2,6 +2,38 @@
 // 个人使用免费；商业使用需商业授权，或同样以 AGPL-3.0 开源（见 LICENSE）。
 const std = @import("std");
 const builtin = @import("builtin");
+
+/// Debug/ReleaseSafe 下才做「单线程」断言；且只在**确实支持 `std.Thread.getCurrentId()`** 的目标上做。
+///
+/// 为什么需要这个开关：`std` 在无 OS 目标（`freestanding` / `uefi` …）上把
+/// `Thread.getCurrentId()` 实现成 **`@compileError`**（`UnsupportedImpl.getCurrentId`），
+/// 于是在那种目标上开启断言会直接编译失败 —— 直接违反 §16.5「C 档无 OS 必须能编译」。
+///
+/// 判据用「白名单 + 默认关」而不是「黑名单 + 默认开」：断言只是开发期辅助，
+/// 认错的代价应当是「少一个检查」，而不是「编译不过」。
+/// 白名单与 `std/Thread.zig` 里 `Thread.Id` 的 `switch` 保持一致。
+const thread_check_supported = std.debug.runtime_safety and switch (builtin.os.tag) {
+    .windows,
+    .linux,
+    .macos,
+    .ios,
+    .tvos,
+    .watchos,
+    .visionos,
+    .maccatalyst,
+    .driverkit,
+    .freebsd,
+    .netbsd,
+    .openbsd,
+    .dragonfly,
+    .haiku,
+    .illumos,
+    .serenity,
+    .wasi,
+    .emscripten,
+    => true,
+    else => false,
+};
 const Skiplist = @import("skiplist.zig").Skiplist;
 const walmod = @import("wal.zig");
 const segmod = @import("segment.zig");
@@ -398,7 +430,7 @@ pub const Table = struct {
             .io = io,
             .dir = dir,
             .alloc = alloc,
-            .owner = std.Thread.getCurrentId(),
+            .owner = if (comptime thread_check_supported) std.Thread.getCurrentId() else 0,
             .base_path = base_path,
             .wal_path = wal_path,
             .index_path = index_path,
@@ -487,9 +519,7 @@ pub const Table = struct {
     /// 这是有意为之：并发写同一张表会 **静默** 抢同一个 seq、并发改 skiplist，
     /// 事后表现得像「数据自己错乱了」，极难定位 —— 宁可开发期直接炸。
     inline fn checkThread(self: *const Table) void {
-        // `std.debug.runtime_safety`：Debug / ReleaseSafe 为 true，ReleaseFast / ReleaseSmall 为 false。
-        // 用它而不是比 `builtin.mode` 的枚举名 —— 后者在 Zig 版本间改过写法（0.17 是小写下划线）。
-        if (comptime !std.debug.runtime_safety) return;
+        if (comptime !thread_check_supported) return;
         if (std.Thread.getCurrentId() != self.owner) {
             @panic("Table 不是线程安全的：检测到非创建线程在操作同一张表（请每线程各开一张表）");
         }

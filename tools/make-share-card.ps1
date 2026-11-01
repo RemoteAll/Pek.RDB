@@ -77,7 +77,9 @@ function Samples([string]$side, [string]$metric) {
 }
 
 # name(latin), zig metric, sqlite metric, unit, higher-is-better
-# FULL list used for the headline count (must match tools\abba-verdict.ps1).
+# This is the FULL list used for the headline count. It is deliberately a SUBSET of
+# tools\abba-verdict.ps1: the verdict tool reports every pairing, while the card only
+# counts same-criteria ones (see the note below).
 #
 # 故意**不**把 `put` / `sql_put` / `del_100k` 放进来：这三项都是跨口径（字节量差
 # 67× / 67× / 14×），按「口径一样」四条不得计入「全胜」数，否则页顶数字就与
@@ -107,7 +109,8 @@ $defs = @(
     @('big_recover', 'big_recover', 'big_recover', 'ms', $false)
 )
 
-# Rows to show on the card (subset). Everything here must be a 5/5 win.
+# Rows to show on the card (subset). Everything here must win EVERY round that
+# actually exists (the denominator is derived from the CSVs, never from -Rounds).
 #
 # Row-by-row writes ('put', 'sql_put') are deliberately EXCLUDED: SQLite's WAL is
 # page-granular, so one autocommit INSERT ships a whole 4096B page while we ship
@@ -121,9 +124,23 @@ $show = @('upd_get', 'upd_random', 'get', 'big_get', 'sql_limit10', 'sql_each', 
 
 # Chinese labels live in the UTF-8 HTML template (this file must stay ASCII).
 
+# 实际存在几轮？ `-Rounds` 只是上限，不能直接当分母用：
+# 用它当分母会印出「每项 5/5 轮」而实际只跑了 3 轮 —— 那是凭空放大的分母。
+$actualRounds = 0
+for ($r = 1; $r -le $Rounds; $r++) {
+    $zf = Join-Path $DataDir "zig-$Date-$Tag-run$r-a.csv"
+    $sf = Join-Path $DataDir "sqlite-$Date-$Tag-run$r-a.csv"
+    if ((Test-Path $zf) -and (Test-Path $sf)) { $actualRounds = $r }
+}
+if ($actualRounds -lt $Rounds) {
+    Write-Host "WARN requested $Rounds rounds but only $actualRounds found (tag=$Tag) -> using $actualRounds"
+}
+if ($actualRounds -eq 0) { Write-Host "no paired CSVs found for tag=$Tag date=$Date"; exit 1 }
+
 $rows = @()
 $aheadTotal = 0
 $behindTotal = 0
+$denoms = @()
 foreach ($d in $defs) {
     $key = $d[0]
     $zs = Samples 'zig' $d[1]
@@ -151,7 +168,8 @@ foreach ($d in $defs) {
 
     $allWin = ($wins -eq $roundRatios.Count)
     if ($allWin) { $aheadTotal++ } else { $behindTotal++ }
-    if (-not $allWin) { Write-Host "NOT 5/5 (excluded from card): $key wins=$wins/$($roundRatios.Count)"; continue }
+    if ($allWin) { $denoms += $roundRatios.Count }
+    if (-not $allWin) { Write-Host "NOT all-win (excluded from card): $key wins=$wins/$($roundRatios.Count)"; continue }
     if ($show -notcontains $key) { continue }
 
     if ($d[4]) {
@@ -226,7 +244,9 @@ $sPerRow = $sdisk / 2000000.0
 $payload = [pscustomobject]@{
     ahead      = $aheadTotal
     behind     = 0
-    rounds     = $Rounds
+    # 分母取「所有全胜项里最少的那个轮数」，不取参数：
+    # 只要有一项只有 3 轮，就不能写 5/5。
+    rounds     = if ($denoms.Count -gt 0) { ($denoms | Measure-Object -Minimum).Minimum } else { $actualRounds }
     bprRow     = $bprRow
     bprRowS    = $bprRowS
     bprBatch   = $bprBatch
