@@ -1458,6 +1458,125 @@ fn benchMain() !void {
         std.debug.print("recdec_bytes,{d},{d}\n", .{ old_buf.items.len, new_buf.items.len });
     }
 
+    // **假设性实验：块内 key 前缀压缩值不值得做**（§16.1.27）。
+    //
+    // 现在的行是零拷贝的：`key` / `value` 直接是 mmap 里的切片，一格不碰。
+    // 前缀压缩能把 key 从 8 B 压到 ~2 B，但解出来的 key **不再是连续内存** ——
+    // 必须物化到一个缓冲区里。这里不改产品代码，只把「压 + 物化」的代价量出来：
+    // 压缩版缓冲 vs 现有 7 B 头缓冲（都是同一份内容、200k 条、L3 常驻、重复 20 趟）。
+    //
+    // 为什么必须量：§16.1.26 已经踩过一次 —— 只是把 `readRec` 从非 inline 改成 inline、
+    // 把边界检查改成编译器可证明的形状，同一份数据就差了 20%。
+    // 「只是多了一次 memcpy」这种判断在这台机器上从来没准过。
+    {
+        const PN: usize = 200_000;
+        const PREP: usize = 20;
+        var pbuf: std.ArrayList(u8) = .empty;
+        defer pbuf.deinit(alloc);
+        try pbuf.ensureTotalCapacity(alloc, PN * 44);
+        // 同内容的 7 B 定长头版本（对照组），与上一块的 `new_buf` 等价，
+        // 但建在同一个作用域里，两边才能真正配对
+        var plain_buf: std.ArrayList(u8) = .empty;
+        defer plain_buf.deinit(alloc);
+        try plain_buf.ensureTotalCapacity(alloc, PN * 48);
+
+        // 造前缀压缩缓冲：块内第 0 条写整 key，其余写 (pfx, suffix)。
+        // 每行布局：u8 tag | u8 vlen | u32 seq | u8 flags | [u8 pfx,u8 slen | suffix] 或 [key]
+        // tag = 0xFE 表示压缩。
+        {
+            var prev: [8]u8 = @splat(0);
+            var i: usize = 0;
+            while (i < PN) : (i += 1) {
+                const kb = keyOf(@intCast(i));
+                const seq: u32 = @intCast(i + 1);
+                const block_start = (i % 64 == 0);
+                var pfx: usize = 0;
+                if (!block_start) {
+                    while (pfx < 8 and prev[pfx] == kb[pfx]) pfx += 1;
+                }
+                if (block_start) {
+                    try pbuf.append(alloc, 8);
+                    try pbuf.append(alloc, value.len);
+                    try codec.putU32le(&pbuf, alloc, seq);
+                    try pbuf.append(alloc, 0);
+                    try pbuf.appendSlice(alloc, &kb);
+                } else {
+                    try pbuf.append(alloc, 0xFE);
+                    try pbuf.append(alloc, value.len);
+                    try codec.putU32le(&pbuf, alloc, seq);
+                    try pbuf.append(alloc, 0);
+                    try pbuf.append(alloc, @intCast(pfx));
+                    try pbuf.append(alloc, @intCast(8 - pfx));
+                    try pbuf.appendSlice(alloc, kb[pfx..]);
+                }
+                try pbuf.appendSlice(alloc, &value);
+                {
+                    var hdr: [7 + 30]u8 = undefined;
+                    const hn = codec.writeRecHdr(&hdr, kb.len, value.len, seq, 0);
+                    try plain_buf.appendSlice(alloc, hdr[0..hn]);
+                    try plain_buf.appendSlice(alloc, &kb);
+                    try plain_buf.appendSlice(alloc, &value);
+                }
+                prev = kb;
+            }
+        }
+
+        var kbuf: std.ArrayList(u8) = .empty;
+        defer kbuf.deinit(alloc);
+        try kbuf.ensureTotalCapacity(alloc, 512);
+
+        var round: usize = 0;
+        while (round < 5) : (round += 1) {
+            const order: [2]bool = if (round % 2 == 0) .{ true, false } else .{ false, true };
+            for (order) |use_plain| {
+                const t0 = nowNs(io);
+                var acc: u64 = 0;
+                var total: u64 = 0;
+                var rep: usize = 0;
+                while (rep < PREP) : (rep += 1) {
+                    if (use_plain) {
+                        var pos: usize = 0;
+                        while (codec.readRec(plain_buf.items, pos)) |r| {
+                            acc +%= r.seq +% r.key.len +% r.value.len +% r.key[0] +% r.flags;
+                            pos = r.next;
+                            total += 1;
+                        }
+                    } else {
+                        var pos: usize = 0;
+                        while (pos < pbuf.items.len) {
+                            kbuf.clearRetainingCapacity();
+                            const tag = pbuf.items[pos];
+                            const vlen: usize = pbuf.items[pos + 1];
+                            const seq = std.mem.readInt(u32, pbuf.items[pos + 2 ..][0..4], .little);
+                            const flags = pbuf.items[pos + 6];
+                            var p = pos + 7;
+                            if (tag == 0xFE) {
+                                const pfx: usize = pbuf.items[p];
+                                const slen: usize = pbuf.items[p + 1];
+                                p += 2;
+                                // 物化：保留已有前缀，接上后缀
+                                try kbuf.appendSlice(alloc, pbuf.items[p..][0..slen]);
+                                acc +%= seq +% (pfx + slen) +% vlen;
+                                p += slen;
+                            } else {
+                                try kbuf.appendSlice(alloc, pbuf.items[p..][0..tag]);
+                                acc +%= seq +% @as(u64, tag) +% vlen;
+                                p += tag;
+                            }
+                            acc +%= kbuf.items[0] +% flags;
+                            pos = p + vlen;
+                            total += 1;
+                        }
+                    }
+                }
+                const ns = nowNs(io) - t0;
+                const tag2 = if (use_plain) "plain7" else "pfx";
+                std.debug.print("recdec_{s},{d},{d:.0}\n", .{ tag2, total, opsPerSec(total, ns) });
+            }
+        }
+        std.debug.print("recdec_pfx_bytes,1,{d},{d}\n", .{ plain_buf.items.len, pbuf.items.len });
+    }
+
     std.debug.print("bench_done,1,1\n", .{});
     out.deinit(alloc);
     // threaded.deinit() 会让进程收尾更慢，基准进程直接靠 OS 回收；这里保留但注释说明
