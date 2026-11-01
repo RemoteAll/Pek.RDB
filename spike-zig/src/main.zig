@@ -1176,6 +1176,53 @@ fn benchMain() !void {
             kt.opts.no_concat = false;
         }
 
+        // **反向段裁剪 A/B（§16.1.23）**：范围落在表中段时，起点之前的整段可以整段跳过。
+        //
+        // 每侧都**先关表再重开**，保证两边同样冷（`cursor()` 里每段要 `ensureParsed`
+        // 做整段 CRC + `dataView` 建 mmap，热态下测不出这笔开销）。
+        // 计时只包住 `MergeIter` 的扫描，不含 `Table.open` —— 要量的是「查询前的段准备」。
+        {
+            const rstart = keyOf(1_000_000);
+            const rend = keyOf(1_001_000);
+            var round: usize = 0;
+            while (round < 3) : (round += 1) {
+                const order: [2]bool = if (round % 2 == 0) .{ true, false } else .{ false, true };
+                for (order) |off| {
+                    if (kt_live) {
+                        kt.deinit();
+                        kt_live = false;
+                    }
+                    kt = try tablemod.Table.open(io, dir, kp, alloc, .{
+                        .wal_sync_every = 10_000,
+                        .flush_bytes = 8 << 20,
+                        .no_prune_before = off,
+                    });
+                    kt_live = true;
+
+                    var it = tablemod.MergeIter{};
+                    try it.init(&kt, &rstart, &rend);
+                    const t0 = nowNs(io);
+                    var cnt: u64 = 0;
+                    while (it.next()) |_| cnt += 1;
+                    const ns = nowNs(io) - t0;
+                    const tag = if (off) "off" else "on";
+                    std.debug.print("prune_range_{s},{d},{d:.0}\n", .{ tag, cnt, opsPerSec(cnt, ns) });
+                    // 确定性凭据：剪了几段 / 建了几个游标 / 实际读了几条记录
+                    std.debug.print("prune_pruned_{s},1,{d}\n", .{ tag, kt.merge_pruned_before });
+                    std.debug.print("prune_cursors_{s},1,{d}\n", .{ tag, kt.merge_cursors_built });
+                    std.debug.print("prune_rowsread_{s},1,{d}\n", .{ tag, kt.scan_rows_read });
+                    it.deinit();
+                }
+            }
+            // 复原成后续档位期望的状态
+            if (kt_live) {
+                kt.deinit();
+                kt_live = false;
+            }
+            kt = try tablemod.Table.open(io, dir, kp, alloc, .{ .wal_sync_every = 10_000, .flush_bytes = 8 << 20 });
+            kt_live = true;
+        }
+
         // 合并前点查
         {
             const t0 = nowNs(io);

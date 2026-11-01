@@ -35,6 +35,9 @@ pub const Options = struct {
     /// 有了这个开关就能在**同一进程、同一张表、背靠背交替**跑两种模式，得到配对结论。
     /// 生产路径永远留 false。
     no_concat: bool = false,
+    /// **仅用于基准 A/B**：置 true 时禁用「反向段裁剪」（`maxKey() < start` 的整段跳过）。
+    /// 同样是为了在同进程里拿到配对结论，生产路径永远留 false。
+    no_prune_before: bool = false,
 };
 
 /// 自动 compaction 连续失败上限：到顶就停手，避免每次 flush 都白跑一遍合并。
@@ -203,6 +206,9 @@ pub const Table = struct {
     /// 最近一次 `MergeIter.init` **实际建了几个游标**（段裁剪是否生效的可观测证据）。
     /// 「不裁剪只是慢、结果一样」，只看结果永远看不出裁剪有没有生效 —— 必须有这个计数。
     merge_cursors_built: usize = 0,
+    /// 最近一次 `MergeIter.init` 中因「整段落在查询起点之前」而被跳过的段数。
+    /// 与 `merge_cursors_built` 配对：段数 = 建游标数 + 反向剪掉的 + 正向剪掉的。
+    merge_pruned_before: usize = 0,
     /// 归并累计**比较次数**。确定性指标：它不依赖计时器精度与机器噪声。
     /// 已用它证伪了「k 小改线性」的直觉 —— 见 `MergeIter.compares` 的注释。
     merge_compares_total: u64 = 0,
@@ -729,6 +735,7 @@ pub const MergeIter = struct {
     pub fn init(self: *MergeIter, table: *Table, start: []const u8, end: []const u8) !void {
         self.* = .{ .table = table };
         const alloc = table.alloc;
+        var pruned_before: usize = 0;
         // init 中途失败时要自己清干净：调用方是在 init 成功后才注册 defer deinit 的
         errdefer self.deinit();
         if (table.mem.len() > 0) {
@@ -739,15 +746,27 @@ pub const MergeIter = struct {
             } });
         }
         for (table.segs.items) |*s| {
-            // **段裁剪**：稀疏索引的第 0 条就是段内最小的 key。若它已经排到查询上界之后，
+            // **反向段裁剪**（§16.1.23）：段内最大 key 都小于查询起点 → 整段不可能命中。
+            //
+            // 判据是段头里**精确**的 `maxKey()`（§16.1.22 才加的），不是稀疏索引的近似值 ——
+            // 段头之前就只能剪「段在查询之后」那一侧，因为稀疏索引最后几行没有索引项。
+            //
+            // 收益不只在大表：`s.cursor()` 里每段都要 `ensureParsed()`（整段 CRC）+
+            // `dataView()`（open + mmap，平台成本 ~0.3ms/段）。冷重开后的窄范围查询
+            // 以前要为「一行都不命中」的段付这笔钱，现在是零。
+            if (start.len > 0 and !table.opts.no_prune_before) {
+                if (s.maxKey()) |k1| {
+                    if (segmod.keyCmp(k1, start) == .lt) {
+                        pruned_before += 1;
+                        continue;
+                    }
+                }
+            }
+            // **正向段裁剪**：稀疏索引的第 0 条就是段内最小的 key。若它已经排到查询上界之后，
             // 整段不可能命中，连游标都不必建 —— 建了不用也要付「每行多一路归并」的钱。
             //
             // 实测背景：200 万行、25 段时纯遍历只有 7.26M 行/s，而单段表能到 11–17M；
             // 顺序写入的段 key 范围几乎不重叠，这一刀能砍掉大部分路数。
-            //
-            // 本轮补注（§16.1.22）：段头现在也带 `maxKey()`，「段整体在查询之前」那一侧
-            // **已经可以剪**（判据 `maxKey() < start`），只是还没接上 —— 列为待办，别照着
-            // 旧注释以为做不到。
             if (end.len > 0) {
                 // 用 `firstKey()`（段头部就有，不需要 `ensureParsed`）——
                 // 冷重开只解析头部，裁剪判定的信息已经够了。
@@ -786,6 +805,7 @@ pub const MergeIter = struct {
         // 诊断：本次归并实际建了几个游标。段裁剪有没有生效必须**能观测**，
         // 否则「结果对」不代表「真的剪了整段」（不剪只是慢，结果一样）。
         table.merge_cursors_built = self.cursors.items.len;
+        table.merge_pruned_before = pruned_before;
     }
 
     /// 堆内比较必须用 `refLess`（它含「同 key 时 seq 大的在前」），
@@ -1555,12 +1575,28 @@ test "MergeIter 段裁剪：查询只落在一段内时结果与全量过滤一�
         try t.scanRefs(&lo, &hi, &refs);
 
         // **裁剪是否真的生效**：不裁剪只是慢、结果一样，光看结果看不出来。
-        // 5 段、每段 10 行、段间 key 不重叠：第 i 段的段首 key 是 i*10，
-        // 只有「段首 key < hi」的段需要建游标 —— 即 ceil(hi/10) 段，上限 5。
-        const expect_cursors: usize = @min(@as(usize, 5), (@as(usize, c.hi) + 9) / 10);
+        // 5 段、每段 10 行、段间 key 不重叠 → 第 i 段覆盖 [i*10, i*10+9]。两侧都能剪：
+        //   反向（§16.1.23）：段内最大 key < lo  → 整段在起点之前，跳过；
+        //   正向：            段内最小 key >= hi → 整段在终点之后，跳过。
+        var expect_cursors: usize = 0;
+        var expect_pruned_before: usize = 0;
+        for (0..5) |si| {
+            const kmin = si * 10;
+            const kmax = si * 10 + 9;
+            if (kmax < c.lo) {
+                expect_pruned_before += 1;
+                continue;
+            }
+            if (kmin >= c.hi) continue;
+            expect_cursors += 1;
+        }
         if (t.merge_cursors_built != expect_cursors) {
             std.debug.print("case {d}: 期望建 {d} 个游标，实际 {d} 个\n", .{ ci, expect_cursors, t.merge_cursors_built });
             return error.CursorCountMismatch;
+        }
+        if (t.merge_pruned_before != expect_pruned_before) {
+            std.debug.print("case {d}: 期望反向剪 {d} 段，实际 {d} 段\n", .{ ci, expect_pruned_before, t.merge_pruned_before });
+            return error.PrunedCountMismatch;
         }
 
         const want: usize = blk: {
@@ -1580,4 +1616,114 @@ test "MergeIter 段裁剪：查询只落在一段内时结果与全量过滤一�
             }
         }
     }
+}
+
+test "空字符串 key：两段都含同一个空 key 时必须判「重叠」，不能走顺序拼接" {
+    // 守的是 §16.1.22 引入的一个**歧义**：段头里写的是 `u32 klen + key`，
+    // 空段的 klen 是 0，而「最后一条记录的 key 就是空字符串」的 klen 也是 0。
+    //
+    // 若 `maxKey()` 用 `max_key_len == 0` 判空段，这里两段的 maxKey() 都会返回 null：
+    // `canConcat` 把「前一段是空的」当成事实而 `continue`，最终误判为「可拼接」。
+    // 拼接按段依次产出 → 先吐旧版本 v1、再被 last_key 去重吃掉新版 v2 → **读到陈旧值**。
+    // 修法：判空段用 `rows == 0`（段头里就有，无歧义）。
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-empty-key";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+
+    try t.put("", "v1");
+    try t.flush();
+    try t.put("", "v2");
+    try t.flush();
+    try std.testing.expectEqual(@as(usize, 2), t.segs.items.len);
+
+    // 两段都是 ["" , ""]，真重叠 → 不允许拼接
+    try std.testing.expect(!canConcat(&t));
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    const got = try t.get("", &out);
+    try std.testing.expect(got != null);
+    try std.testing.expectEqualStrings("v2", out.items);
+
+    // 扫描同样只应产出一条，且是新版本
+    var refs: std.ArrayList(segmod.Segment.RefRecord) = .empty;
+    defer refs.deinit(alloc);
+    try t.scanRefs(&.{}, &.{}, &refs);
+    try std.testing.expectEqual(@as(usize, 1), refs.items.len);
+    try std.testing.expectEqualStrings("", refs.items[0].key);
+    try std.testing.expectEqualStrings("v2", refs.items[0].value);
+    // 走的是堆路径（两段真重叠），比较次数不为 0 就是证据
+    try std.testing.expect(t.merge_compares_total > 0);
+}
+
+test "反向段裁剪：范围落在表中段时，起点之前的整段必须被跳过且结果不变" {
+    // §16.1.23：段头 `maxKey()` 让「整段在查询起点之前」也能剪。
+    // 这里除了断言结果一致，还要断言 `merge_pruned_before` —— 不剪只是慢、结果一样，
+    // 光看结果永远看不出裁剪有没有生效。
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-prune-before";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+
+    // 10 段 × 10 行，第 i 段覆盖 [i*10, i*10+9]
+    var seg_i: u8 = 0;
+    while (seg_i < 10) : (seg_i += 1) {
+        var r: u8 = 0;
+        while (r < 10) : (r += 1) {
+            var kb: [8]u8 = @splat(0);
+            kb[7] = seg_i * 10 + r;
+            try t.put(&kb, "v");
+        }
+        try t.flush();
+    }
+    try std.testing.expectEqual(@as(usize, 10), t.segs.items.len);
+
+    var refs: std.ArrayList(segmod.Segment.RefRecord) = .empty;
+    defer refs.deinit(alloc);
+
+    // 只查第 7 段的后半 + 第 8 段：lo=75, hi=85
+    var lo: [8]u8 = @splat(0);
+    lo[7] = 75;
+    var hi: [8]u8 = @splat(0);
+    hi[7] = 85;
+    try t.scanRefs(&lo, &hi, &refs);
+
+    // 期望：反向剪掉第 0..6 段（maxKey 9,19,...,69 都 < 75）共 7 段，
+    // 正向剪掉第 9 段（段首 90 >= 85），实际建 2 个游标。
+    try std.testing.expectEqual(@as(usize, 7), t.merge_pruned_before);
+    try std.testing.expectEqual(@as(usize, 2), t.merge_cursors_built);
+    try std.testing.expectEqual(@as(usize, 10), refs.items.len);
+    for (refs.items, 0..) |r, i| {
+        try std.testing.expectEqual(@as(u8, 75 + @as(u8, @intCast(i))), r.key[7]);
+    }
+
+    // 关掉反向裁剪后结果必须**完全相同**（只是变的更慢）—— 证明裁剪纯属优化、不改变语义
+    t.opts.no_prune_before = true;
+    refs.clearRetainingCapacity();
+    try t.scanRefs(&lo, &hi, &refs);
+    try std.testing.expectEqual(@as(usize, 0), t.merge_pruned_before);
+    // 反向裁剪关掉后仍有**正向**裁剪：第 9 段段首 90 >= 85 依旧要剪 → 剩 9 个游标
+    try std.testing.expectEqual(@as(usize, 9), t.merge_cursors_built);
+    try std.testing.expectEqual(@as(usize, 10), refs.items.len);
+    for (refs.items, 0..) |r, i| {
+        try std.testing.expectEqual(@as(u8, 75 + @as(u8, @intCast(i))), r.key[7]);
+    }
+    t.opts.no_prune_before = false;
 }

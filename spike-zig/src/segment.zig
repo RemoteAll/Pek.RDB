@@ -517,10 +517,17 @@ pub const Segment = struct {
         return self.idx[e.key_off..][0..e.key_len];
     }
 
-    /// 段内最大 key（头部就有）。空段返回 null。
-    /// 与 `firstKey()` 配合就能判定「两段 key 范围是否重叠」（顺序拼接的前提）。
+    /// 段内最大 key（头部就有）。**空段**返回 null。
+    /// 与 `firstKey()` 配合就能判定「两段 key 范围是否重叠」（顺序拼接的前提），
+    /// 也能判定「整段是否落在查询起点之前」（反向段裁剪）。
+    ///
+    /// 判空段用 `rows`，**不能用 `max_key_len == 0`**：空字符串是合法 key
+    /// （`Table.put` 不校验），「最后一条记录的 key 是 ``」写出的 klen 也是 0。
+    /// 两种情形混淆的后果：两个都含空 key 的段（真重叠）会被 `canConcat` 当成
+    /// 「前面那段是空的」而放行 → 顺序拼接先吐旧版本、再被 `last_key` 去重吃掉
+    /// 新版本 → **返回陈旧值**（用例 `空字符串 key` 守着这条）。
     pub fn maxKey(self: *const Segment) ?[]const u8 {
-        if (self.max_key_len == 0) return null;
+        if (self.rows == 0) return null;
         return self.idx[self.max_key_off..][0..self.max_key_len];
     }
 
