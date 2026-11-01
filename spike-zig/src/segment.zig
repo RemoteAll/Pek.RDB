@@ -5,7 +5,27 @@ const codec = @import("codec.zig");
 
 pub const INDEX_STRIDE: usize = 64;
 const FLUSH_BYTES: usize = 1 << 20;
-const IDX_MAGIC = "PEKZIX04";
+/// `scanRefs` 这类「先收集再交还」的 API 用来落稳定 key 的分块 arena（实现在 codec 里，与段格式无关）。
+pub const KeyArena = codec.KeyArena;
+/// `PEKZIX05`：行格式改成「块内公共前缀压缩」（每 64 行一个块，块头 1 字节前缀长度），
+/// 索引头多了 `max_klen`。旧库不兼容，按项目约定（尚未正式使用）直接升版本、不做迁移。
+const IDX_MAGIC = "PEKZIX05";
+
+/// 两串的最长公共前缀长度。
+fn commonPrefixLen(a: []const u8, b: []const u8) usize {
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    // 8 字节 key（主流情形）一次 64 位异或 + 前导零个数就能算出前缀长度
+    if (n >= 8) {
+        const x = std.mem.readInt(u64, a[0..8], .big) ^ std.mem.readInt(u64, b[0..8], .big);
+        if (x != 0) return @intCast(@clz(x) / 8);
+        i = 8;
+    }
+    while (i < n) : (i += 1) {
+        if (a[i] != b[i]) return i;
+    }
+    return n;
+}
 
 /// `push` 的升序不变量检查用（只在 Debug/ReleaseSafe 生效）。
 fn keyCmpLessEq(a: []const u8, b: []const u8) bool {
@@ -149,11 +169,32 @@ pub const Writer = struct {
     min_seq: u64 = std.math.maxInt(u64),
     max_seq: u64 = 0,
     /// 最后一个 `push` 的 key（= 本段最大 key，因为 push 按 key 升序调用）。
-    /// **存的是引用而不是拷贝** —— 与 `entries` 里 key 的约定一致：
-    /// 调用方保证它在 `finish` 之前有效（`MergeIter` / memtable 的切片都满足）。
-    /// 不能每行 dupe：200 万行那是 32MB 的无谓拷贝。
+    ///
+    /// **必须拷贝**（`last_buf`）：调用方把游标刚产出的 key 直接传进来，
+    /// 而那些切片指向游标的双缓冲，下一次 `next()` 就会被覆写 ——
+    /// 引用版会在 `compact` 里直接触发升序断言。
     last_key: []const u8 = &.{},
-    scratch: std.ArrayList(u8) = .empty,
+    last_buf: std.ArrayList(u8) = .empty,
+    /// 本段内 key 长度上界（读侧靠它一次性预留重建缓冲，避免热路径分配）。
+    max_klen: usize = 0,
+    /// **块缓冲**：当前块最多 `INDEX_STRIDE` 条记录（key 先按完整长度写进来）。
+    ///
+    /// 为什么必须先攒一块再落盘：块内公共前缀只有看到「本块全部 key」才知道，
+    /// 而 `push` 是流式的。攒满 64 行就定死前缀并就地改写，块大小与稀疏索引步长
+    /// 一致（都指向块头），读侧不必再存第二套偏移。
+    blk_buf: std.ArrayList(u8) = .empty,
+    /// 每条记录在 `blk_buf` 里的起始偏移（行头首字节）
+    blk_off: [INDEX_STRIDE]usize = @splat(0),
+    /// 每条记录 **key** 在 `blk_buf` 里的起始偏移（= `blk_off[i]` + 行头长度）
+    blk_koff: [INDEX_STRIDE]usize = @splat(0),
+    blk_n: u32 = 0,
+    /// 本块首条 key 的长度（它在 `blk_buf[blk_koff[0]..]`，是前缀来源）
+    blk_first_klen: usize = 0,
+    /// 当前块的公共前缀长度，**在 `push` 里增量收敛**。
+    ///
+    /// 不放着收尾时再算：那样收尾要重新解一遍每行的头，
+    /// 实测把 `big_put` 拖慢 ~8%（写入路径本来就只有 6+8+32 字节的工作量）。
+    blk_pfx: usize = 0,
     /// 文件句柄是否还开着（`finishBytes` 关掉后置 false）
     file_open: bool = true,
     /// 四个缓冲是否还没释放（`finishBytes` 成功后置 false）
@@ -203,7 +244,8 @@ pub const Writer = struct {
         self.entries.deinit(self.alloc);
         self.bloom.deinit(self.alloc);
         self.buf.deinit(self.alloc);
-        self.scratch.deinit(self.alloc);
+        self.blk_buf.deinit(self.alloc);
+        self.last_buf.deinit(self.alloc);
         self.buffers_live = false;
     }
 
@@ -215,10 +257,68 @@ pub const Writer = struct {
     /// 现有调用方（memtable 刷盘 / compaction 归并）都是升序，测试也跑在 Debug 下。
     pub fn push(self: *Writer, key: []const u8, seq: u64, flags: u8, value: []const u8) !void {
         std.debug.assert(self.rows == 0 or keyCmpLessEq(self.last_key, key));
-        if (self.rows % INDEX_STRIDE == 0) {
-            // 必须分两步：写成 `try append(.{ .key = try dupe(...) })` 时，
-            // append 一失败，刚 dupe 出来的 key 就丢了（`checkAllAllocationFailures` 抓到的真实泄漏）。
-            const k = try self.alloc.dupe(u8, key);
+        std.debug.assert(self.blk_n < INDEX_STRIDE);
+        const bi: usize = self.blk_n;
+
+        // 先按**完整 key** 写进块缓冲；块攒满后再把公共前缀裁掉。
+        // 行头：6 字节定长 + 哨兵逃逸（§16.1.26/§16.1.30）。编解码只有
+        // `codec.writeRecHdr` / `codec.readRec` 这一对，两边必须同改。
+        {
+            var hdr: [6 + 33]u8 = undefined;
+            const hn = codec.writeRecHdr(&hdr, key.len, value.len, seq, flags);
+            self.blk_off[bi] = self.blk_buf.items.len;
+            try self.blk_buf.appendSlice(self.alloc, hdr[0..hn]);
+        }
+        self.blk_koff[bi] = self.blk_buf.items.len;
+        try self.blk_buf.appendSlice(self.alloc, key);
+        try self.blk_buf.appendSlice(self.alloc, value);
+
+        // 增量求块内公共前缀：只需和**块首 key** 比，不用碰其它行
+        if (bi == 0) {
+            self.blk_pfx = key.len;
+            self.blk_first_klen = key.len;
+        } else if (self.blk_pfx > 0) {
+            const first = self.blk_buf.items[self.blk_koff[0]..][0..self.blk_first_klen];
+            self.blk_pfx = commonPrefixLen(first[0..self.blk_pfx], key);
+        }
+        self.blk_n += 1;
+
+        if (self.bits_len > 0) self.bloomSet(key);
+
+        self.rows += 1;
+        self.max_klen = @max(self.max_klen, key.len);
+        self.min_seq = @min(self.min_seq, seq);
+        self.max_seq = @max(self.max_seq, seq);
+        self.last_buf.clearRetainingCapacity();
+        try self.last_buf.appendSlice(self.alloc, key);
+        self.last_key = self.last_buf.items;
+
+        if (self.blk_n == INDEX_STRIDE) try self.flushBlock();
+        if (self.buf.items.len >= FLUSH_BYTES) try self.flushBuf();
+    }
+
+    /// 把攒满（或收尾时不满）的一块落到 `buf`：**块内公共前缀压缩**。
+    ///
+    /// 块布局：`u8 pfx_len` + 最多 `INDEX_STRIDE` 条记录。
+    /// - **第 1 条存完整 key**（它同时是本块后续记录的前缀来源，块因此自描述）；；
+    /// - 第 2 条起只存 `key[pfx_len..]`。
+    ///
+    /// 稀疏索引项的 `offset` 指向**块头**（那个 pfx 字节），与 `INDEX_STRIDE` 对齐，
+    /// 所以不需要第二套偏移表。
+    ///
+    /// 前缀在 `push` 里已经增量算好（`blk_pfx`），这里只做「原样搬两段字节」：
+    /// `[行头] + [key 去掉前 pfx 字节后的部分 + value]` —— **不重新解头、不重编码**。
+    fn flushBlock(self: *Writer) !void {
+        if (self.blk_n == 0) return;
+        const n: usize = @intCast(self.blk_n);
+        const raw = self.blk_buf.items;
+        const pfx = self.blk_pfx;
+
+        // 索引项：offset 指向即将写入的块头；key 用块首 key 的**拷贝**
+        // （块首 key 在 `raw` 里，下一块就会复用）。
+        {
+            const first = raw[self.blk_koff[0]..][0..self.blk_first_klen];
+            const k = try self.alloc.dupe(u8, first);
             errdefer self.alloc.free(k);
             try self.entries.append(self.alloc, .{
                 .offset = self.buf_base + self.buf.items.len,
@@ -226,27 +326,22 @@ pub const Writer = struct {
             });
         }
 
-        self.scratch.clearRetainingCapacity();
-        // 行头：7 字节定长 + 哨兵逃逸（§16.1.26）。旧的 `klen4+vlen4+seq8+flags1 = 17 B`
-        // 每行白扔 10 B —— 换算成磁盘就是「比 SQLite 多占 41%」里的大头。
-        // 编解码只有 `codec.writeRecHdr` / `codec.readRec` 这一对，两边必须同改。
-        {
-            var hdr: [7 + 30]u8 = undefined;
-            const hn = codec.writeRecHdr(&hdr, key.len, value.len, seq, flags);
-            try self.scratch.appendSlice(self.alloc, hdr[0..hn]);
+        try self.buf.append(self.alloc, @intCast(pfx));
+
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const hdr_end = self.blk_koff[i];
+            const rec_end = if (i + 1 < n) self.blk_off[i + 1] else raw.len;
+            // 行头原样搬（klen 仍写**完整**长度，读侧据此知道要补多少前缀字节）
+            try self.buf.appendSlice(self.alloc, raw[self.blk_off[i]..hdr_end]);
+            // 块首那条从 key 首字节开始，其余跳过公共前缀
+            const skip: usize = if (i == 0) 0 else pfx;
+            try self.buf.appendSlice(self.alloc, raw[hdr_end + skip .. rec_end]);
         }
-        try self.scratch.appendSlice(self.alloc, key);
-        try self.scratch.appendSlice(self.alloc, value);
-        try self.buf.appendSlice(self.alloc, self.scratch.items);
 
-        if (self.bits_len > 0) self.bloomSet(key);
-
-        self.rows += 1;
-        self.min_seq = @min(self.min_seq, seq);
-        self.max_seq = @max(self.max_seq, seq);
-        self.last_key = key;
-
-        if (self.buf.items.len >= FLUSH_BYTES) try self.flushBuf();
+        self.blk_buf.clearRetainingCapacity();
+        self.blk_n = 0;
+        self.blk_pfx = 0;
     }
 
     /// 在线置位（k = 7）。位置算法与读取侧 `mayContain` 必须逐位一致。
@@ -273,6 +368,7 @@ pub const Writer = struct {
     /// 收尾：落数据 + 返回索引字节（调用方决定写哪：单段 `.idx` 还是聚合 `index.bin`）。
     /// 调用后 Writer 不可再用。
     pub fn finishBytes(self: *Writer) !Finished {
+        try self.flushBlock(); // 收尾时最后不满一块的残块
         try self.flushBuf();
         try self.file.sync(self.io);
         self.file.close(self.io);
@@ -289,6 +385,8 @@ pub const Writer = struct {
         // 从而在 `MergeIter` 里走顺序拼接快路径（§16.1.21：25 路归并 → 单游标，+34%）。
         try codec.putU32le(&idx, self.alloc, @intCast(self.last_key.len));
         try idx.appendSlice(self.alloc, self.last_key);
+        // 段内 key 长度上界：读侧用它一次性预留「块内前缀重建」缓冲，避免逐行分配。
+        try codec.putU32le(&idx, self.alloc, @intCast(self.max_klen));
         for (self.entries.items) |e| {
             try codec.putU64le(&idx, self.alloc, e.offset);
             try codec.putU32le(&idx, self.alloc, @intCast(e.key.len));
@@ -336,7 +434,7 @@ pub const Finished = struct {
 // 格式：ARCHIVE_MAGIC(8) 之后为连续 record：{ u32 len, u32 crc32Fast(payload), payload[len] }；
 // payload 就是单段 `.idx` 的完整内容（自带 magic 与尾部 CRC，读取时仍逐段校验、能定位损坏段）。
 // 只追加不改写，所以 flush 的代价仍是一段索引的大小。
-pub const ARCHIVE_MAGIC = "PEKZAG05";
+pub const ARCHIVE_MAGIC = "PEKZAG06";
 
 /// 校验归档文件头。空文件（新建库）视为合法。
 pub fn archiveCheckMagic(bytes: []const u8) !void {
@@ -495,6 +593,13 @@ pub const Segment = struct {
     /// 段内最大 key 在 `idx` 里的偏移/长度（0 长度 = 空段）。
     max_key_off: u32 = 0,
     max_key_len: u32 = 0,
+    /// 段内 key 长度上界（写索引时记录的），用于一次性预留行重建缓冲。
+    max_klen: u32 = 0,
+    /// 复用的行迭代器（`get` / `scanRefs` / `scanRange` 专用）。
+    /// **游标不共用它**：`RefCursor` 自带一份，否则多段归并时会被互相覆盖。
+    it: ?codec.RecIter = null,
+    /// `scanRefs` 的 key arena（压缩块重建出来的 key 只在一两行内有效，收集型 API 必须掉到稳定内存）。
+    key_arena: codec.KeyArena = .{},
     /// `entries` / `bits_*` / CRC 是否已真正解析。
     /// 对齐 SQLite：`sqlite3BtreeOpen` 只读第 1 页（`pPage1`），叶页/索引页按需缺页。
     /// 我们同样只读段头部（magic + 行数/seq 水位 + 第 1 条稀疏索引），
@@ -627,6 +732,7 @@ pub const Segment = struct {
         const mk = try r.bytes(mklen);
         self.max_key_off = @intCast(@intFromPtr(mk.ptr) - @intFromPtr(idx_bytes.ptr));
         self.max_key_len = @intCast(mklen);
+        self.max_klen = try r.u32le();
 
         // 第 1 条稀疏索引就是段内最小 key —— 段裁剪只需要它。
         // 先把它装进 `entries`，这样「只 open 不查询」的路径也能正确裁剪。
@@ -666,6 +772,7 @@ pub const Segment = struct {
         // 跳过头部已读的 max_key（它已在 `parseIdxHeader` 里记好偏移）
         const mklen: usize = @intCast(try r.u32le());
         _ = try r.bytes(mklen);
+        self.max_klen = try r.u32le();
         try self.entries.ensureTotalCapacity(self.alloc, n);
         var i: usize = 0;
         while (i < n) : (i += 1) {
@@ -744,10 +851,23 @@ pub const Segment = struct {
 
     pub fn close(self: *Segment) void {
         self.entries.deinit(self.alloc);
+        if (self.it) |*it| it.deinit(self.alloc);
+        self.key_arena.deinit(self.alloc);
         if (self.owns_idx and self.idx.len > 0) self.alloc.free(@constCast(self.idx));
         if (self.mm) |*m| m.destroy(self.io);
         if (self.file) |f| f.close(self.io);
         self.* = undefined;
+    }
+
+    /// 取（必要时建）复用的行迭代器，并把数据视图换成本段的。
+    /// `get` / `scanRefs` / `scanRange` 都是「一次调用从头扫一遍」，不会嵌套，所以可以共用。
+    fn iter(self: *Segment) !*codec.RecIter {
+        const view = try self.dataView();
+        if (self.it == null) self.it = try codec.RecIter.init(self.alloc, view, INDEX_STRIDE, self.max_klen);
+        const it = &self.it.?;
+        it.buf = view;
+        it.sink = null; // 只有 `scanRefs` 需要稳定切片，其余入口保持双缓冲
+        return it;
     }
 
     fn mayContain(self: *const Segment, key: []const u8) bool {
@@ -792,15 +912,15 @@ pub const Segment = struct {
         if (self.entries.items.len == 0) return null;
 
         const i = self.candidateIndex(key);
-        const begin = self.entries.items[i].offset;
-        const view = try self.dataView();
-        const end: u64 = if (i + 1 < self.entries.items.len) self.entries.items[i + 1].offset else view.len;
+        const begin: usize = @intCast(self.entries.items[i].offset);
+        const it = try self.iter();
+        const end: u64 = if (i + 1 < self.entries.items.len) self.entries.items[i + 1].offset else it.buf.len;
         if (end <= begin) return null;
+        it.seek(begin);
 
-        const data = view[@intCast(begin)..@intCast(end)];
-
-        var pos: usize = 0;
-        while (codec.readRec(data, pos)) |rec| {
+        var pos: usize = begin;
+        while (pos < end) {
+            const rec = it.next(self.alloc) orelse break;
             pos = rec.next;
             switch (keyCmp(rec.key, key)) {
                 .lt => continue,
@@ -824,29 +944,33 @@ pub const Segment = struct {
         value: []const u8,
     };
 
-    /// 零拷贝扫描：输出借用 mmap 的切片（调用方保证段存活）。
+    /// 零拷贝扫描：值的切片借用 mmap（调用方保证段存活）。
     /// 同一 key 只输出一个可见版本（墓碑跳过）。
+    /// **`key` 落在本段的 `key_arena` 里**：在下一次 `scanRefs` 之前有效。
     pub fn scanRefs(self: *Segment, start: []const u8, end: []const u8, snapshot: u64, out: *std.ArrayList(RefRecord)) !void {
         try self.ensureParsed();
         if (self.entries.items.len == 0) return;
-        const data = try self.dataView();
-        var pos: usize = @intCast(self.entries.items[self.candidateIndex(start)].offset);
-        var cur_key: []const u8 = &.{};
-        var have_cur = false;
+        self.key_arena.reset();
+        const i = self.candidateIndex(start);
+        const it = try self.iter();
+        it.sink = &self.key_arena; // 收集型 API：key 直接重建进 arena
+        it.seek(@intCast(self.entries.items[i].offset));
+        // 只回看**上一行**的 key 判重：双缓冲就是为这个设计的。
+        // 写成「记住上一次换 key 的那行」会把回看距离拉到任意远 → 缓冲被覆盖 → 误判重复、漏行。
+        var prev_key: []const u8 = &.{};
+        var have_prev = false;
         var decided = false;
 
-        while (codec.readRec(data, pos)) |rec| {
-            pos = rec.next;
+        while (it.next(self.alloc)) |rec| {
             switch (keyCmp(rec.key, end)) {
                 .gt, .eq => return,
                 .lt => {},
             }
             if (keyCmp(rec.key, start) == .lt) continue;
-            if (!have_cur or !std.mem.eql(u8, rec.key, cur_key)) {
-                cur_key = rec.key;
-                have_cur = true;
-                decided = false;
-            }
+            const same = have_prev and std.mem.eql(u8, rec.key, prev_key);
+            prev_key = rec.key;
+            have_prev = true;
+            if (!same) decided = false;
             if (decided) continue;
             if (rec.seq <= snapshot) {
                 decided = true;
@@ -863,8 +987,11 @@ pub const Segment = struct {
         if (self.entries.items.len > 0) {
             pos = @intCast(self.entries.items[self.candidateIndex(start)].offset);
         }
+        // **游标自带一份迭代器**：多段归并时每个游标都要同时活着，不能共用段上的那份。
+        var it = try codec.RecIter.init(self.alloc, view, INDEX_STRIDE, self.max_klen);
+        it.seek(pos);
         // 空 start = 无下界：直接标记已越过，省掉每行一次无谓的 key 比较
-        return .{ .seg = self, .pos = pos, .start = start, .end = end, .snapshot = snapshot, .passed_start = start.len == 0 };
+        return .{ .seg = self, .pos = pos, .start = start, .end = end, .snapshot = snapshot, .passed_start = start.len == 0, .it = it };
     }
 
     /// 范围扫描（start 含、end 排他），只输出 seq <= snapshot 的记录（含墓碑）。
@@ -878,12 +1005,10 @@ pub const Segment = struct {
         try self.ensureParsed();
         if (self.entries.items.len == 0) return;
         const i = self.candidateIndex(start);
-        const begin: usize = @intCast(self.entries.items[i].offset);
-        var pos: usize = begin;
-        const data = try self.dataView();
+        const it = try self.iter();
+        it.seek(@intCast(self.entries.items[i].offset));
 
-        while (codec.readRec(data, pos)) |rec| {
-            pos = rec.next;
+        while (it.next(self.alloc)) |rec| {
             switch (keyCmp(rec.key, end)) {
                 .gt, .eq => return,
                 .lt => {},
@@ -909,10 +1034,17 @@ pub const RefCursor = struct {
     /// 是否已越过 start。稀疏索引每 64 行一项，定位后最多再跳 63 行就到起点，
     /// 之后不必每行都和 start 比（热路径上省一次 key 比较）。
     passed_start: bool = false,
+    /// 本游标**独立**的行迭代器（块内前缀重建缓冲）。
+    /// 它随游标一起存放于 `MergeIter.cursors`（堆上的稳定数组），所以返回的 key
+    /// 切片在游标存活期间一直有效 —— 双缓冲保证「上一行」在下一条产出后仍可读。
+    it: codec.RecIter,
+
+    pub fn deinit(self: *RefCursor) void {
+        self.it.deinit(self.seg.alloc);
+    }
 
     pub fn next(self: *RefCursor) ?Segment.RefRecord {
-        const data = self.seg.data;
-        while (codec.readRec(data, self.pos)) |rec| {
+        while (self.it.next(self.seg.alloc)) |rec| {
             self.pos = rec.next;
 
             // 空 end = 无上界（compaction 全量归并时用）

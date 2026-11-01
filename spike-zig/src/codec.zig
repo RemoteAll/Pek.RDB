@@ -215,12 +215,15 @@ pub const Reader = struct {
 
 // ---------- 数据文件里的「一条记录」 ----------
 
-/// 一条记录的视图。**不拷贝**：`key` / `value` 直接借用 `buf`。
+/// 一条记录的视图。**不拷贝**：`key` / `value` 直接借用 `buf`
+/// （`key` 在「块内前缀压缩」的块里是 **suffix**，见 `RecIter`）。
 pub const RecView = struct {
     key: []const u8,
     value: []const u8,
     seq: u64,
     flags: u8,
+    /// 完整 key 长度（`key.len` 是**实际存储**的字节数 = `klen - pfx`）
+    klen: usize,
     /// 下一条记录的起始偏移
     next: usize,
 };
@@ -231,8 +234,12 @@ pub const RecView = struct {
 const KLEN_ESC: u8 = 0xFF;
 const VLEN_ESC: u8 = 0xFF;
 const SEQ_ESC: u32 = 0xFFFF_FFFF;
-/// 行头定长部分：`u8 klen, u8 vlen, u32 seq, u8 flags`
-const REC_HDR: usize = 7;
+/// `seq` 字段能原地容纳的上界（2³¹−1）：**最高位借给墓碑标志**（`PEKZAG07`）。
+/// 全项目只用到 `flags` 的 bit0（0 = 正常、1 = 墓碑），所以把它挂到 seq 的高位，
+/// 行头就从 7 字节降到 6 字节（2M 行省 2MB）。超过上界或 flags 带其它位时走逃逸。
+const SEQ_MAX_INLINE: u64 = 0x7FFF_FFFF;
+/// 行头定长部分：`u8 klen, u8 vlen, u32 (seq<<1 位|墓碑)`
+const REC_HDR: usize = 6;
 
 /// LEB128 解码的**快路径版**（只给行头的哨兵逃逸用）：
 /// 一字节能表示的值直接 return，不建 `Reader`、不走 error union。
@@ -263,10 +270,13 @@ inline fn rdVarint(buf: []const u8, p: *usize) ?u64 {
 
 /// 解一条记录；**越界 / 截断一律返回 null**（各调用点都把它当「这段读完了」）。
 ///
-/// 行格式（`PEKZAG05` 起）：
+/// 行格式（`PEKZAG07` 起）：
 /// ```
-/// u8 klen | u8 vlen | u32 seq | u8 flags | [klen 逃逸 varint] [vlen 逃逸] [seq 逃逸] | key | value
+/// u8 klen | u8 vlen | u32 (seq|墓碑位) | [klen 逃逸 varint] [vlen 逃逸] [seq 逃逸 varint + u8 flags] | key[klen-pfx] | value
 /// ```
+///
+/// `pfx` = 本块的公共前缀长度（块头里那个字节，见 `RecIter`）。`pfx == 0` 时记录的
+/// key 就是完整 key，**行为与 `PEKZAG05` 完全一致**。
 ///
 /// **为什么是「定长 7 字节 + 哨兵逃逸」而不是纯 varint**：
 /// 旧头是 `klen4 + vlen4 + seq8 + flags1 = 17 B`，每行白扔 10 B ——
@@ -283,51 +293,205 @@ inline fn rdVarint(buf: []const u8, p: *usize) ?u64 {
 ///
 /// `inline`：不标的话热循环里会变成一次真实函数调用 + 结构体返回。
 /// 配对微基准（`recdec_*`）实测这层开销比解码本身还大。
-pub inline fn readRec(buf: []const u8, pos: usize) ?RecView {
+pub inline fn readRec(buf: []const u8, pos: usize, pfx: usize) ?RecView {
     if (pos + REC_HDR > buf.len) return null;
     const kraw = buf[pos];
     const vraw = buf[pos + 1];
     const sraw = std.mem.readInt(u32, buf[pos + 2 ..][0..4], .little);
-    const flags = buf[pos + 6];
     var p = pos + REC_HDR;
 
     var klen: usize = kraw;
     if (kraw == KLEN_ESC) klen = @intCast(rdVarint(buf, &p) orelse return null);
     var vlen: usize = vraw;
     if (vraw == VLEN_ESC) vlen = @intCast(rdVarint(buf, &p) orelse return null);
-    var seq: u64 = sraw;
-    if (sraw == SEQ_ESC) seq = rdVarint(buf, &p) orelse return null;
+    var seq: u64 = sraw & 0x7FFF_FFFF;
+    var flags: u8 = @intCast(sraw >> 31);
+    if (sraw == SEQ_ESC) {
+        seq = rdVarint(buf, &p) orelse return null;
+        if (p >= buf.len) return null;
+        flags = buf[p];
+        p += 1;
+    }
 
     // 长度都是不可信输入：**先比剩余、再加**，避开 `p + klen` 溢出绕过判定。
     // 写成「先算剩余再减」而不是「先加再比」，编译器才能证明下面两个切片不越界，
     // 从而不插运行时边界检查（这正是配对微基准里那 20% 的来源）。
+    if (pfx > klen) return null;
+    const stored = klen - pfx;
     const rest = buf.len - p;
-    if (klen > rest) return null;
-    const after_k = rest - klen;
+    if (stored > rest) return null;
+    const after_k = rest - stored;
     if (vlen > after_k) return null;
-    const k = buf[p..][0..klen];
-    const v = buf[p + klen ..][0..vlen];
-    return .{ .key = k, .value = v, .seq = seq, .flags = flags, .next = p + klen + vlen };
+    const k = buf[p..][0..stored];
+    const v = buf[p + stored ..][0..vlen];
+    return .{ .key = k, .value = v, .seq = seq, .flags = flags, .klen = klen, .next = p + stored + vlen };
 }
 
-/// 写行头到 `dst`（调用方保证至少 `7 + 30` 字节），返回写了几个字节。
+/// 写行头到 `dst`（调用方保证至少 `6 + 33` 字节），返回写了几个字节。
 /// **必须与 `readRec` 同改。**
 pub fn writeRecHdr(dst: []u8, klen: usize, vlen: usize, seq: u64, flags: u8) usize {
     const k_esc = klen >= @as(usize, KLEN_ESC);
     const v_esc = vlen >= @as(usize, VLEN_ESC);
-    const s_esc = seq >= @as(u64, SEQ_ESC);
+    // flags 只用到 bit0（墓碑），它被挂到 seq 字段最高位；其它位不能丢，走逃逸
+    const s_esc = seq >= SEQ_MAX_INLINE or (flags & ~@as(u8, 1)) != 0;
     dst[0] = if (k_esc) KLEN_ESC else @intCast(klen);
     dst[1] = if (v_esc) VLEN_ESC else @intCast(vlen);
-    std.mem.writeInt(u32, dst[2..6], if (s_esc) SEQ_ESC else @intCast(seq), .little);
-    dst[6] = flags;
-    var n: usize = 7;
+    if (s_esc) {
+        std.mem.writeInt(u32, dst[2..6], SEQ_ESC, .little);
+    } else {
+        const sf: u32 = @as(u32, @intCast(seq)) | (@as(u32, flags & 1) << 31);
+        std.mem.writeInt(u32, dst[2..6], sf, .little);
+    }
+    var n: usize = 6;
     if (k_esc) n += encodeVarint(dst[n..], klen);
     if (v_esc) n += encodeVarint(dst[n..], vlen);
-    if (s_esc) n += encodeVarint(dst[n..], seq);
+    if (s_esc) {
+        n += encodeVarint(dst[n..], seq);
+        dst[n] = flags;
+        n += 1;
+    }
     return n;
 }
 
-test "readRec: 定长 7B 头 + 哨兵逃逸 往返 + 边界（空值 / 长 key / 大 seq）" {
+// ---------- 分块 key arena ----------
+
+/// 只增分块的字节 arena：用来把「重建出来的临时 key」落成**长期有效**的切片。
+///
+/// 为什么不用 `ArrayList(u8)`：它扩容会搬到新地址，先前发出的切片全部悬空。
+/// 常见的绕法是「先收集偏移、最后统一回填」，但那是**第二遍遍历输出数组**
+/// （200 万行 × 48B = 96MB 再写一遍），实测把 `scan_refs` 从 12.2M 行/s 打到 9.8M。
+/// 分块就解决了：块一旦分配就不再移动，单个 key 天然稳定，一遍过。
+///
+/// 分块跨调用复用（`reset` 只回到第 0 块），所以反复扫描不会反复分配。
+pub const KeyArena = struct {
+    chunks: std.ArrayList([]u8) = .empty,
+    idx: usize = 0,
+    used: usize = 0,
+    chunk_size: usize = 1 << 20,
+
+    pub fn deinit(self: *KeyArena, a: std.mem.Allocator) void {
+        for (self.chunks.items) |c| a.free(c);
+        self.chunks.deinit(a);
+    }
+
+    /// 回到起点，**保留已分配的块**供下次扫描复用。
+    pub fn reset(self: *KeyArena) void {
+        self.idx = 0;
+        self.used = 0;
+    }
+
+    fn pushChunk(self: *KeyArena, a: std.mem.Allocator, need: usize) !void {
+        const c = try a.alloc(u8, @max(self.chunk_size, need));
+        errdefer a.free(c);
+        try self.chunks.append(a, c);
+    }
+
+    /// 分配 `n` 字节；返回的切片在本 arena 存活期内**永不移动**。
+    pub fn alloc(self: *KeyArena, a: std.mem.Allocator, n: usize) ![]u8 {
+        if (self.chunks.items.len == 0) try self.pushChunk(a, n);
+        var c = self.chunks.items[self.idx];
+        if (self.used + n > c.len) {
+            self.idx += 1;
+            self.used = 0;
+            if (self.idx >= self.chunks.items.len) try self.pushChunk(a, n);
+            c = self.chunks.items[self.idx];
+        }
+        const s = c[self.used..][0..n];
+        self.used += n;
+        return s;
+    }
+};
+
+// ---------- 块内公共前缀：段内行迭代器 ----------
+
+/// 段内行迭代器，负责「块内公共前缀」的重建。
+///
+/// **块布局**：`u8 pfx_len` 后面跟最多 `stride` 条记录。
+/// - 块内**第 1 条记录存完整 key**（它同时充当本块后续记录的前缀来源，所以块本身
+///   是自描述、可独立迭代的；不依赖稀疏索引，也就不必在建游标时额外传进来）。
+/// - 第 2 条起只存 `key[pfx_len..]`，完整 key = 首条 key 的前 `pfx_len` 字节 + suffix。
+/// - `pfx_len == 0`（随机 key，块内无公共前缀）时**每条记录都存完整 key**，
+///   迭代直接借用 `buf` 切片 —— **零拷贝**，随机 key 场景完全不退化。
+///
+/// **为什么用双缓冲**：重建出来的 key 不能指向 mmap（不连续），必须落到内部缓冲。
+/// 但排序归并会跨行持有「上一行的 key」；单缓冲会被下一次 `next()` 覆盖。
+/// 双缓冲交替使用，保证「上一行」在下一条产出后仍然有效。
+///
+/// **契约**：返回的 `key` 在**再下一次** `next()` 之前有效。需要跨更多行保留的调用方
+/// （例如「收集全部记录」）必须自己拷走。
+pub const RecIter = struct {
+    buf: []const u8,
+    pos: usize = 0,
+    stride: usize = 64,
+    /// 当前块剩余行数；0 表示下一条要先读块头
+    blk_left: usize = 0,
+    /// 当前块的公共前缀长度
+    pfx: usize = 0,
+    /// 本块首 key（指向 `buf`，稳定）
+    base: []const u8 = &.{},
+    kbuf: [2]std.ArrayList(u8) = .{ .empty, .empty },
+    cur: usize = 1,
+    /// 设了就表示「重建出来的 key 要落成长期稳定切片」：不开双缓冲，直接向 arena 要内存。
+    /// 给「先收集、后使用」的 API（`Table.scanRefs`）用，省掉一次额外 memcpy。
+    sink: ?*KeyArena = null,
+
+    /// `max_key`：本段内 key 长度上界（段头里有，用来一次性预留重建缓冲，避免热路径分配）
+    pub fn init(alloc: std.mem.Allocator, buf: []const u8, stride: usize, max_key: usize) !RecIter {
+        var it = RecIter{ .buf = buf, .stride = stride };
+        errdefer it.deinit(alloc);
+        const cap = if (max_key == 0) 1 else max_key;
+        try it.kbuf[0].ensureTotalCapacity(alloc, cap);
+        try it.kbuf[1].ensureTotalCapacity(alloc, cap);
+        return it;
+    }
+
+    pub fn deinit(self: *RecIter, alloc: std.mem.Allocator) void {
+        self.kbuf[0].deinit(alloc);
+        self.kbuf[1].deinit(alloc);
+    }
+
+    /// 定位到某个**块头**（稀疏索引项的 offset 就指向块头）。
+    pub fn seek(self: *RecIter, pos: usize) void {
+        self.pos = pos;
+        self.blk_left = 0;
+    }
+
+    /// 解下一条。**`key` 指向内部双缓冲（pfx>0 时），再下一次 `next()` 前有效。**
+    pub fn next(self: *RecIter, alloc: std.mem.Allocator) ?RecView {
+        if (self.pos >= self.buf.len) return null;
+        if (self.blk_left == 0) {
+            self.pfx = self.buf[self.pos];
+            self.pos += 1;
+            self.blk_left = self.stride;
+            // 块首记录存的是完整 key（pfx 不适用于它），顺带成为本块的前缀来源
+            const h0 = readRec(self.buf, self.pos, 0) orelse return null;
+            self.pos = h0.next;
+            self.blk_left -= 1;
+            self.base = h0.key;
+            return h0;
+        }
+        const h = readRec(self.buf, self.pos, self.pfx) orelse return null;
+        self.pos = h.next;
+        self.blk_left -= 1;
+        if (self.pfx == 0) return h; // 零拷贝
+        if (self.pfx > self.base.len or h.klen > self.kbuf[0].capacity) return null; // 文件损坏
+        if (self.sink) |arena| {
+            const k = arena.alloc(alloc, h.klen) catch return null;
+            @memcpy(k[0..self.pfx], self.base[0..self.pfx]);
+            @memcpy(k[self.pfx..], h.key);
+            return .{ .key = k, .value = h.value, .seq = h.seq, .flags = h.flags, .klen = h.klen, .next = h.next };
+        }
+        self.cur ^= 1;
+        const kb = &self.kbuf[self.cur];
+        kb.resize(alloc, h.klen) catch return null;
+        @memcpy(kb.items[0..self.pfx], self.base[0..self.pfx]);
+        @memcpy(kb.items[self.pfx..], h.key);
+        return .{ .key = kb.items, .value = h.value, .seq = h.seq, .flags = h.flags, .klen = h.klen, .next = h.next };
+    }
+};
+
+
+test "readRec: 定长 6B 头 + 哨兵逃逸 往返 + 边界（空值 / 长 key / 大 seq）" {
     const K254: [254]u8 = @splat('x');
     const K255: [255]u8 = @splat('y');
     const K300: [300]u8 = @splat('z');
@@ -351,18 +515,21 @@ test "readRec: 定长 7B 头 + 哨兵逃逸 往返 + 边界（空值 / 长 key /
         // vlen 逃逸边界
         .{ .key = "k2", .value = &V254, .seq = 6, .flags = 0 },
         .{ .key = "k3", .value = &V255, .seq = 7, .flags = 0 },
-        // seq 逃逸边界
-        .{ .key = "k4", .value = "v", .seq = @as(u64, SEQ_ESC) - 1, .flags = 0 },
-        .{ .key = "k5", .value = "v", .seq = @as(u64, SEQ_ESC), .flags = 0 },
+        // seq 逃逸边界（上界是 2³¹−1：最高位借给墓碑标志）
+        .{ .key = "k4", .value = "v", .seq = SEQ_MAX_INLINE - 1, .flags = 0 },
+        .{ .key = "k4b", .value = "v", .seq = SEQ_MAX_INLINE, .flags = 1 },
+        .{ .key = "k5", .value = "v", .seq = SEQ_MAX_INLINE + 1, .flags = 0 },
         .{ .key = "k6", .value = "v", .seq = std.math.maxInt(u64), .flags = 0 },
         // 三个逃逸同时命中
         .{ .key = &K300, .value = &V255, .seq = std.math.maxInt(u64), .flags = 1 },
+        // flags 带 bit0 以外的位：不能丢，必须走逃逸
+        .{ .key = "k7", .value = "v", .seq = 8, .flags = 0x81 },
     };
 
     var expect_off: [cases.len]usize = undefined;
     for (cases, 0..) |c, i| {
         expect_off[i] = buf.items.len;
-        var hdr: [7 + 30]u8 = undefined;
+        var hdr: [6 + 33]u8 = undefined;
         const hn = writeRecHdr(&hdr, c.key.len, c.value.len, c.seq, c.flags);
         try buf.appendSlice(alloc, hdr[0..hn]);
         try buf.appendSlice(alloc, c.key);
@@ -370,7 +537,7 @@ test "readRec: 定长 7B 头 + 哨兵逃逸 往返 + 边界（空值 / 长 key /
     }
 
     for (cases, 0..) |c, i| {
-        const rec = readRec(buf.items, expect_off[i]) orelse return error.RecMissing;
+        const rec = readRec(buf.items, expect_off[i], 0) orelse return error.RecMissing;
         try std.testing.expectEqualStrings(c.key, rec.key);
         try std.testing.expectEqualStrings(c.value, rec.value);
         try std.testing.expectEqual(c.seq, rec.seq);
@@ -382,28 +549,109 @@ test "readRec: 定长 7B 头 + 哨兵逃逸 往返 + 边界（空值 / 长 key /
         }
     }
 
-    // 定长头确实只有 7 字节：小字段（8B key / 32B value / 小 seq）时整行 = 7+8+32
+    // 定长头确实只有 6 字节：小字段（8B key / 32B value / 小 seq）时整行 = 6+8+32
     {
-        var hdr: [7 + 30]u8 = undefined;
+        var hdr: [6 + 33]u8 = undefined;
         const hn = writeRecHdr(&hdr, 8, 32, 1_234_567, 0);
-        try std.testing.expectEqual(@as(usize, 7), hn);
+        try std.testing.expectEqual(@as(usize, 6), hn);
+        // 墓碑位不额外占字节
+        try std.testing.expectEqual(@as(usize, 6), writeRecHdr(&hdr, 8, 0, 1_234_567, 1));
     }
     // 边界前后必须严格分开：254 不逃逸、255 逃逸（逃逸版多 2 字节：255 + 1B varint）
     {
-        var hdr: [7 + 30]u8 = undefined;
-        const a = writeRecHdr(&hdr, 254, 254, 0xFFFF_FFFE, 0);
-        const b = writeRecHdr(&hdr, 255, 255, 0xFFFF_FFFF, 0);
-        try std.testing.expectEqual(@as(usize, 7), a);
-        try std.testing.expectEqual(@as(usize, 7 + 2 + 2 + 5), b);
+        var hdr: [6 + 33]u8 = undefined;
+        const a = writeRecHdr(&hdr, 254, 254, SEQ_MAX_INLINE - 1, 0);
+        const b = writeRecHdr(&hdr, 255, 255, SEQ_MAX_INLINE + 1, 0);
+        try std.testing.expectEqual(@as(usize, 6), a);
+        // seq 逃逸 = varint(2³¹) 5 字节 + 1 字节 flags
+        try std.testing.expectEqual(@as(usize, 6 + 2 + 2 + 5 + 1), b);
     }
 
     // 截断必须返回 null，不能 panic、也不能读越界
-    try std.testing.expect(readRec(buf.items, buf.items.len) == null);
-    try std.testing.expect(readRec(buf.items, buf.items.len + 100) == null);
+    try std.testing.expect(readRec(buf.items, buf.items.len, 0) == null);
+    try std.testing.expect(readRec(buf.items, buf.items.len + 100, 0) == null);
     var cut: usize = 0;
     while (cut < buf.items.len) : (cut += 3) {
-        _ = readRec(buf.items[0..cut], 0); // 只要不 panic / 不越界
-        _ = readRec(buf.items, cut);
+        _ = readRec(buf.items[0..cut], 0, 0); // 只要不 panic / 不越界
+        _ = readRec(buf.items, cut, 0);
+        // pfx 不可大于 klen：文件损坏时必须报 null，不能把 suffix 读越界
+        _ = readRec(buf.items[0..cut], 0, 4096);
+    }
+}
+
+test "RecIter: 块内公共前缀往返（pfx=0 / pfx>0 / 残块 / 空 key）" {
+    const alloc = std.testing.allocator;
+    const stride: usize = 4;
+
+    // 造三块数据：① pf=3 满块 ② pf=0 满块（key 无公共前缀）③ 2 条残块，含空 key
+    const keys = [_][]const u8{
+        "abc000", "abc001", "abc002", "abc003", // 块 1：pfx=3
+        "abc004", "xyz005", "qqq006", "zzz007", // 块 2：pfx=0
+        "",      "zzz999", // 块 3：pfx=0（空 key 的公共前缀是 0）
+    };
+
+    var blob: std.ArrayList(u8) = .empty;
+    defer blob.deinit(alloc);
+
+    var block_starts: [3]usize = undefined;
+    var nblk: usize = 0;
+    var i: usize = 0;
+    while (i < keys.len) {
+        const n = @min(stride, keys.len - i);
+        var pfx = keys[i].len;
+        var j: usize = 1;
+        while (j < n) : (j += 1) {
+            const a = keys[i][0..pfx];
+            const b = keys[i + j];
+            const m = @min(a.len, b.len);
+            var k: usize = 0;
+            while (k < m and a[k] == b[k]) k += 1;
+            pfx = k;
+        }
+        block_starts[nblk] = blob.items.len;
+        nblk += 1;
+        try blob.append(alloc, @intCast(pfx));
+        j = 0;
+        while (j < n) : (j += 1) {
+            const key = keys[i + j];
+            const val = [_]u8{@intCast('0' + (i + j) % 10)};
+            var hdr: [6 + 33]u8 = undefined;
+            const hn = writeRecHdr(&hdr, key.len, val.len, i + j + 1, 0);
+            try blob.appendSlice(alloc, hdr[0..hn]);
+            // 块首那条写完整 key（自描述），其余写 suffix
+            try blob.appendSlice(alloc, if (j == 0) key else key[pfx..]);
+            try blob.appendSlice(alloc, &val);
+        }
+        i += n;
+    }
+
+    var it = try RecIter.init(alloc, blob.items, stride, 8);
+    defer it.deinit(alloc);
+
+    // 逐行解，结果必须与原始 key 完全一致；同时验证「上一行的 key」仍然可读（双缓冲）
+    var prev: ?RecView = null;
+    for (keys, 0..) |want, n| {
+        const rec = it.next(alloc) orelse return error.MissingRow;
+        try std.testing.expectEqualStrings(want, rec.key);
+        try std.testing.expectEqual(@as(usize, want.len), rec.klen);
+        try std.testing.expectEqual(n + 1, rec.seq);
+        if (prev) |p| try std.testing.expectEqualStrings(keys[n - 1], p.key);
+        prev = rec;
+    }
+    try std.testing.expect(it.next(alloc) == null);
+
+    // 直接跳到第 2 / 第 3 块块头必须也能正确解出（块自描述，不依赖稀疏索引）
+    for ([_]usize{ 1, 2 }) |bi| {
+        var it2 = try RecIter.init(alloc, blob.items, stride, 8);
+        defer it2.deinit(alloc);
+        it2.seek(block_starts[bi]);
+        const want = keys[bi * stride];
+        const r0 = it2.next(alloc) orelse return error.MissingRow;
+        try std.testing.expectEqualStrings(want, r0.key);
+        if (bi * stride + 1 < keys.len) {
+            const r1 = it2.next(alloc) orelse return error.MissingRow;
+            try std.testing.expectEqualStrings(keys[bi * stride + 1], r1.key);
+        }
     }
 }
 

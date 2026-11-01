@@ -118,6 +118,21 @@ const ScanCursor = union(enum) {
             .seg => |*s| s.next(),
         };
     }
+
+    fn deinit(self: *ScanCursor, alloc: std.mem.Allocator) void {
+        _ = alloc;
+        switch (self.*) {
+            .mem => {},
+            .seg => |*s| s.deinit(),
+        }
+    }
+
+    fn useStableKeys(self: *ScanCursor, arena: ?*segmod.KeyArena) void {
+        switch (self.*) {
+            .mem => {},
+            .seg => |*s| s.it.sink = arena,
+        }
+    }
 };
 
 /// 从 `seg/index.bin`（索引聚合文件）打开全部段。
@@ -212,6 +227,13 @@ pub const Table = struct {
     /// 归并累计**比较次数**。确定性指标：它不依赖计时器精度与机器噪声。
     /// 已用它证伪了「k 小改线性」的直觉 —— 见 `MergeIter.compares` 的注释。
     merge_compares_total: u64 = 0,
+    /// `scanRefs` 收集记录时用的 key arena。
+    ///
+    /// 块内前缀压缩（`PEKZAG07`）后，压缩块里的 key 是**重建**到游标双缓冲的，
+    /// 只在下一两行内有效；而 `scanRefs` 是把记录收集起来交给调用方之后才读，
+    /// 所以必须拷到一份活过扫描的内存。用**分块 arena** 而不是 `ArrayList`：
+    /// 分块不会搬地址，一遍就能定下稳定切片。
+    key_arena: segmod.KeyArena = .{},
 
     pub fn open(
         io: std.Io,
@@ -343,6 +365,7 @@ pub const Table = struct {
         if (self.idx_map) |*m| m.destroy();
         self.idx_map = null;
         self.idx_archive = &.{};
+        self.key_arena.deinit(self.alloc);
         self.mem.deinit();
         self.wal.close();
         self.alloc.free(self.base_path);
@@ -563,9 +586,12 @@ pub const Table = struct {
         return .{ .alloc = self.alloc, .buf = buf, .records = records };
     }
     /// 通用 refs 扫描：memtable + 所有段的 k 路归并（值零拷贝借用；调用期间不得写）。
+    ///
+    /// **key 有效期**：指向本表内部的 `key_slab`，在下一次 `scanRefs` 之前都可用（value 不受影响）。
     pub fn scanRefs(self: *Table, start: []const u8, end: []const u8, out: *std.ArrayList(segmod.Segment.RefRecord)) !void {
+        self.key_arena.reset();
         var it = MergeIter{};
-        try it.init(self, start, end);
+        try it.initStable(self, start, end, &self.key_arena);
         defer it.deinit();
         while (it.next()) |rec| try out.append(self.alloc, rec);
     }
@@ -729,15 +755,48 @@ pub const MergeIter = struct {
     /// （线性跑第一次、堆跑预热后的第二次），得到的 50% 差异是假的，**该方向已放弃**，
     /// 代码里只保留堆。要重试必须两边都预热后再比。
     compares: u64 = 0,
+    /// 上一个**产出**的 key。
+    ///
+    /// **块内前缀压缩之后必须拷贝**（`PEKZAG06`）：段游标重建出来的 key 指向游标
+    /// 的双缓冲，而「上一个产出」可能距当前行 2 行以上（同 key 的多个版本被跳过的场景）——
+    /// 那时双缓冲可能刚好轮回到同一个 buffer 把它覆盖掉，比较就退化成「自己和自己比」
+    /// → 误判重复 → **整行丢失**。`last_buf` 容量按段头里的 `max_klen` 预留，永远够。
+    last_buf: []u8 = &.{},
     last_key: []const u8 = &.{},
     have_last: bool = false,
 
+    /// 记下本行 key。传进来的 key 可能指向游标双缓冲（会被覆写），所以必须拷贝。
+    inline fn setLast(self: *MergeIter, key: []const u8) void {
+        if (key.len > self.last_buf.len) {
+            // 只有 memtable 的 key 会走到这里（段内 key 长度由 `max_klen` 精确限定），
+            // 而 memtable 的 key 切片是稳定的，直接引用是安全的。
+            self.last_key = key;
+        } else {
+            @memcpy(self.last_buf[0..key.len], key);
+            self.last_key = self.last_buf[0..key.len];
+        }
+        self.have_last = true;
+    }
+
     pub fn init(self: *MergeIter, table: *Table, start: []const u8, end: []const u8) !void {
+        try self.initStable(table, start, end, null);
+    }
+
+    /// `arena != null` 时，压缩块重建出来的 key 直接落进 arena（稳定切片，供收集型 API 使用）。
+    /// **必须在建游标之前设定**：堆模式下 `init` 末尾会预读每条游标的第 1 条记录，
+    /// 那批 key 若落在双缓冲里，后续推进就会把它们覆盖。
+    pub fn initStable(self: *MergeIter, table: *Table, start: []const u8, end: []const u8, arena: ?*segmod.KeyArena) !void {
         self.* = .{ .table = table };
         const alloc = table.alloc;
         var pruned_before: usize = 0;
         // init 中途失败时要自己清干净：调用方是在 init 成功后才注册 defer deinit 的
         errdefer self.deinit();
+        // `last_key` 的稳定副本：容量取「段头里记录的最大 key 长度」上界
+        {
+            var mk: usize = 0;
+            for (table.segs.items) |*s| mk = @max(mk, @as(usize, s.max_klen));
+            if (mk > 0) self.last_buf = try alloc.alloc(u8, mk);
+        }
         if (table.mem.len() > 0) {
             try self.cursors.append(alloc, .{ .mem = .{
                 .it = table.mem.iteratorFrom(start),
@@ -775,7 +834,9 @@ pub const MergeIter = struct {
                 }
             }
             const c = try s.cursor(start, end, table.visible);
-            try self.cursors.append(alloc, .{ .seg = c });
+            var sc = ScanCursor{ .seg = c };
+            sc.useStableKeys(arena);
+            try self.cursors.append(alloc, sc);
         }
         if (self.cursors.items.len > 1 and canConcat(table)) {
             // 顺序拼接：段 key 范围两两不重叠且有序 → 按段依次耗尽游标。
@@ -824,8 +885,7 @@ pub const MergeIter = struct {
             if (self.concat_i >= self.cursors.items.len) return null;
             while (self.cursors.items[self.concat_i].next()) |rec| {
                 if (self.have_last and std.mem.eql(u8, rec.key, self.last_key)) continue;
-                self.last_key = rec.key;
-                self.have_last = true;
+                self.setLast(rec.key);
                 self.table.scan_rows_read += 1;
                 if (rec.flags == 0) return rec;
             }
@@ -850,6 +910,8 @@ pub const MergeIter = struct {
     pub fn deinit(self: *MergeIter) void {
         if (self.cur.len > 0) self.table.alloc.free(self.cur);
         if (self.heap.len > 0) self.table.alloc.free(self.heap);
+        if (self.last_buf.len > 0) self.table.alloc.free(self.last_buf);
+        for (self.cursors.items) |*c| c.deinit(self.table.alloc);
         self.cursors.deinit(self.table.alloc);
         self.table.merge_compares_total += self.compares;
     }
@@ -859,8 +921,7 @@ pub const MergeIter = struct {
         if (self.cursors.items.len == 1) {
             while (self.cursors.items[0].next()) |rec| {
                 if (self.have_last and std.mem.eql(u8, rec.key, self.last_key)) continue;
-                self.last_key = rec.key;
-                self.have_last = true;
+                self.setLast(rec.key);
                 self.table.scan_rows_read += 1;
                 if (rec.flags == 0) return rec;
             }
@@ -881,8 +942,7 @@ pub const MergeIter = struct {
             if (self.heap_len > 1) self.siftDown(0);
 
             if (self.have_last and std.mem.eql(u8, rec.key, self.last_key)) continue;
-            self.last_key = rec.key;
-            self.have_last = true;
+            self.setLast(rec.key);
             self.table.scan_rows_read += 1;
             if (rec.flags == 0) return rec;
         }

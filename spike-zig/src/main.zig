@@ -46,6 +46,7 @@ fn readRecLegacy(buf: []const u8, pos: usize) ?codec.RecView {
         .value = buf[pos + 17 + klen ..][0..vlen],
         .seq = seq,
         .flags = flags,
+        .klen = klen,
         .next = pos + total,
     };
 }
@@ -1405,7 +1406,7 @@ fn benchMain() !void {
                 try old_buf.appendSlice(alloc, &kb);
                 try old_buf.appendSlice(alloc, &value);
                 // 新格式
-                var hdr: [7 + 30]u8 = undefined;
+                var hdr: [6 + 33]u8 = undefined;
                 const hn = codec.writeRecHdr(&hdr, kb.len, value.len, seq, 0);
                 try new_buf.appendSlice(alloc, hdr[0..hn]);
                 try new_buf.appendSlice(alloc, &kb);
@@ -1418,7 +1419,7 @@ fn benchMain() !void {
             var pn: usize = 0;
             while (true) {
                 const a = readRecLegacy(old_buf.items, po);
-                const b = codec.readRec(new_buf.items, pn);
+                const b = codec.readRec(new_buf.items, pn, 0);
                 if (a == null or b == null) {
                     if (a != null or b != null) return error.RecFmtMismatch;
                     break;
@@ -1442,7 +1443,7 @@ fn benchMain() !void {
                 while (rep < REP) : (rep += 1) {
                     var pos: usize = 0;
                     while (true) {
-                        const rec = if (use_old) readRecLegacy(buf, pos) else codec.readRec(buf, pos);
+                        const rec = if (use_old) readRecLegacy(buf, pos) else codec.readRec(buf, pos, 0);
                         const r = rec orelse break;
                         acc +%= r.seq +% r.key.len +% r.value.len +% r.key[0] +% r.flags;
                         pos = r.next;
@@ -1511,7 +1512,7 @@ fn benchMain() !void {
                 }
                 try pbuf.appendSlice(alloc, &value);
                 {
-                    var hdr: [7 + 30]u8 = undefined;
+                    var hdr: [6 + 33]u8 = undefined;
                     const hn = codec.writeRecHdr(&hdr, kb.len, value.len, seq, 0);
                     try plain_buf.appendSlice(alloc, hdr[0..hn]);
                     try plain_buf.appendSlice(alloc, &kb);
@@ -1536,7 +1537,7 @@ fn benchMain() !void {
                 while (rep < PREP) : (rep += 1) {
                     if (use_plain) {
                         var pos: usize = 0;
-                        while (codec.readRec(plain_buf.items, pos)) |r| {
+                        while (codec.readRec(plain_buf.items, pos, 0)) |r| {
                             acc +%= r.seq +% r.key.len +% r.value.len +% r.key[0] +% r.flags;
                             pos = r.next;
                             total += 1;

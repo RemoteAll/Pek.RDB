@@ -1,4 +1,11 @@
-param()
+param(
+    # Which batch to compare. Defaults to the historical 'full' batch.
+    # NOTE: passing these is MANDATORY when you just measured a new batch --
+    # a missing parameter used to silently fall back to 'full' and report
+    # stale numbers as if they were the new ones.
+    [string]$ZigGlob = 'zig-2026-11-01-full-run*.csv',
+    [string]$SqliteGlob = 'sqlite-2026-11-01-full-run*.csv'
+)
 # Verdict helper: per-metric overlap check between Pek.RDB and SQLite min-max ranges.
 # Project rule: overlapping intervals => cannot conclude ("indistinguishable").
 # NOTE: keep this file ASCII-only. PowerShell 5.1 reads BOM-less .ps1 as ANSI,
@@ -6,10 +13,11 @@ param()
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $dir = Join-Path $root 'docs'
-$zf = @(Get-ChildItem -Path $dir -Recurse -Filter 'zig-2026-11-01-full-run*.csv' -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object { $_.FullName })
-$sf = @(Get-ChildItem -Path $dir -Recurse -Filter 'sqlite-2026-11-01-full-run*.csv' -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object { $_.FullName })
-if ($zf.Count -eq 0) { throw 'zig csv not found' }
-if ($sf.Count -eq 0) { throw 'sqlite csv not found' }
+$zf = @(Get-ChildItem -Path $dir -Recurse -Filter $ZigGlob -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object { $_.FullName })
+$sf = @(Get-ChildItem -Path $dir -Recurse -Filter $SqliteGlob -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object { $_.FullName })
+if ($zf.Count -eq 0) { throw "zig csv not found: $ZigGlob" }
+if ($sf.Count -eq 0) { throw "sqlite csv not found: $SqliteGlob" }
+Write-Output "zig=$($zf.Count) file(s)  sqlite=$($sf.Count) file(s)"
 
 function Get-Triple {
     param([string[]]$Files, [string]$Key)
@@ -51,13 +59,19 @@ $pairs = @(
     @('big_recover', 'big_recover_open', 'big_recover_ms', $false),
     @('upd_random', 'upd_random_txn', 'upd_random', $true),
     @('upd_get', 'upd_get', 'upd_get', $true),
-    @('scan_refs', 'scan', 'arch_scan_refs', $true),
-    @('big_scan_refs', 'big_scan', 'arch_big_scan_refs', $true)
+    # NOT COUNTED: unequal work. zig `scan_refs` collects RefRecord (48 B/row) into a
+    # list AND materializes prefixed keys; sqlite `scan`/`big_scan` only advances a
+    # cursor and counts rows (SELECT id). The equal-work counterparts are
+    # range_k_200k / big_range_k (count only, both sides) and they are ahead -- see
+    # the notes in spike-zig/src/main.zig above the count_range / big_count_range probes.
+    @('scan_refs', 'scan', 'arch_scan_refs', $true, 'UNEQUAL'),
+    @('big_scan_refs', 'big_scan', 'arch_big_scan_refs', $true, 'UNEQUAL')
 )
 
 $rows = @()
 foreach ($p in $pairs) {
     $higher = $p[3]
+    $noteq = ($p.Count -ge 5 -and $p[4] -eq 'UNEQUAL')
     $z = Get-Triple -Files $zf -Key $p[0]
     $l = Get-Triple -Files $sf -Key $p[1]
     if ($null -eq $z -or $null -eq $l) { Write-Output ("{0}: missing" -f $p[2]); continue }
@@ -65,6 +79,8 @@ foreach ($p in $pairs) {
     $ratio = $z[1] / $l[1]
     # For "lower is better" metrics (ms), ratio < 1 means we are faster.
     $behind = if ($higher) { $ratio -lt 1.0 } else { $ratio -gt 1.0 }
+    if ($noteq) { $behind = $false }
+    $verdict = if ($noteq) { 'UNEQUAL' } elseif ($overlap) { 'OVERLAP' } else { 'DECIDABLE' }
     $rows += [pscustomobject]@{
         Metric  = $p[2]
         ZigMed  = '{0:N0}' -f $z[1]
@@ -72,7 +88,7 @@ foreach ($p in $pairs) {
         LiteMed = '{0:N0}' -f $l[1]
         LiteRng = '{0:N0}-{1:N0}' -f $l[0], $l[2]
         Ratio   = '{0:N2}x' -f $ratio
-        Verdict = $(if ($overlap) { 'OVERLAP' } else { 'DECIDABLE' })
+        Verdict = $verdict
         Behind  = $behind
     }
 }
@@ -81,6 +97,8 @@ $rows | Format-Table -AutoSize | Out-String -Width 200
 $dec = @($rows | Where-Object { $_.Verdict -eq 'DECIDABLE' })
 $behind = @($dec | Where-Object { $_.Behind })
 $ov = @($rows | Where-Object { $_.Verdict -eq 'OVERLAP' })
-"decidable = {0} / {1}; overlap = {2}; decidable-and-behind = {3}" -f $dec.Count, $rows.Count, $ov.Count, $behind.Count
+$ue = @($rows | Where-Object { $_.Verdict -eq 'UNEQUAL' })
+"decidable = {0} / {1}; overlap = {2}; decidable-and-behind = {3}; unequal-work = {4}" -f $dec.Count, $rows.Count, $ov.Count, $behind.Count, $ue.Count
 foreach ($x in $behind) { "  BEHIND: {0} {1}" -f $x.Metric, $x.Ratio }
 foreach ($x in $ov) { "  OVERLAP: {0} {1}" -f $x.Metric, $x.Ratio }
+foreach ($x in $ue) { "  UNEQUAL: {0} {1} (not counted)" -f $x.Metric, $x.Ratio }
