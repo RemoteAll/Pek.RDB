@@ -3,6 +3,11 @@
 const std = @import("std");
 const codec = @import("codec.zig");
 
+/// 单调纳秒时钟（`Writer` 内部计时用）。
+inline fn monoNs(io: std.Io) u64 {
+    return @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
+}
+
 pub const INDEX_STRIDE: usize = 64;
 const FLUSH_BYTES: usize = 1 << 20;
 /// `scanRefs` 这类「先收集再交还」的 API 用来落稳定 key 的分块 arena（实现在 codec 里，与段格式无关）。
@@ -146,6 +151,12 @@ pub const Writer = struct {
     io: std.Io,
     file: std.Io.File,
     alloc: std.mem.Allocator,
+    /// 本段累计耗时拆分（纳秒）。审计用：`big_put` 偶发单次 flush 卡到 373ms（正常 25ms），
+    /// 而同一时刻的裸文件写探针完全正常（314 MB/s），所以必须拆开看是「建文件」「写」还是「sync」。
+    /// 产品路径不计时（开销只有几个单调时钟读，但它们是导出字段，不影响热循环）。
+    ns_create: u64 = 0,
+    ns_write: u64 = 0,
+    ns_sync: u64 = 0,
     /// Bloom 位数/key（0 = 不生成 Bloom）。默认 10（误报率 ~1%）。
     /// Bloom 占索引体积的 ~80%（200 万行时 2.4MB / 3.1MB），而它只对「不存在的 key」有用，
     /// 所以做成可配：关掉后索引只剩稀疏索引，冷重开与索引 IO 同步变小。
@@ -210,6 +221,7 @@ pub const Writer = struct {
         bloom_bits: u8,
         expected_rows: usize,
     ) !Writer {
+        const t_create = monoNs(io);
         const f = try dir.createFile(io, path, .{ .read = true, .truncate = true });
         var w = Writer{ .io = io, .file = f, .alloc = alloc, .bloom_bits = bloom_bits };
         if (bloom_bits > 0) {
@@ -220,6 +232,7 @@ pub const Writer = struct {
             try w.bloom.resize(alloc, bytes_len);
             @memset(w.bloom.items, 0);
         }
+        w.ns_create = monoNs(io) - t_create;
         return w;
     }
 
@@ -365,7 +378,9 @@ pub const Writer = struct {
 
     fn flushBuf(self: *Writer) !void {
         if (self.buf.items.len == 0) return;
+        const t = monoNs(self.io);
         try self.file.writePositionalAll(self.io, self.buf.items, self.buf_base);
+        self.ns_write += monoNs(self.io) - t;
         self.buf_base += self.buf.items.len;
         self.buf.clearRetainingCapacity();
     }
@@ -375,7 +390,9 @@ pub const Writer = struct {
     pub fn finishBytes(self: *Writer) !Finished {
         try self.flushBlock(); // 收尾时最后不满一块的残块
         try self.flushBuf();
+        const t_sync = monoNs(self.io);
         try self.file.sync(self.io);
+        self.ns_sync += monoNs(self.io) - t_sync;
         self.file.close(self.io);
         self.file_open = false;
 

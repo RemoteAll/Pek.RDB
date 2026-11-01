@@ -237,6 +237,10 @@ pub const Table = struct {
     ns_flush_max: u64 = 0,
     /// 段数据文件写入 + fsync 的累计纳秒（`Writer.create` → `finishBytes`）。
     ns_seg_data: u64 = 0,
+    /// `ns_seg_data` 的三段拆分：建文件（含 Bloom 位图分配）/ 写块 / fsync。
+    ns_seg_create: u64 = 0,
+    ns_seg_write: u64 = 0,
+    ns_seg_sync: u64 = 0,
     /// 索引归档追加 + fsync 的累计纳秒（`archiveAppend`）。
     ns_idx: u64 = 0,
     /// WAL 轮换（sync + 关/删/建，或原地截断）的累计纳秒。
@@ -547,6 +551,9 @@ pub const Table = struct {
         errdefer self.alloc.free(fin.bytes);
         // 数据段（create → finishBytes）落盘耗时
         self.ns_seg_data += self.nowNs() - t_seg;
+        self.ns_seg_create += w.ns_create;
+        self.ns_seg_write += w.ns_write;
+        self.ns_seg_sync += w.ns_sync;
         // 从「有效末尾」写：若上次追加留下崩溃残片，这里会把它覆盖掉
         const t_idx = self.nowNs();
         self.index_valid_len = try segmod.archiveAppend(self.io, self.dir, self.index_path, @intCast(id), fin.bytes, self.index_valid_len);

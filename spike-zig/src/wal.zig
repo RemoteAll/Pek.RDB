@@ -87,8 +87,12 @@ pub const Wal = struct {
     pub fn reset(self: *Wal) !void {
         self.buf.clearRetainingCapacity();
         try self.file.setLength(self.io, 0);
-        try self.file.sync(self.io);
+        // **`written` 必须在 `sync` 之前置 0**：`setLength` 已经成功、文件就是 0 字节了，
+        // 而 `sync` 若失败会把错误往上抛。此时若 `written` 还是旧值，下一次 `flushBuf`
+        // 会用 `writePositionalAll(buf, written)` 在末尾**打一个空洞** —— 文件前 `written`
+        // 字节全是 0，重开时 `parseBatches` 在偏移 0 就把前面当撕裂尾，**空洞之后的 WAL 全丢**。
         self.written = 0;
+        try self.file.sync(self.io);
     }
 
     pub fn close(self: *Wal) void {
@@ -247,6 +251,10 @@ test "wal reset：原地截断后文件为 0 字节，旧批次不得被回放" 
 
     try w.reset();
     try std.testing.expectEqual(@as(u64, 0), (try dir.statFile(io, path, .{})).size);
+    // `written`（追加点）必须与文件长度一致。它若停在旧值，下一次 flushBuf 会在末尾
+    // 打一个空洞，重开时 parseBatches 在偏移 0 就把前面当撕裂尾 → 空洞之后的 WAL 全丢。
+    // （这个不一致只在 `sync` 失败时才会出现，本用例覆盖不到那条失败路径，见审计报告。）
+    try std.testing.expectEqual(@as(u64, 0), w.written);
 
     // 截断后写入的新批次必须能被读到，且**只能读到这一批**
     _ = try w.append(2, &.{.{ .flags = 0, .key = "k2", .value = "v2" }});

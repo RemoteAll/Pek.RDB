@@ -14,6 +14,35 @@ fn nowNs(io: std.Io) u64 {
     return @intCast(ts.nanoseconds);
 }
 
+/// **裸文件写探针**：完全不经过引擎，只做「建文件 → 分块写 → 每块 fsync」。
+///
+/// 存在的理由：审计发现同一份配置、同一数据量的 `big_put` 与 `b8_put` 在同一轮里能差 4×
+/// （p11 r2：503,836 vs 2,033,491），而读指标完全正常。这可能是「我们的写路径暴露」，
+/// 也可能是「这台机器在某个时间窗口里写盘就是慢」。两种情况对策完全不同：
+/// - 裸写也掉 → 环境（NTFS/Defender/写回），优化我们的代码没用，只能多轮取中位或加窗口检测；
+/// - 裸写不掉 → 确实是我们的写路径，继续往文件数/fsync 次数上查。
+/// 所以把干净变量（同进程、同一时刻、只差「有没有引擎」）放进基准里。
+fn bareWriteMbPerSec(io: std.Io, dir: std.Io.Dir, path: []const u8, mb: usize) f64 {
+    const chunk = 8 << 20;
+    var buf: [8 << 20]u8 = undefined;
+    @memset(&buf, 'b');
+    dir.deleteFile(io, path) catch {};
+    const t0 = nowNs(io);
+    const f = dir.createFile(io, path, .{ .read = false, .truncate = true }) catch return 0;
+    defer f.close(io);
+    defer dir.deleteFile(io, path) catch {};
+    var off: u64 = 0;
+    var i: usize = 0;
+    while (i < mb) : (i += 8) {
+        f.writePositionalAll(io, &buf, off) catch return 0;
+        f.sync(io) catch return 0;
+        off += chunk;
+    }
+    const ns = nowNs(io) - t0;
+    if (ns == 0) return 0;
+    return @as(f64, @floatFromInt(mb)) / (@as(f64, @floatFromInt(ns)) / 1e9);
+}
+
 /// 流式基准的消费回调：只数行，不保留任何东西。
 /// 真实系统里对应「边读边算 / 边读边发」——这正是 SQLite `while rows.next()` 的用法。
 fn countRow(cnt: *usize, row: []const spike.sql.Value) anyerror!void {
@@ -77,6 +106,9 @@ fn benchMain() !void {
 
     var out: std.ArrayList(u8) = .empty;
     std.debug.print("metric,count,value\n", .{});
+
+    // 裸文件写探针：基准的**起点**。与后面两个点对比就能看出「是否某个时间窗口写盘变慢」。
+    std.debug.print("bare_write_mbps,{d},{d:.1}\n", .{ 64, bareWriteMbPerSec(io, dir, "bench-bare-1.tmp", 64) });
 
     var t = try tablemod.Table.open(io, dir, path, alloc, .{ .wal_sync_every = 0, .flush_bytes = 1 << 30 });
     // recover 之前要手动关掉再 reopen，用标志位避免 defer 二次 deinit（use-after-free）
@@ -610,6 +642,11 @@ fn benchMain() !void {
         // 三段相加接近 `ns_flush` 才算拆全；剩下的差额是 Segment.fromBytes 的 mmap 等。
         std.debug.print("big_put_phases,{d},{d}\n", .{ t6.ns_seg_data, t6.ns_idx });
         std.debug.print("big_put_phases2,{d},{d}\n", .{ t6.ns_walrot, t6.ns_walrot_max });
+        // 裸文件写探针：**紧接着 big_put**（同一时刻，只差「不经引擎」）
+        std.debug.print("bare_write2_mbps,{d},{d:.1}\n", .{ 64, bareWriteMbPerSec(io, dir, "bench-bare-2.tmp", 64) });
+        // 段数据三段拆分：建文件 / 写块 / fsync
+        std.debug.print("big_put_segphase,{d},{d}\n", .{ t6.ns_seg_create, t6.ns_seg_write });
+        std.debug.print("big_put_segphase2,{d},{d}\n", .{ t6.ns_seg_sync, t6.ns_seg_data });
 
         // **强耐久档参考**：`wal_sync_every = 10_000` = 每 1 万条 put 做一次 WAL fsync。
         //
@@ -640,46 +677,6 @@ fn benchMain() !void {
             const ns = nowNs(io) - t0;
             std.debug.print("big_put_strong,{d},{d:.0}\n", .{ big_n, opsPerSec(big_n, ns) });
             std.debug.print("big_put_strong_breakdown,{d},{d}\n", .{ ts.ns_wal_sync, ts.ns_flush });
-        }
-
-        // **WAL 轮换 A/B（同进程背靠背配对）**：原地截断 vs 关/删/建文件。
-        //
-        // 为什么要配对：写路径偶发整轮崩塌只有约 1/7 的概率，跨批次比必然被噪声吃掉
-        // （§16.1.22 那一轮就是跨批次比比值、结论差 14% 全在噪声里）。
-        // 这里同进程交替、**奇偶轮交换先后**抵消冷热偏差，逐对输出比值。
-        {
-            const ab_n: u64 = 1_000_000;
-            var pair: usize = 0;
-            while (pair < 7) : (pair += 1) {
-                const recreate_first = (pair % 2) == 1;
-                var vals: [2]f64 = undefined;
-                var k: usize = 0;
-                while (k < 2) : (k += 1) {
-                    const recreate = if (k == 0) recreate_first else !recreate_first;
-                    const p = if (recreate) "bench-data-walab-re" else "bench-data-walab-tr";
-                    dir.deleteTree(io, p) catch {};
-                    defer dir.deleteTree(io, p) catch {};
-                    var tab = try tablemod.Table.open(io, dir, p, alloc, .{
-                        .wal_sync_every = 0,
-                        .flush_bytes = 8 << 20,
-                        .wal_rotate_recreate = recreate,
-                    });
-                    defer tab.deinit();
-                    const t0 = nowNs(io);
-                    var j: u64 = 0;
-                    while (j < ab_n) : (j += 1) {
-                        const kb = keyOf(@intCast(j));
-                        try tab.put(&kb, &value);
-                    }
-                    try tab.flush();
-                    vals[k] = opsPerSec(ab_n, nowNs(io) - t0);
-                }
-                const trunc = if (recreate_first) vals[1] else vals[0];
-                const recre = if (recreate_first) vals[0] else vals[1];
-                std.debug.print("walab_pair,{d},{d:.0}\n", .{ pair + 1, trunc });
-                std.debug.print("walab_pair_recreate,{d},{d:.0}\n", .{ pair + 1, recre });
-                std.debug.print("walab_ratio,{d},{d:.4}\n", .{ pair + 1, trunc / recre });
-            }
         }
 
         // 点查（随机）
@@ -986,6 +983,8 @@ fn benchMain() !void {
         try t9.flush();
         std.debug.print("b8_put,{d},{d:.0}\n", .{ bn, opsPerSec(bn, nowNs(io) - t_nb_put) });
         std.debug.print("b8_segs,{d},0\n", .{t9.segs.items.len});
+        // 裸文件写探针：**紧接着 b8_put**（同配置的第二次 200 万行写完之后）
+        std.debug.print("bare_write3_mbps,{d},{d:.1}\n", .{ 64, bareWriteMbPerSec(io, dir, "bench-bare-3.tmp", 64) });
 
         {
             const ip = try alloc.print("{s}/seg/index.bin", .{path9});
@@ -1759,6 +1758,50 @@ fn benchMain() !void {
                 std.debug.print("keycmp_{s},{d},{d:.0}\n", .{ tag, KN * KREP, opsPerSec(KN * KREP, ns) });
                 if (acc == 0xDEADBEEF) std.debug.print("keycmp_guard,1,0\n", .{});
             }
+        }
+    }
+
+    // **WAL 轮换 A/B（同进程背靠背配对）**：原地截断 vs 关/删/建文件。
+    //
+    // 为什么要配对：写路径偶发整轮崩塌只有约 1/7 的概率，跨批次比必然被噪声吃掉
+    // （§16.1.22 那一轮就是跨批次比比值、结论差 14% 全在噪声里）。
+    // 这里同进程交替、**奇偶轮交换先后**抵消冷热偏差，逐对输出比值。
+    //
+    // **必须放在整套基准的最末尾**（§16.1.7 的教训）：本探针要写 14 × 100 万行 ≈ 570MB，
+    // 放在中间会把脏页与页缓存占满，让后面的 `big_*` 读指标波动从 20% 放大到 400%+。
+    // 第一版就是放在 `big_put_strong` 后面的，审计时已挪到 `bench_done` 之前。
+    {
+        const ab_n: u64 = 1_000_000;
+        var pair: usize = 0;
+        while (pair < 7) : (pair += 1) {
+            const recreate_first = (pair % 2) == 1;
+            var vals: [2]f64 = undefined;
+            var k: usize = 0;
+            while (k < 2) : (k += 1) {
+                const recreate = if (k == 0) recreate_first else !recreate_first;
+                const p = if (recreate) "bench-data-walab-re" else "bench-data-walab-tr";
+                dir.deleteTree(io, p) catch {};
+                defer dir.deleteTree(io, p) catch {};
+                var tab = try tablemod.Table.open(io, dir, p, alloc, .{
+                    .wal_sync_every = 0,
+                    .flush_bytes = 8 << 20,
+                    .wal_rotate_recreate = recreate,
+                });
+                defer tab.deinit();
+                const t0 = nowNs(io);
+                var j: u64 = 0;
+                while (j < ab_n) : (j += 1) {
+                    const kb = keyOf(@intCast(j));
+                    try tab.put(&kb, &value);
+                }
+                try tab.flush();
+                vals[k] = opsPerSec(ab_n, nowNs(io) - t0);
+            }
+            const trunc = if (recreate_first) vals[1] else vals[0];
+            const recre = if (recreate_first) vals[0] else vals[1];
+            std.debug.print("walab_pair,{d},{d:.0}\n", .{ pair + 1, trunc });
+            std.debug.print("walab_pair_recreate,{d},{d:.0}\n", .{ pair + 1, recre });
+            std.debug.print("walab_ratio,{d},{d:.4}\n", .{ pair + 1, trunc / recre });
         }
     }
 
