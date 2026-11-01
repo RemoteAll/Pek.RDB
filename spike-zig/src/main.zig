@@ -606,6 +606,10 @@ fn benchMain() !void {
         // 判定偶发崩塌是「周期 fsync 抖动」还是「段落盘抖动」的直接证据。
         std.debug.print("big_put_breakdown,{d},{d}\n", .{ t6.ns_wal_sync, t6.ns_flush });
         std.debug.print("big_put_flushmax,{d},{d}\n", .{ t6.flush_calls, t6.ns_flush_max });
+        // 段 flush 内部三段分解：段数据写入+fsync / 索引归档追加+fsync / WAL 轮换。
+        // 三段相加接近 `ns_flush` 才算拆全；剩下的差额是 Segment.fromBytes 的 mmap 等。
+        std.debug.print("big_put_phases,{d},{d}\n", .{ t6.ns_seg_data, t6.ns_idx });
+        std.debug.print("big_put_phases2,{d},{d}\n", .{ t6.ns_walrot, t6.ns_walrot_max });
 
         // **强耐久档参考**：`wal_sync_every = 10_000` = 每 1 万条 put 做一次 WAL fsync。
         //
@@ -636,6 +640,46 @@ fn benchMain() !void {
             const ns = nowNs(io) - t0;
             std.debug.print("big_put_strong,{d},{d:.0}\n", .{ big_n, opsPerSec(big_n, ns) });
             std.debug.print("big_put_strong_breakdown,{d},{d}\n", .{ ts.ns_wal_sync, ts.ns_flush });
+        }
+
+        // **WAL 轮换 A/B（同进程背靠背配对）**：原地截断 vs 关/删/建文件。
+        //
+        // 为什么要配对：写路径偶发整轮崩塌只有约 1/7 的概率，跨批次比必然被噪声吃掉
+        // （§16.1.22 那一轮就是跨批次比比值、结论差 14% 全在噪声里）。
+        // 这里同进程交替、**奇偶轮交换先后**抵消冷热偏差，逐对输出比值。
+        {
+            const ab_n: u64 = 1_000_000;
+            var pair: usize = 0;
+            while (pair < 7) : (pair += 1) {
+                const recreate_first = (pair % 2) == 1;
+                var vals: [2]f64 = undefined;
+                var k: usize = 0;
+                while (k < 2) : (k += 1) {
+                    const recreate = if (k == 0) recreate_first else !recreate_first;
+                    const p = if (recreate) "bench-data-walab-re" else "bench-data-walab-tr";
+                    dir.deleteTree(io, p) catch {};
+                    defer dir.deleteTree(io, p) catch {};
+                    var tab = try tablemod.Table.open(io, dir, p, alloc, .{
+                        .wal_sync_every = 0,
+                        .flush_bytes = 8 << 20,
+                        .wal_rotate_recreate = recreate,
+                    });
+                    defer tab.deinit();
+                    const t0 = nowNs(io);
+                    var j: u64 = 0;
+                    while (j < ab_n) : (j += 1) {
+                        const kb = keyOf(@intCast(j));
+                        try tab.put(&kb, &value);
+                    }
+                    try tab.flush();
+                    vals[k] = opsPerSec(ab_n, nowNs(io) - t0);
+                }
+                const trunc = if (recreate_first) vals[1] else vals[0];
+                const recre = if (recreate_first) vals[0] else vals[1];
+                std.debug.print("walab_pair,{d},{d:.0}\n", .{ pair + 1, trunc });
+                std.debug.print("walab_pair_recreate,{d},{d:.0}\n", .{ pair + 1, recre });
+                std.debug.print("walab_ratio,{d},{d:.4}\n", .{ pair + 1, trunc / recre });
+            }
         }
 
         // 点查（随机）

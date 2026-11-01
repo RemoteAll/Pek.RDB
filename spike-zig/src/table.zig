@@ -38,6 +38,13 @@ pub const Options = struct {
     /// **仅用于基准 A/B**：置 true 时禁用「反向段裁剪」（`maxKey() < start` 的整段跳过）。
     /// 同样是为了在同进程里拿到配对结论，生产路径永远留 false。
     no_prune_before: bool = false,
+    /// **仅用于基准 A/B**：置 true 时退回「flush 后 close + deleteFile + createFile」重建 WAL，
+    /// 而不是原地 `setLength(0)` 复用句柄。生产路径永远留 false。
+    ///
+    /// 为什么要这个开关：写路径偶发整轮崩塌（约 7 轮 1 次，同轮读完全正常）。
+    /// 删+建文件是写路径上唯一会增删目录项的操作，也是 Windows 实时扫描最容易插进来的点，
+    /// 但「怀疑」不够 —— 必须同进程背靠背配对才能把 200 次元数据操作的代价从噪声里分出来。
+    wal_rotate_recreate: bool = false,
 };
 
 /// 自动 compaction 连续失败上限：到顶就停手，避免每次 flush 都白跑一遍合并。
@@ -228,6 +235,14 @@ pub const Table = struct {
     flush_calls: u64 = 0,
     /// 单次 `flush()` 最长耗时（纳秒）：尾部抖动的直接证据。
     ns_flush_max: u64 = 0,
+    /// 段数据文件写入 + fsync 的累计纳秒（`Writer.create` → `finishBytes`）。
+    ns_seg_data: u64 = 0,
+    /// 索引归档追加 + fsync 的累计纳秒（`archiveAppend`）。
+    ns_idx: u64 = 0,
+    /// WAL 轮换（sync + 关/删/建，或原地截断）的累计纳秒。
+    ns_walrot: u64 = 0,
+    /// 单次 WAL 轮换最长耗时（纳秒）。
+    ns_walrot_max: u64 = 0,
     /// 扫描/归并**实际产出**的行数（累计）。
     /// 确定性指标：用来证明「LIMIT 提前终止」真的没白读，而不是靠计时猜。
     scan_rows_read: u64 = 0,
@@ -518,6 +533,7 @@ pub const Table = struct {
         // 不删代价只是多一个文件，而且 `next_seg` 没递增、下次 flush 会用同一路径覆盖，天然自愈；
         // 万一是「写成功但没回传」的情况，保留它反而能恢复到一致状态。
 
+        const t_seg = self.nowNs();
         var w = try segmod.Writer.create(self.io, self.dir, data_path, self.alloc, self.opts.bloom_bits, self.mem.len());
         defer w.deinit();
         var it = self.mem.iterator();
@@ -529,8 +545,12 @@ pub const Table = struct {
         // 索引：追加到聚合文件（一次小写），并直接接管内存字节，不重复读盘
         const fin = try w.finishBytes();
         errdefer self.alloc.free(fin.bytes);
+        // 数据段（create → finishBytes）落盘耗时
+        self.ns_seg_data += self.nowNs() - t_seg;
         // 从「有效末尾」写：若上次追加留下崩溃残片，这里会把它覆盖掉
+        const t_idx = self.nowNs();
         self.index_valid_len = try segmod.archiveAppend(self.io, self.dir, self.index_path, @intCast(id), fin.bytes, self.index_valid_len);
+        self.ns_idx += self.nowNs() - t_idx;
 
         const seg = try segmod.Segment.fromBytes(self.io, self.dir, self.base_path, id, fin.bytes, self.alloc, true, self.opts.mmap_preheat);
         self.segs.append(self.alloc, seg) catch |e| {
@@ -544,10 +564,25 @@ pub const Table = struct {
 
         self.mem.reset();
 
-        try self.wal.sync();
-        self.wal.close();
-        self.dir.deleteFile(self.io, self.wal_path) catch {};
-        self.wal = try walmod.Wal.create(self.io, self.dir, self.wal_path, self.alloc);
+        // WAL 轮换：memtable 已全部落到段，这份 WAL 到此作废。
+        //
+        // **默认走原地截断**（`reset`）：只付一次 `setLength`，不增删目录项。
+        // 旧写法是「sync → close → deleteFile → createFile」，每 flush 一次就在
+        // 写路径上增删一个目录项；200 万行要 flush 25 次，而实测有约 1/7 的轮次
+        // 写路径整轮崩塌 3–6 倍（同轮读正常、SQLite 正常、单次 flush 从 22ms 卡到 203ms）。
+        // `wal_rotate_recreate` 只为基准 A/B 保留旧路径，生产恒 false。
+        const t_rot = self.nowNs();
+        if (self.opts.wal_rotate_recreate) {
+            try self.wal.sync();
+            self.wal.close();
+            self.dir.deleteFile(self.io, self.wal_path) catch {};
+            self.wal = try walmod.Wal.create(self.io, self.dir, self.wal_path, self.alloc);
+        } else {
+            try self.wal.reset();
+        }
+        const d_rot = self.nowNs() - t_rot;
+        self.ns_walrot += d_rot;
+        if (d_rot > self.ns_walrot_max) self.ns_walrot_max = d_rot;
         self.pending = 0;
 
         // 计数放最后：上面的 WAL 同步若失败，调用方会重试 flush，
@@ -977,6 +1012,66 @@ pub const MergeIter = struct {
     }
 };
 
+// WAL 轮换改「原地截断」后的守门用例。
+//
+// 为什么必须有这条：旧路径是「sync → close → deleteFile → createFile」，
+// 新路径只做 `setLength(0)` + 复用同一句柄。两者**语义**必须完全等价：
+// flush 成功后这份 WAL 内容作废，重开时只能看到段里的数据 + 截断后新写入的数据。
+// 这条用「多次 flush + 重开」把它钉住；`wal_rotate_recreate` 两种模式各跑一遍，
+// 保证 A/B 开关不是只在基准里才成立的假开关。
+test "flush 后 WAL 原地截断：多次 flush 后重开数据完整（truncate 与 recreate 两种模式）" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    for ([_]bool{ false, true }) |recreate| {
+        const tmp = if (recreate) "test-walrot-re" else "test-walrot-tr";
+        dir.deleteTree(io, tmp) catch {};
+        defer dir.deleteTree(io, tmp) catch {};
+
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(alloc);
+
+        {
+            // flush_bytes 取很小 → 每写几条就触发一次 flush，几轮下来 WAL 被轮换多次
+            var t = try Table.open(io, dir, tmp, alloc, .{
+                .wal_sync_every = 0,
+                .flush_bytes = 1,
+                .wal_rotate_recreate = recreate,
+            });
+            defer t.deinit();
+            var i: u64 = 0;
+            while (i < 50) : (i += 1) {
+                var kb: [8]u8 = undefined;
+                std.mem.writeInt(u64, &kb, i, .little);
+                try t.put(&kb, "v");
+                // 每写一条都会 flush；中途留下「已落段但还没再写」的状态
+            }
+            try t.flush();
+            // flush 之后 WAL 必须是空的：非空就说明「作废的 WAL」没被清掉，
+            // 重开时会把已入段的数据重复回放一遍
+            var wp: [128]u8 = undefined;
+            const wpath = try std.fmt.bufPrint(&wp, "{s}/wal/000001.wal", .{tmp});
+            const st = try dir.statFile(io, wpath, .{});
+            try std.testing.expectEqual(@as(u64, 0), st.size);
+            try std.testing.expect(t.segs.items.len > 1); // 确认真的发生了多次轮换
+        }
+
+        var t2 = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        defer t2.deinit();
+        var i: u64 = 0;
+        while (i < 50) : (i += 1) {
+            var kb: [8]u8 = undefined;
+            std.mem.writeInt(u64, &kb, i, .little);
+            const v = try t2.get(&kb, &out);
+            try std.testing.expect(v != null);
+            try std.testing.expectEqualStrings("v", v.?);
+        }
+    }
+}
+
 test "table put/get/flush/reopen" {
     const alloc = std.testing.allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
@@ -1012,8 +1107,7 @@ test "table put/get/flush/reopen" {
     var set = try t2.scanRange("a", "z");
     defer set.deinit();
     try std.testing.expectEqual(@as(usize, 1), set.records.len);
-    try std.testing.expectEqualStrings("b", set.records[0].key);
-}
+    try std.testing.expectEqualStrings("b", set.records[0].key);}
 
 test "table reopen: 懒加载 / 预热 / 并行 三种打开方式结果一致" {
     const alloc = std.testing.allocator;

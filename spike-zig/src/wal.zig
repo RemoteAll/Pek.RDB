@@ -74,6 +74,23 @@ pub const Wal = struct {
         try self.file.sync(self.io);
     }
 
+    /// **原地清空**并复用同一个文件句柄：`setLength(0)` + 复位追加点。
+    ///
+    /// 语义与「close + deleteFile + createFile」完全等价（flush 成功后这一点 WAL 内容已作废），
+    /// 但只付**一次** `setLength`：
+    /// - 少两次元数据操作（删目录项 + 重建目录项）；
+    /// - **不产生新目录项** → 不会触发文件系统「新文件」实时扫描。
+    ///
+    /// 为什么要改：7 轮交替配对里有约 1 轮写路径**整轮崩塌 3–6 倍**（而同轮读指标正常、
+    /// SQLite 同轮正常），实测段 flush 单次从 22ms 卡到 203ms。200 万行要 flush 25 次，
+    /// 每次删+建一个 WAL 文件 —— 这是写路径上**唯一**会产生目录项增删的地方。
+    pub fn reset(self: *Wal) !void {
+        self.buf.clearRetainingCapacity();
+        try self.file.setLength(self.io, 0);
+        try self.file.sync(self.io);
+        self.written = 0;
+    }
+
     pub fn close(self: *Wal) void {
         self.flushBuf() catch {};
         self.buf.deinit(self.alloc);
@@ -206,6 +223,42 @@ pub fn replay(io: std.Io, dir: std.Io.Dir, path: []const u8, alloc: std.mem.Allo
     _ = try parseBatches(data, alloc, &batches);
 
     return .{ .buf = buf, .batches = batches, .alloc = alloc };
+}
+
+test "wal reset：原地截断后文件为 0 字节，旧批次不得被回放" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-wal-reset";
+    dir.deleteTree(io, tmp) catch {};
+    try dir.createDirPath(io, tmp);
+    defer dir.deleteTree(io, tmp) catch {};
+
+    const path = tmp ++ "/000001.wal";
+
+    var w = try Wal.create(io, dir, path, alloc);
+    _ = try w.append(1, &.{.{ .flags = 0, .key = "k1", .value = "v1" }});
+    try w.sync();
+    // 先确认「确实写出了内容」——否则下面的「截断成功」只是空文件对空文件的假相等
+    try std.testing.expect((try dir.statFile(io, path, .{})).size > 0);
+
+    try w.reset();
+    try std.testing.expectEqual(@as(u64, 0), (try dir.statFile(io, path, .{})).size);
+
+    // 截断后写入的新批次必须能被读到，且**只能读到这一批**
+    _ = try w.append(2, &.{.{ .flags = 0, .key = "k2", .value = "v2" }});
+    try w.sync();
+    w.close();
+
+    var rp = try openReplay(io, dir, path, alloc);
+    defer rp.replay.deinit();
+    defer rp.wal.close();
+    try std.testing.expectEqual(@as(usize, 1), rp.replay.batches.items.len);
+    try std.testing.expectEqual(@as(u64, 2), rp.replay.batches.items[0].seq);
+    try std.testing.expectEqualStrings("k2", rp.replay.batches.items[0].ops[0].key);
 }
 
 test "wal append + replay" {
