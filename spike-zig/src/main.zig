@@ -1577,6 +1577,78 @@ fn benchMain() !void {
         std.debug.print("recdec_pfx_bytes,1,{d},{d}\n", .{ plain_buf.items.len, pbuf.items.len });
     }
 
+    // **keyCmp 快路径到底值多少**（§16.1.28）。
+    //
+    // `segment.zig` 里那句「逐字节循环实测占 ~20%」是拿**手写循环**比 u64 得出的。
+    // 但 `std.mem.order` 会落到 memcmp（向量化），对手写循环快得多。
+    // 如果 memcmp 与 u64 差不多，那「key 必须定长 8 字节」这个前提就不成立了 ——
+    // 变长保序编码能直接省 4 B/行且保持零拷贝。
+    //
+    // 三种比法，同进程配对、奇偶轮换：
+    {
+        const KN: usize = 8192;
+        const KREP: usize = 200;
+        var keys: [KN][8]u8 = undefined;
+        {
+            var i: usize = 0;
+            while (i < KN) : (i += 1) {
+                // 打散一下，避免全部前缀相同导致「第一次字节就分胜负」的假象
+                var kb: [8]u8 = undefined;
+                codec.encodeI64Key(&kb, @as(i64, @intCast(i)) * 0x9E37 + @as(i64, @intCast(i % 97)) * 65536);
+                keys[i] = kb;
+            }
+        }
+        var round: usize = 0;
+        while (round < 5) : (round += 1) {
+            const order: [3]u8 = switch (round % 3) {
+                0 => .{ 0, 1, 2 },
+                1 => .{ 1, 2, 0 },
+                else => .{ 2, 0, 1 },
+            };
+            for (order) |which| {
+                const t0 = nowNs(io);
+                var acc: u64 = 0;
+                var rep: usize = 0;
+                while (rep < KREP) : (rep += 1) {
+                    var i: usize = 0;
+                    while (i < KN) : (i += 1) {
+                        const a = keys[i][0..];
+                        const b = keys[(i * 31 + 1) % KN][0..];
+                        const o: std.math.Order = switch (which) {
+                            0 => blk: {
+                                const x = std.mem.readInt(u64, a[0..8], .big);
+                                const y = std.mem.readInt(u64, b[0..8], .big);
+                                break :blk std.math.order(x, y);
+                            },
+                            1 => std.mem.order(u8, a, b),
+                            else => blk: {
+                                const nn = @min(a.len, b.len);
+                                var j: usize = 0;
+                                var r: std.math.Order = .eq;
+                                while (j < nn) : (j += 1) {
+                                    if (a[j] != b[j]) {
+                                        r = if (a[j] < b[j]) .lt else .gt;
+                                        break;
+                                    }
+                                }
+                                break :blk r;
+                            },
+                        };
+                        acc +%= @intFromEnum(o);
+                    }
+                }
+                const ns = nowNs(io) - t0;
+                const tag = switch (which) {
+                    0 => "u64",
+                    1 => "memcmp",
+                    else => "hand",
+                };
+                std.debug.print("keycmp_{s},{d},{d:.0}\n", .{ tag, KN * KREP, opsPerSec(KN * KREP, ns) });
+                if (acc == 0xDEADBEEF) std.debug.print("keycmp_guard,1,0\n", .{});
+            }
+        }
+    }
+
     std.debug.print("bench_done,1,1\n", .{});
     out.deinit(alloc);
     // threaded.deinit() 会让进程收尾更慢，基准进程直接靠 OS 回收；这里保留但注释说明
