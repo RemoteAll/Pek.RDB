@@ -468,28 +468,53 @@ pub const Table = struct {
         start: []const u8,
         end: []const u8,
     ) !RecordSet {
-        var refs: std.ArrayList(segmod.Segment.RefRecord) = .empty;
-        defer refs.deinit(self.alloc);
-        try self.scanRefs(start, end, &refs);
-
+        // 第一遍：只统计条数与总字节，**不收集任何记录**。
+        //
+        // 旧实现是「scanRefs 收集全部 RefRecord（48B/条，20 万行 = 9.6MB 写入）
+        // → 算 total → 分配 buf → 再把它们逐条复制进 buf → 扔掉 refs」。
+        // 中间那 9.6MB 纯粹是为了「知道 buf 多大」而付的，扫两遍就能完全省掉。
+        // 代价是多走一遍 k 路归并：`count_range` 档实测 55.5M 行/s（20 万行 3.6ms），
+        // 而收集那 9.6MB 要 7.6ms（`count_range` → `scan_refs_full` 的落差，见 §16.1.14）。
+        var n: usize = 0;
         var total: usize = 0;
-        for (refs.items) |r| total += r.key.len + r.value.len;
+        {
+            var it = MergeIter{};
+            try it.init(self, start, end);
+            defer it.deinit();
+            while (it.next()) |rec| {
+                n += 1;
+                total += rec.key.len + rec.value.len;
+            }
+        }
 
         const buf = try self.alloc.alloc(u8, total);
         errdefer self.alloc.free(buf);
-        const records = try self.alloc.alloc(RecordOwned, refs.items.len);
+        const records = try self.alloc.alloc(RecordOwned, n);
         errdefer self.alloc.free(records);
 
+        // 第二遍：边遍历边填，不再产生中间数组。
+        // 两遍必须产出一致的结果 —— MergeIter 对同一 snapshot 是确定性的，
+        // 且约定「扫描期间不得写」；下面的 assert 就是这个不变量的守门人。
         var off: usize = 0;
-        for (refs.items, 0..) |r, i| {
-            const k = buf[off..][0..r.key.len];
-            @memcpy(k, r.key);
-            off += r.key.len;
-            const v = buf[off..][0..r.value.len];
-            @memcpy(v, r.value);
-            off += r.value.len;
-            records[i] = .{ .key = k, .seq = r.seq, .flags = r.flags, .value = v };
+        var i: usize = 0;
+        {
+            var it = MergeIter{};
+            try it.init(self, start, end);
+            defer it.deinit();
+            while (it.next()) |r| {
+                std.debug.assert(i < n);
+                const k = buf[off..][0..r.key.len];
+                @memcpy(k, r.key);
+                off += r.key.len;
+                const v = buf[off..][0..r.value.len];
+                @memcpy(v, r.value);
+                off += r.value.len;
+                records[i] = .{ .key = k, .seq = r.seq, .flags = r.flags, .value = v };
+                i += 1;
+            }
         }
+        std.debug.assert(i == n);
+        std.debug.assert(off == total);
         return .{ .alloc = self.alloc, .buf = buf, .records = records };
     }
     /// 通用 refs 扫描：memtable + 所有段的 k 路归并（值零拷贝借用；调用期间不得写）。

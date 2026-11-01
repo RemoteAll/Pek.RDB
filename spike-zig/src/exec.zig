@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
+﻿// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
 // 个人使用免费；商业使用需商业授权，或同样以 AGPL-3.0 开源（见 LICENSE）。
 const std = @import("std");
 const sql = @import("sql.zig");
@@ -349,11 +349,12 @@ pub fn selectRows(
     var hi: [16]u8 = @splat(0xFF);
     // 只收集 value 切片（16B/条），不收集 key/seq/flags（`RefRecord` 是 48B/条）。
     // 100 万行时输出量 48MB -> 16MB，而实测 `scanRefs` 占物化总耗时 66%。
-    var all_vals: std.ArrayList([]const u8) = .empty;
-    defer all_vals.deinit(alloc);
+    // 注意：**无 WHERE 且无 LIMIT 的主路径已经不收这个数组了**（走 `decodeAllRange` 两遍遍历），
+    // 这里只服务 WHERE 过滤与 LIMIT 提前终止两条分支。
     var keep: std.ArrayList([]const u8) = .empty;
     defer keep.deinit(alloc);
-
+    var all_vals: std.ArrayList([]const u8) = .empty;
+    defer all_vals.deinit(alloc);
     // 容量上界：各段行数 + memtable 行数（段合并过时偏大，但不会重分配）。
     var cap: usize = t.mem.len();
     for (t.segs.items) |sg| cap +|= sg.rows;
@@ -421,6 +422,12 @@ pub fn selectRows(
         } else {
             // 无 WHERE：cap 接近实际行数，预分配能避免重分配；
             // 但段合并过（大量覆盖/墓碑）时 cap 可能远大于实际，所以封顶 100 万条（16MB）。
+            //
+            // **这里曾经试过「两遍遍历直接解码」（省掉这 16MB 切片数组），实测是负优化**：
+            // 省下的是 16B/条的连续写（约 3ms/100 万行），多付的是一整遍 k 路归并
+            // （25 段 100 万行 ≈ 25ms）→ `sql_full` 18.63M → 12.86M（-31%）。
+            // 对比 `Table.scanRange` 那个同款改法却是正收益：那里省的是 48B/条（RefRecord）
+            // 且只有 20 万行，多一遍归并只 3.6ms。**同一种改法在不同规模下结论相反。**
             try all_vals.ensureTotalCapacity(alloc, @min(cap, 1 << 20));
             try t.scanValues(&[_]u8{}, &hi, &all_vals);
             src = all_vals.items;
