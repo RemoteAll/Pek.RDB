@@ -88,6 +88,9 @@ $defs = @(
     @('sql_put', 'sql_put', 'put', '/s', $true),
     @('sql_each', 'sql_each', 'sql_full_touch', '/s', $true),
     @('sql_limit10', 'sql_limit10', 'sql_limit10', '/s', $true),
+    # SQL 点查：两边走 SQL 接口 + 同一 xorshift64 主键序列（不是存储 API 的 get）。
+    # p13 及之前 SQLite 侧没有这个探针，会自动跳过。
+    @('sql_get', 'sql_get', 'sql_get', '/s', $true),
     @('sql_full', 'sql_full', 'sql_full', '/s', $true),
     @('conc1', 'conc_put_1t', 'conc_put_1t_txn', '/s', $true),
     @('conc2', 'conc_put_2t', 'conc_put_2t_txn', '/s', $true),
@@ -109,7 +112,7 @@ $defs = @(
 # ~63B. The resulting 51.7x / 9.96x measures write amplification, not engine
 # speed (see docs/决策记录.md 七十九). Showing them as "we are faster" is exactly
 # the cross-criteria claim the user rejected.
-$show = @('upd_get', 'upd_random', 'get', 'big_get', 'sql_limit10', 'sql_each',
+$show = @('upd_get', 'upd_random', 'get', 'big_get', 'sql_limit10', 'sql_each', 'sql_get',
           'big_put', 'conc4', 'conc2', 'conc1', 'put_batch', 'count_10k',
           'big_count', 'big_count_range', 'scan', 'scan_refs',
           'recover', 'big_recover')
