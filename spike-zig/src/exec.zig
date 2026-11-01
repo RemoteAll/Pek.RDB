@@ -1742,3 +1742,76 @@ test "HAVING：按聚合结果过滤组，NULL 聚合被排除" {
         try std.testing.expectEqual(@as(i64, 4), rows.rows[1][0].integer); // 6 次之
     }
 }
+
+test "HAVING 与 WHERE 组合：WHERE 先过滤行，HAVING 后过滤组" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-exec-where-having";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    const cols = [_]schema_mod.Column{
+        .{ .name = "id", .col_type = .integer, .primary_key = true },
+        .{ .name = "g", .col_type = .integer },
+        .{ .name = "x", .col_type = .integer },
+        .{ .name = "s", .col_type = .text },
+    };
+    var s = try schema_mod.Schema.init(alloc, "wh", &cols);
+    defer s.deinit(alloc);
+    var t = try tablemod.Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+
+    {
+        // g=1: x=1,2,3 / g=2: x=10,20 / g=3: x=100
+        var p = try sql.parse(alloc,
+            "INSERT INTO wh (id, g, x, s) VALUES (1,1,1,'b'), (2,1,2,'a'), (3,1,3,'c'), " ++
+                "(4,2,10,'z'), (5,2,20,'y'), (6,3,100,'m')");
+        defer p.deinit();
+        _ = try insertRows(&t, &s, p.stmt.insert, alloc);
+    }
+
+    // WHERE x < 10 只剩 g=1 的 3 行与 g=2 的 1 行（x=10 被排除），
+    // 再 HAVING COUNT(*) >= 2 → 只剩 g=1（3 行）；g=2 只有 1 行被淘汰。
+    // 若把两个过滤顺序弄反（先 HAVING 再 WHERE），g=2 会被保留 → 结果不同。
+    {
+        var p = try sql.parse(alloc,
+            "SELECT g, COUNT(*), SUM(x) FROM wh WHERE x < 10 GROUP BY g HAVING COUNT(*) >= 2 ORDER BY g");
+        defer p.deinit();
+        var rows = try selectRows(&t, &s, p.stmt.select, alloc);
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+        try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
+        try std.testing.expectEqual(@as(i64, 3), rows.rows[0][1].integer);
+        try std.testing.expectEqual(@as(i64, 6), rows.rows[0][2].integer); // 1+2+3，不是 1+2+3+10
+    }
+
+    // 文本列上的 MIN/MAX（走 ownValue + valueCmp 的文本分支）
+    {
+        var p = try sql.parse(alloc, "SELECT g, MIN(s), MAX(s) FROM wh GROUP BY g ORDER BY g");
+        defer p.deinit();
+        var rows = try selectRows(&t, &s, p.stmt.select, alloc);
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 3), rows.rows.len);
+        try std.testing.expectEqualStrings("a", rows.rows[0][1].text); // g=1: b,a,c
+        try std.testing.expectEqualStrings("c", rows.rows[0][2].text);
+        try std.testing.expectEqualStrings("y", rows.rows[1][1].text); // g=2: z,y
+        try std.testing.expectEqualStrings("z", rows.rows[1][2].text);
+        try std.testing.expectEqualStrings("m", rows.rows[2][1].text); // g=3: m
+    }
+
+    // HAVING 作用在文本聚合上（MIN(s) > 'b' 的组）
+    {
+        var p = try sql.parse(alloc, "SELECT g FROM wh GROUP BY g HAVING MIN(s) > 'b' ORDER BY g");
+        defer p.deinit();
+        var rows = try selectRows(&t, &s, p.stmt.select, alloc);
+        defer rows.deinit();
+        // g=1 MIN='a' 不满足；g=2 MIN='y' 满足；g=3 MIN='m' 满足
+        try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
+        try std.testing.expectEqual(@as(i64, 2), rows.rows[0][0].integer);
+        try std.testing.expectEqual(@as(i64, 3), rows.rows[1][0].integer);
+    }
+}

@@ -221,3 +221,70 @@ test "engine create/insert/reopen/update/delete" {
         try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
     }
 }
+
+test "engine 全链路：CREATE/INSERT 后 GROUP BY + HAVING + ORDER BY 聚合" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const root = "test-engine-agg";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    {
+        var eng = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+        defer eng.deinit();
+
+        {
+            var p = try sql.parse(alloc, "CREATE TABLE sales (id INTEGER PRIMARY KEY, city TEXT, amount INTEGER)");
+            defer p.deinit();
+            _ = try eng.execute(p.stmt, alloc);
+        }
+        {
+            // 北京 2 笔共 300；上海 1 笔 50；广州 3 笔共 60
+            var p = try sql.parse(alloc,
+                "INSERT INTO sales (id, city, amount) VALUES " ++
+                    "(1,'bj',100), (2,'bj',200), (3,'sh',50), (4,'gz',10), (5,'gz',20), (6,'gz',30)");
+            defer p.deinit();
+            const ins = try eng.execute(p.stmt, alloc);
+            try std.testing.expectEqual(@as(usize, 6), ins.inserted);
+        }
+    }
+
+    // 关闭后从磁盘重开：证明聚合依赖的 schema/catalog 落盘是对的
+    var eng2 = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    defer eng2.deinit();
+
+    {
+        var p = try sql.parse(alloc,
+            "SELECT city, COUNT(*), SUM(amount) FROM sales GROUP BY city HAVING SUM(amount) >= 100 ORDER BY sum(amount) DESC");
+        defer p.deinit();
+        const res = try eng2.execute(p.stmt, alloc);
+        var rows = res.rows;
+        defer rows.deinit();
+
+        try std.testing.expectEqual(@as(usize, 1), rows.rows.len); // 只有 bj(300) 达到 100
+        try std.testing.expectEqualStrings("bj", rows.rows[0][0].text);
+        try std.testing.expectEqual(@as(i64, 2), rows.rows[0][1].integer);
+        try std.testing.expectEqual(@as(i64, 300), rows.rows[0][2].integer);
+        try std.testing.expectEqualStrings("city", rows.columns[0]);
+        try std.testing.expectEqualStrings("count(*)", rows.columns[1]);
+        try std.testing.expectEqualStrings("sum(amount)", rows.columns[2]);
+    }
+
+    // 放宽 HAVING 后三座城市都在，按金额降序（bj 300 / gz 60 / sh 50）
+    {
+        var p = try sql.parse(alloc,
+            "SELECT city, SUM(amount) FROM sales GROUP BY city HAVING SUM(amount) > 0 ORDER BY sum(amount) DESC");
+        defer p.deinit();
+        const res = try eng2.execute(p.stmt, alloc);
+        var rows = res.rows;
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 3), rows.rows.len);
+        try std.testing.expectEqualStrings("bj", rows.rows[0][0].text);
+        try std.testing.expectEqualStrings("gz", rows.rows[1][0].text);
+        try std.testing.expectEqualStrings("sh", rows.rows[2][0].text);
+    }
+}
