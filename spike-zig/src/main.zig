@@ -55,6 +55,51 @@ fn keyOf(v: i64) [8]u8 {
     return b;
 }
 
+/// 批量写的公共口径（`flush_bytes` 可调），用于「段 fsync 次数 vs 吞吐/尾部」的敏感度实验。
+///
+/// 背景（`docs/审计-2026-11-01-第八轮.md`）：段写耗时里 **fsync 占 ~60%**
+/// （235–288ms / 394–453ms，200 万行 / 25 次 flush），而 `flush_calls` 与 `flush_bytes`
+/// 近似成反比 —— 8MB→25 次、32MB→约 7 次、64MB→约 4 次。
+/// 如果尾部崩塌与 fsync **次数**有关，那么同样 200 万行、同样总量的写入，
+/// 更大 `flush_bytes` 应当更稳。这是「实测」而不是「按直觉调参」。
+const BulkResult = struct {
+    ops: f64,
+    flushes: u64,
+    ns_flush: u64,
+    ns_seg_sync: u64,
+};
+
+fn bulkWrite(
+    io: std.Io,
+    dir: std.Io.Dir,
+    path: []const u8,
+    alloc: std.mem.Allocator,
+    value: []const u8,
+    n: u64,
+    flush_bytes: usize,
+) !BulkResult {
+    dir.deleteTree(io, path) catch {};
+    defer dir.deleteTree(io, path) catch {};
+    var t = try tablemod.Table.open(io, dir, path, alloc, .{
+        .wal_sync_every = 0,
+        .flush_bytes = flush_bytes,
+    });
+    defer t.deinit();
+    const t0 = nowNs(io);
+    var i: u64 = 0;
+    while (i < n) : (i += 1) {
+        const kb = keyOf(@intCast(i));
+        try t.put(&kb, value);
+    }
+    try t.flush();
+    return .{
+        .ops = opsPerSec(n, nowNs(io) - t0),
+        .flushes = t.flush_calls,
+        .ns_flush = t.ns_flush,
+        .ns_seg_sync = t.ns_seg_sync,
+    };
+}
+
 /// **只给基准用**：旧版定长行头（`klen4+vlen4+seq8+flags1 = 17 B`）的解析。
 ///
 /// 存在的唯一目的是和 `codec.readRec`（varint 头，6 B）做**同进程、背靠背**的配对对比 ——
@@ -647,6 +692,18 @@ fn benchMain() !void {
         // 段数据三段拆分：建文件 / 写块 / fsync
         std.debug.print("big_put_segphase,{d},{d}\n", .{ t6.ns_seg_create, t6.ns_seg_write });
         std.debug.print("big_put_segphase2,{d},{d}\n", .{ t6.ns_seg_sync, t6.ns_seg_data });
+
+        // **`flush_bytes` 敏感度实验**：同样 200 万行 / 同一时间窗口，只改段大小。
+        // 8MB（`big_put`）→ 约 25 次 flush；32MB/64MB → 约 7/4 次。
+        // 判据看两点：① 吞吐是否更高（fsync 次数少）；② **同轮内**是否比 `big_put` 更稳。
+        {
+            const r32 = try bulkWrite(io, dir, "bench-data-fb32", alloc, &value, big_n, 32 << 20);
+            std.debug.print("big_put_fb32,{d},{d:.0}\n", .{ big_n, r32.ops });
+            std.debug.print("big_put_fb32_flushes,{d},{d}\n", .{ r32.flushes, r32.ns_seg_sync });
+            const r64 = try bulkWrite(io, dir, "bench-data-fb64", alloc, &value, big_n, 64 << 20);
+            std.debug.print("big_put_fb64,{d},{d:.0}\n", .{ big_n, r64.ops });
+            std.debug.print("big_put_fb64_flushes,{d},{d}\n", .{ r64.flushes, r64.ns_seg_sync });
+        }
 
         // **强耐久档参考**：`wal_sync_every = 10_000` = 每 1 万条 put 做一次 WAL fsync。
         //
