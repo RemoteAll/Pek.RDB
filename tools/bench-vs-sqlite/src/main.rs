@@ -462,6 +462,32 @@ fn main() -> rusqlite::Result<()> {
             let secs = t0.elapsed().as_secs_f64();
             println!("sql_limit10,{},{}", n, n as f64 / secs);
         }
+        // SQL 点查：与 Zig 侧 `sql_get` **同一个随机序列、同样的主键分布** ——
+        // 走 SQL 接口做 10 万次主键点查（不是 `get` 那种直连存储 API）。
+        // 随机数用 xorshift64 + 同一个种子，否则两边点的不是同一批 key，比较无意义。
+        {
+            let t0 = Instant::now();
+            let mut hits: i64 = 0;
+            let mut x: u64 = 88_172_645_463_325_252;
+            {
+                let mut stmt = c3.prepare("SELECT id, v FROM t WHERE id = ?1")?;
+                let mut k: i64 = 0;
+                while k < GET_N {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    let id = (x % N as u64) as i64;
+                    let mut rows = stmt.query([id])?;
+                    if rows.next()?.is_some() {
+                        hits += 1;
+                    }
+                    k += 1;
+                }
+            }
+            let secs = t0.elapsed().as_secs_f64();
+            println!("sql_get,{},{}", GET_N, GET_N as f64 / secs);
+            println!("sql_get_hits,{},{}", GET_N, hits);
+        }
         {
             let t0 = Instant::now();
             let mut n: usize = 0;

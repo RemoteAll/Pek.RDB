@@ -5,7 +5,7 @@
 <style>
   * { margin:0; padding:0; box-sizing:border-box; }
   body {
-    width:1080px; height:1470px; overflow:hidden;
+    width:1080px; height:1860px; overflow:hidden;
     background:
       radial-gradient(900px 600px at 12% -8%, rgba(56,189,248,.20), transparent 60%),
       radial-gradient(700px 520px at 105% 8%, rgba(167,139,250,.18), transparent 62%),
@@ -73,10 +73,12 @@
 const DATA = __DATA__;
 const LABELS = {
   put:'逐行写入（组提交档・我方 256KB 缓冲）', put_sync:'逐行写入（逐行落盘档・与 SQLite 同档）', sql_put:'逐行写入（SQL 层）',
+  sql_limit10:'SQL 取 10 行（LIMIT）', sql_each:'SQL 全表流式解两列',
   upd_get:'更新后点查', upd_random:'随机更新 10 万行', get:'主键点查',
-  conc4:'并发写 4 线程', big_get:'超内存点查（25 段）', big_put:'超内存批量写 200 万行',
+  conc1:'并发写 1 线程', conc4:'并发写 4 线程', big_get:'超内存点查（25 段）', big_put:'超内存批量写 200 万行',
   conc2:'并发写 2 线程', put_batch:'单事务批量写', count_10k:'范围扫描（只数行）',
-  big_count:'超内存全表遍历', scan_refs:'范围扫描（收集记录）'
+  big_count:'超内存全表遍历', big_count_range:'超内存范围扫描', scan:'范围扫描（内存表）',
+  scan_refs:'范围扫描（收集记录）', recover:'冷重开 100 万行', big_recover:'冷重开 200 万行/25 段'
 };
 const fmt = n => n >= 1000 ? Math.round(n).toLocaleString('en-US') : n.toFixed(2);
 const maxRatio = Math.max(...DATA.rows.map(r => r.ratio));

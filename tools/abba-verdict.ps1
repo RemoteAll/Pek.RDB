@@ -47,7 +47,12 @@ $pairs = @(
     @('sql_put', 'put', $true),
     @('sql_get', 'sql_get', $true),
     @('sql_full', 'sql_full', $true),
-    @('sql_full_touch', 'sql_full_touch', $true),
+    # 我方 `sql_each` = 流式逐行、解码两列；SQLite `sql_full_touch` = 取两列值（不解码成行对象）。
+    # 两边都「解出两列」，是同口径。旧表里 `sql_full_touch` 被配到自己（我方根本没这个指标），
+    # 等于这一项从来没被比较过 —— 补上。
+    @('sql_each', 'sql_full_touch', $true),
+    # LIMIT 提前终止：两边都是 `SELECT * FROM t LIMIT 10`，我方读到 10 行就停。
+    @('sql_limit10', 'sql_limit10', $true),
     # 以下三项我方是**逐行**写，SQLite 侧用的是**单事务**（它最有利的形态）——
     # 属于**对 SQLite 有利的保守口径**（我方可测值只会更高）。保留是因为 SQLite
     # 没有同量级的逐行变体（200 万行 autocommit 要跑几十秒），且方向不损对方。

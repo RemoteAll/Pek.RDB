@@ -86,6 +86,8 @@ $defs = @(
     @('count_10k', 'count_10k', 'scan_big', '/s', $true),
     @('scan_refs', 'scan_refs', 'scan_big_collect', '/s', $true),
     @('sql_put', 'sql_put', 'put', '/s', $true),
+    @('sql_each', 'sql_each', 'sql_full_touch', '/s', $true),
+    @('sql_limit10', 'sql_limit10', 'sql_limit10', '/s', $true),
     @('sql_full', 'sql_full', 'sql_full', '/s', $true),
     @('conc1', 'conc_put_1t', 'conc_put_1t_txn', '/s', $true),
     @('conc2', 'conc_put_2t', 'conc_put_2t_txn', '/s', $true),
@@ -107,8 +109,10 @@ $defs = @(
 # ~63B. The resulting 51.7x / 9.96x measures write amplification, not engine
 # speed (see docs/决策记录.md 七十九). Showing them as "we are faster" is exactly
 # the cross-criteria claim the user rejected.
-$show = @('upd_get', 'upd_random', 'get', 'big_get', 'big_put',
-          'conc4', 'conc2', 'put_batch', 'count_10k', 'big_count', 'scan_refs')
+$show = @('upd_get', 'upd_random', 'get', 'big_get', 'sql_limit10', 'sql_each',
+          'big_put', 'conc4', 'conc2', 'conc1', 'put_batch', 'count_10k',
+          'big_count', 'big_count_range', 'scan', 'scan_refs',
+          'recover', 'big_recover')
 
 # Chinese labels live in the UTF-8 HTML template (this file must stay ASCII).
 
@@ -158,8 +162,10 @@ foreach ($d in $defs) {
 
     $rows += [pscustomobject]@{
         k     = $key
-        z     = [math]::Round($zm, 0)
-        s     = [math]::Round($sm, 0)
+        # ms 类指标必须保留小数：recover 实测 0.44ms，按 0 位取整会显示成 0.00ms，
+        # 看起来像造假（而且 2.02x 的两边都显示 1.00ms）。
+        z     = if ($unit -eq 'ms') { [math]::Round($zm, 2) } else { [math]::Round($zm, 0) }
+        s     = if ($unit -eq 'ms') { [math]::Round($sm, 2) } else { [math]::Round($sm, 0) }
         unit  = $unit
         ratio = [math]::Round($shown, 2)
     }
@@ -234,7 +240,7 @@ if (-not (Test-Path $edge)) { Write-Host 'no headless browser found; keep the HT
 
 $uri = 'file:///' + ($OutHtml -replace '\\', '/')
 & $edge --headless=new --disable-gpu --hide-scrollbars --force-device-scale-factor=1 `
-    --window-size=1080,1470 --screenshot=$OutPng $uri 2>$null | Out-Null
+    --window-size=1080,1860 --screenshot=$OutPng $uri 2>$null | Out-Null
 if (Test-Path $OutPng) {
     $kb = [math]::Round((Get-Item $OutPng).Length / 1KB, 1)
     Write-Host "png  -> $OutPng  ($kb KB)"
