@@ -266,7 +266,9 @@ fn main() -> rusqlite::Result<()> {
             let fsz = |p: &str| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
             let total = fsz(path) + fsz(&format!("{path}-wal")) + fsz(&format!("{path}-shm"));
             println!("big_disk_bytes,{},{}", BIG, total);
-            println!("big_disk_bytes_row,1,{}", total / BIG as u64);
+            // Print with decimals: integer division turned 41.56 into 41 and the Zig side's
+            // 40.92 into 40, so both sides were biased but by different amounts.
+            println!("big_disk_bytes_row,1,{:.3}", total as f64 / BIG as f64);
         }
 
         // 随机点查

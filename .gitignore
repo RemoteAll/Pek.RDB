@@ -25,3 +25,9 @@ tools/bench-vs-sqlite/*.db-shm
 /bench-*.db
 /bench-*.db-wal
 /bench-*.db-shm
+
+# Zig 基准的落盘目录：正常跑完会自己删（defer deleteTree），
+# 但中断（Ctrl-C / kill）会留下几十 MB。`spike-zig/` 下的已经挡了，
+# 从仓库根跑 `spike-zig\zig-out\bin\spike-bench.exe` 时它会建在根下 —— 这里补上。
+/bench-data*/
+/bench-data-*/

@@ -312,7 +312,12 @@ pub const Writer = struct {
         if (self.blk_n == 0) return;
         const n: usize = @intCast(self.blk_n);
         const raw = self.blk_buf.items;
-        const pfx = self.blk_pfx;
+        // 块头只有 1 字节（≤255），而 key 长度没有上限：
+        // 长 key 且块内共享超长前缀时，必须**截到 255**，否则 @intCast 溢出
+        // （ReleaseFast 下是未定义行为，Debug 下直接 panic）。
+        // 截断只损失一点压缩率，语义不变 —— 读侧按块头里的 pfx 补前缀，不会多不少。
+        const pfx: usize = @min(self.blk_pfx, 255);
+        const stored: u8 = @intCast(pfx);
 
         // 索引项：offset 指向即将写入的块头；key 用块首 key 的**拷贝**
         // （块首 key 在 `raw` 里，下一块就会复用）。
@@ -326,7 +331,7 @@ pub const Writer = struct {
             });
         }
 
-        try self.buf.append(self.alloc, @intCast(pfx));
+        try self.buf.append(self.alloc, stored);
 
         var i: usize = 0;
         while (i < n) : (i += 1) {
@@ -335,7 +340,7 @@ pub const Writer = struct {
             // 行头原样搬（klen 仍写**完整**长度，读侧据此知道要补多少前缀字节）
             try self.buf.appendSlice(self.alloc, raw[self.blk_off[i]..hdr_end]);
             // 块首那条从 key 首字节开始，其余跳过公共前缀
-            const skip: usize = if (i == 0) 0 else pfx;
+            const skip: usize = if (i == 0) 0 else stored;
             try self.buf.appendSlice(self.alloc, raw[hdr_end + skip .. rec_end]);
         }
 
@@ -890,11 +895,22 @@ pub const Segment = struct {
         // 未解析时 `entries` 只有头部装的那 1 条，二分会在 1 条里找 → **结果错**。
         // 这是懒解析最危险的一处静默错误，用断言守住。
         std.debug.assert(self.parsed);
+        // 找「第一个段首 key >= target」的块，再回退一块 —— 也就是
+        // 「最后一个段首 key **严格小于** target 的块」。
+        //
+        // **不能用「最后一个段首 key ≤ target」**（即 `== .gt` 那版）：同一 key 的多个版本
+        // 会跨段界（稀疏索引每 64 行一条，而版本列是按 seq 降序排的），
+        // 那时第 i−1 块与第 i 块的段首 key **都是这个 key**，
+        // 从第 i 块开始扫就漏掉了第 i−1 块里更新的版本 → **读到旧值**
+        // （用例 `同一 key 的多个版本跨过索引边界` 守着，撤掉修复会返回 v6 而不是 v70）。
+        //
+        // 代价：仅当 target 恰好等于某个段首 key 时才多扫一块（约 1/64 的查询），
+        // 其余情形与旧写法完全一致。
         var lo: usize = 0;
         var hi: usize = self.entries.items.len;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            if (keyCmp(self.entryKey(mid), key) == .gt) {
+            if (keyCmp(self.entryKey(mid), key) != .lt) {
                 hi = mid;
             } else {
                 lo = mid + 1;
@@ -914,7 +930,11 @@ pub const Segment = struct {
         const i = self.candidateIndex(key);
         const begin: usize = @intCast(self.entries.items[i].offset);
         const it = try self.iter();
-        const end: u64 = if (i + 1 < self.entries.items.len) self.entries.items[i + 1].offset else it.buf.len;
+        // 上界要**放宽一块**：`candidateIndex` 返回的是「最后一个段首 key 严格小于 target 的块」，
+        // 当 target 恰好是下一块的段首 key 时，`begin` 就在它的**前一块**上。
+        // 只放到 `entries[i+1]` 会在扫完前一块就停，target 根本见不到 → 返回 null
+        // （用例 `同一 key 的多个版本跨过索引边界` 与 `>255 公共前缀` 都会踩到）。
+        const end: u64 = if (i + 2 < self.entries.items.len) self.entries.items[i + 2].offset else it.buf.len;
         if (end <= begin) return null;
         it.seek(begin);
 
@@ -950,7 +970,7 @@ pub const Segment = struct {
     pub fn scanRefs(self: *Segment, start: []const u8, end: []const u8, snapshot: u64, out: *std.ArrayList(RefRecord)) !void {
         try self.ensureParsed();
         if (self.entries.items.len == 0) return;
-        self.key_arena.reset();
+        self.key_arena.reset(self.alloc);
         const i = self.candidateIndex(start);
         const it = try self.iter();
         it.sink = &self.key_arena; // 收集型 API：key 直接重建进 arena
@@ -1105,6 +1125,113 @@ test "segment idx 被翻位后必须报错（不静默返回错误结果）" {
     var seg = try Segment.open(io, dir, tmp ++ "/000001.data", tmp ++ "/000001.idx", alloc, false);
     defer seg.close();
     try std.testing.expectError(error.BadIndexChecksum, seg.ensureParsed());
+}
+
+test "segment：块内前缀 >255 字节（块头 1 字节必须截断）" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-longpfx-tmp";
+    dir.deleteTree(io, tmp) catch {};
+    try dir.createDirPath(io, tmp);
+    defer dir.deleteTree(io, tmp) catch {};
+
+    // 70 条 key：前 300 字节完全相同，后 6 字节是升序编号。
+    // 块头只有 1 字节 pfx（≤255），所以写入侧必须把前缀**截到 255**；
+    // 不截断就是 @intCast 溢出（Debug panic / ReleaseFast UB）。
+    // 70 条 > INDEX_STRIDE(64)，正好跨两块：满块 + 残块，两条路径都覆盖。
+    const N = 70;
+    var common: [300]u8 = @splat('p');
+    var keys: [N][306]u8 = undefined;
+    for (&keys, 0..) |*k, i| {
+        @memcpy(k[0..300], &common);
+        std.mem.writeInt(u48, k[300..306], @intCast(i), .big);
+    }
+
+    {
+        var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc, 10, N);
+        defer w.deinit();
+        for (&keys, 0..) |*k, i| try w.push(k, i + 1, 0, "v");
+        _ = try w.finish(dir, tmp ++ "/000001.idx");
+    }
+
+    var seg = try Segment.open(io, dir, tmp ++ "/000001.data", tmp ++ "/000001.idx", alloc, false);
+    defer seg.close();
+
+    // 点查：跨块边界两侧各取一条
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    for ([_]usize{ 0, 63, 64, N - 1 }) |i| {
+        try std.testing.expectEqual(@as(u8, 0), (try seg.get(&keys[i], N + 1, &out)).?);
+        try std.testing.expectEqualStrings("v", out.items);
+    }
+
+    // 全量扫描：每条 key 必须逐字节还原
+    var rows: std.ArrayList(RecordOwned) = .empty;
+    defer {
+        for (rows.items) |r| {
+            alloc.free(r.key);
+            alloc.free(r.value);
+        }
+        rows.deinit(alloc);
+    }
+    try seg.scanRange("", "q", 999, &rows);
+    try std.testing.expectEqual(@as(usize, N), rows.items.len);
+    for (&keys, 0..) |*k, i| try std.testing.expectEqualStrings(k, rows.items[i].key);
+}
+
+test "segment：同一 key 的多个版本跨过索引边界（64 行）时，点查必须拿到最新可见版本" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-dupkey-boundary-tmp";
+    dir.deleteTree(io, tmp) catch {};
+    try dir.createDirPath(io, tmp);
+    defer dir.deleteTree(io, tmp) catch {};
+
+    // 同一个 key "k" 的 70 个版本（seq 70..1，按 key asc / seq desc 升序排列），
+    // 必然跨过第 64 行那条稀疏索引边界。
+    //
+    // 会踩到的坑：`candidateIndex` 若返回「最后一个段首 key ≤ target 的块」，
+    // 而第 1 块与第 2 块的段首 key **都是 "k"**，就会从第 2 块（较旧版本）开始扫，
+    // 直接漏掉第 1 块里 seq 61..70 这些更新的版本 → 返回旧值。
+    const nver: u64 = 70;
+    {
+        var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc, 10, nver);
+        defer w.deinit();
+        var s: u64 = nver;
+        while (s >= 1) : (s -= 1) {
+            const buf = try std.fmt.allocPrint(alloc, "v{d}", .{s});
+            defer alloc.free(buf);
+            try w.push("k", s, 0, buf);
+            if (s == 1) break;
+        }
+        _ = try w.finish(dir, tmp ++ "/000001.idx");
+    }
+
+    var seg = try Segment.open(io, dir, tmp ++ "/000001.data", tmp ++ "/000001.idx", alloc, false);
+    defer seg.close();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    // 快照 = 无限：必须拿到 seq 最大的版本
+    try std.testing.expectEqual(@as(u8, 0), (try seg.get("k", 1_000_000, &out)).?);
+    try std.testing.expectEqualStrings("v70", out.items);
+
+    // 快照 = 65：必须拿到 seq ≤ 65 里最大的那个（v65）
+    _ = try seg.get("k", 65, &out);
+    try std.testing.expectEqualStrings("v65", out.items);
+
+    // 快照 = 5：只有 v5 及更旧可见
+    _ = try seg.get("k", 5, &out);
+    try std.testing.expectEqualStrings("v5", out.items);
 }
 
 test "segment write + point get + scan" {

@@ -733,7 +733,9 @@ fn benchMain() !void {
                 } else |_| {}
             }
             std.debug.print("big_disk_bytes,{d},{d}\n", .{ big_n, total });
-            std.debug.print("big_disk_bytes_row,1,{d}\n", .{total / big_n});
+            // 必须打小数：整数除法把 40.92 截成 40、把 SQLite 的 41.56 截成 41，
+            // 两边各自向下取整，但余额不同，等于我们自己多让了 0.9 B/行（对自己有利的偏差也要修）。
+            std.debug.print("big_disk_bytes_row,1,{d:.3}\n", .{@as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(big_n))});
             // 写放大（千分比）：flush 产出 + 合并重写 ÷ 用户数据量。
             // 本档不触发自动合并，所以 ≈1000（1.0×）；有合并的档位见 `cm_write_amp_milli`。
             std.debug.print("big_write_amp_milli,1,{d}\n", .{(t6.flush_bytes_total + t6.compact_bytes_total) * 1000 / @max(1, t6.flush_bytes_total)});

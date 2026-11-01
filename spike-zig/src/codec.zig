@@ -368,14 +368,29 @@ pub const KeyArena = struct {
     idx: usize = 0,
     used: usize = 0,
     chunk_size: usize = 1 << 20,
+    /// `reset` 时最多保留多少字节的分块。超出部分**释放**，下次扫描按需重新分配。
+    ///
+    /// 不设上限的话，跑过一次全表 `scanRefs`（200 万行 × 8B ≈ 16MB）之后，
+    /// 那些分块会一直挂在 `Table` 上 —— 对「偶尔一次大扫描」的进程就是纯浪费。
+    /// 保留 4MB 是为了让常规的小范围扫描（几万行）完全免分配。
+    retain_bytes: usize = 4 << 20,
 
     pub fn deinit(self: *KeyArena, a: std.mem.Allocator) void {
         for (self.chunks.items) |c| a.free(c);
         self.chunks.deinit(a);
     }
 
-    /// 回到起点，**保留已分配的块**供下次扫描复用。
-    pub fn reset(self: *KeyArena) void {
+    /// 回到起点：保留前 `retain_bytes` 字节的分块供复用，其余释放。
+    pub fn reset(self: *KeyArena, a: std.mem.Allocator) void {
+        var keep: usize = 0;
+        var total: usize = 0;
+        while (total < self.retain_bytes and keep < self.chunks.items.len) : (keep += 1) {
+            total += self.chunks.items[keep].len;
+        }
+        while (self.chunks.items.len > keep) {
+            const c = self.chunks.pop().?;
+            a.free(c);
+        }
         self.idx = 0;
         self.used = 0;
     }
@@ -653,6 +668,39 @@ test "RecIter: 块内公共前缀往返（pfx=0 / pfx>0 / 残块 / 空 key）" {
             try std.testing.expectEqualStrings(keys[bi * stride + 1], r1.key);
         }
     }
+}
+
+test "KeyArena：跨块分配的切片永不移动；reset 复用；retain 有上界" {
+    const alloc = std.testing.allocator;
+    var a = KeyArena{ .chunk_size = 64, .retain_bytes = 128 };
+    defer a.deinit(alloc);
+
+    // 分配 4 块（远超 retain）：先前拿到的切片内容必须还在原处
+    var ptrs: [8][]u8 = undefined;
+    for (&ptrs, 0..) |*p, i| {
+        p.* = try a.alloc(alloc, 40);
+        @memset(p.*, @intCast('a' + i));
+    }
+    for (ptrs, 0..) |p, i| {
+        try std.testing.expectEqual(@as(usize, 40), p.len);
+        try std.testing.expectEqual(@as(u8, @intCast('a' + i)), p[0]);
+        try std.testing.expectEqual(@as(u8, @intCast('a' + i)), p[39]);
+    }
+
+    // raw slice 超过 chunk_size 也要能分配（单独占一块）
+    const big = try a.alloc(alloc, 100);
+    @memset(big, 'Z');
+    try std.testing.expectEqual(@as(usize, 100), big.len);
+
+    // reset 后最多保留 retain_bytes（128），其余释放；再分配仍可用
+    a.reset(alloc);
+    var kept: usize = 0;
+    for (a.chunks.items) |c| kept += c.len;
+    try std.testing.expect(kept <= a.retain_bytes);
+
+    const again = try a.alloc(alloc, 40);
+    @memset(again, 'q');
+    try std.testing.expectEqual(@as(u8, 'q'), again[0]);
 }
 
 test "crc32 known value" {

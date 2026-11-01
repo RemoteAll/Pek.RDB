@@ -589,7 +589,7 @@ pub const Table = struct {
     ///
     /// **key 有效期**：指向本表内部的 `key_slab`，在下一次 `scanRefs` 之前都可用（value 不受影响）。
     pub fn scanRefs(self: *Table, start: []const u8, end: []const u8, out: *std.ArrayList(segmod.Segment.RefRecord)) !void {
-        self.key_arena.reset();
+        self.key_arena.reset(self.alloc);
         var it = MergeIter{};
         try it.initStable(self, start, end, &self.key_arena);
         defer it.deinit();
