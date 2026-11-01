@@ -110,15 +110,28 @@ pub const IndexMap = struct {
 };
 
 /// 把整个文件映射成只读切片；空文件/不存在按 `FileNotFound` 上报（调用方据此区分「新建库」）。
-pub fn mapWholeFile(io: std.Io, dir: std.Io.Dir, path: []const u8, max: u64) !IndexMap {
+///
+/// `max == 0` 表示**不限制**（不再把容量卡在一个写死的常量上）；非 0 时才把 `FileTooBig` 当错误。
+///
+/// `prefault_max`：文件不超过它时整段预缺页，否则不预缺页。这一条不是调优而是**正确性/可用性**：
+/// Zig 0.17 的 `MemoryMap.CreateOptions.populate` 默认是 **true**，Windows 实现里它真的会调
+/// `NtSetInformationVirtualMemory(Prefetch)` 把**整段**拉进工作集（`std/Io/Threaded.zig`
+/// `createFileMap` 里对 `[ptr, len)` 一次性预取）。3 MB 的归档预取是好事（冷重开 0.6 ms 有它一份），
+/// 但 100 GB 的归档预取 = 打开时读 100 GB，所以必须按大小关掉。
+pub fn mapWholeFile(io: std.Io, dir: std.Io.Dir, path: []const u8, max: u64, prefault_max: u64) !IndexMap {
     const f = try dir.openFile(io, path, .{});
     errdefer f.close(io);
     const size = (try f.stat(io)).size;
-    if (size > max) return error.FileTooBig;
+    if (max != 0 and size > max) return error.FileTooBig;
     if (size == 0) return error.FileNotFound;
+    // 32 位目标：去掉 64 GiB 上限后，这里会真正遇到「文件比地址空间还大」。
+    // `@intCast(size)` 到 `usize` 在越界时是安全模式 panic / ReleaseFast UB，
+    // 所以必须显式拒绝（而不是让下标宽度静默截断）。
+    if (size > std.math.maxInt(usize)) return error.FileTooBig;
     const mm = try std.Io.File.MemoryMap.create(io, f, .{
         .len = @intCast(size),
         .protection = .{ .read = true, .write = false },
+        .populate = size <= prefault_max,
     });
     return .{ .io = io, .file = f, .mm = mm };
 }

@@ -70,6 +70,32 @@ pub fn build(b: *std.Build) void {
     const vec_step = b.step("run-bench-vector", "Run the vector search feasibility prototype");
     vec_step.dependOn(&run_vec.step);
 
+    // 容量阶梓基准（决策记录八十九）：1 亿行量级的开表/冷重开/点查/扫描。
+    // 单独入口：灌数据写 4.86 GB、跑几分钟，不能塞进 vs-SQLite 的正式批次。
+    // 参数用编译期选项（Zig 0.17 的 `main` 签名/`b.args` 与旧版不同，编译期常量零风险）：
+    //   zig build run-scale -Doptimize=ReleaseFast -Dscale-rows=100000000 -Dscale-dir=scale-1e8
+    const scale_rows = b.option(u64, "scale-rows", "run-scale: rows to insert") orelse 2_000_000;
+    const scale_dir = b.option([]const u8, "scale-dir", "run-scale: data directory") orelse "scale-data";
+    const scale_opts = b.addOptions();
+    scale_opts.addOption(u64, "rows", scale_rows);
+    scale_opts.addOption([]const u8, "dir", scale_dir);
+    const scale_exe = b.addExecutable(.{
+        .name = "spike-scale",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_scale.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "pek_rdb_spike", .module = mod },
+                .{ .name = "build_options", .module = scale_opts.createModule() },
+            },
+        }),
+    });
+    b.installArtifact(scale_exe);
+    const run_scale = b.addRunArtifact(scale_exe);
+    const scale_step = b.step("run-scale", "Run the capacity ladder benchmark (-Dscale-rows / -Dscale-dir)");
+    scale_step.dependOn(&run_scale.step);
+
     const tests = b.addTest(.{
         .root_module = mod,
     });

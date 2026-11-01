@@ -45,6 +45,19 @@ pub const Options = struct {
     wal_sync_every: usize = 10_000,
     /// 打开段时是否把整个数据文件读进页缓存（默认关：冷重开只加载索引，数据按需缺页）。
     mmap_preheat: bool = false,
+    /// 索引归档（`seg/index.bin`）允许映射的最大字节数；**0 = 不限制**（默认，64 位目标）。
+    ///
+    /// 这不是磁盘格式限制，只是「明确想拒绝打开超大库」时的防御性上界。
+    /// 历史上这里写死过 `64 << 30`，结果 64 GiB ÷ 实测 1.56 B/行 ≈ **440 亿行/表** 就成了单表
+    /// 容量天花板 —— 一个防呆常量不该决定产品容量（决策记录八十九）。
+    index_max_bytes: u64 = 0,
+    /// 归档不超过该值时**整段预缺页**（populate），超过则不预缺页。
+    ///
+    /// 必须按大小限制：Zig 0.17 的 `MemoryMap.CreateOptions.populate` 默认 true，
+    /// 而 Windows 实现真的会对整段调 `NtSetInformationVirtualMemory(Prefetch)`
+    /// （见 `std/Io/Threaded.zig` 的 `createFileMap`）。3 MB 时预取是好事
+    /// （冷重开 0.6 ms 里有它一份），100 GB 时预取 = 打开时读 100 GB 索引。
+    index_prefault_max_bytes: u64 = 32 << 20,
     /// 新段索引的 Bloom 位数/key（0 = 不生成）。
     /// Bloom 占索引体积 ~80%，只对「不存在的 key」有用；关闭后冷重开与索引 IO 同步变小。
     bloom_bits: u8 = 10,
@@ -189,6 +202,27 @@ const ScanCursor = union(enum) {
 /// 一次 IO 拿到所有段的索引；数据文件仍然懒打开（见 `Segment.dataView`）。
 /// `buf` 的所有权留在调用方（Table 持有），段里只存切片。
 /// 返回**有效末尾偏移**（下次追加要从这里写，覆盖崩溃残片）。
+/// `{table}/seg` 里是否已经有 `*.data`（用来判定「旧库丢了归档」而不是「全新空库」）。
+///
+/// 只认 `.data` 不认目录存在：表刚建好、还没 flush 过时 `seg/` 目录就已经存在了，
+/// 那种情况应该继续当空表打开。
+fn hasSegmentDataFiles(io: std.Io, dir: std.Io.Dir, alloc: std.mem.Allocator, table_path: []const u8) !bool {
+    const seg_dir_path = try alloc.print("{s}/seg", .{table_path});
+    defer alloc.free(seg_dir_path);
+    // `.iterate = true` 必须显式给：0.17 的 Dir 默认不带遍历权限，
+    // 否则 `iterate().next()` 会在 Windows 上报 ACCESS_DENIED（"opened with iteration ability"）。
+    var d = dir.openDir(io, seg_dir_path, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound => return false,
+        else => return e,
+    };
+    defer d.close(io);
+    var it = d.iterate();
+    while (try it.next(io)) |entry| {
+        if (std.mem.endsWith(u8, entry.name, ".data")) return true;
+    }
+    return false;
+}
+
 fn openSegmentsFromArchive(
     io: std.Io,
     dir: std.Io.Dir,
@@ -254,6 +288,10 @@ pub const Table = struct {
     index_valid_len: u64 = 8,
     mem: Skiplist,
     segs: std.ArrayList(segmod.Segment) = .empty,
+    /// 段 key 范围是否**严格递增且不重叠**。用于把 `get` 从「逐段倒序试」降到「二分 1 个段」。
+    /// 只在段集合变化（open / flush / merge）时由 `recomputeSegLayout()` 重算。
+    /// **默认 false（保守）**：没算过就走逐段扫，宁可慢也不能给出「看起来查过了其实没查」的结果。
+    segs_disjoint_asc: bool = false,
     wal: walmod.Wal,
     seq: u64 = 0,
     visible: u64 = 0,
@@ -343,7 +381,8 @@ pub const Table = struct {
             // mmap 而非读入堆：3.13MB 的 `readPositionalAll` 实测 1.0–1.6ms（内核拷贝），
             // 而 mmap 建映射 ~0.3ms，且只访问段头部时只缺页 25 页（~0.02ms）。
             // 这是 SQLite `sqlite3BtreeOpen` 只读第 1 页的同款做法。
-            if (segmod.mapWholeFile(io, dir, index_path, 64 << 30)) |m| {
+            // 上限/预缺页都由 Options 控制：0 = 不限制（64 位默认），预缺页只对小归档开。
+            if (segmod.mapWholeFile(io, dir, index_path, opts.index_max_bytes, opts.index_prefault_max_bytes)) |m| {
                 idx_map = m;
                 arch = m.bytes();
                 break :blk true;
@@ -356,6 +395,11 @@ pub const Table = struct {
         try segmod.archiveCheckMagic(arch);
 
         if (!has_index) {
+            // 归档缺失时先分清「全新库」与「归档丢了」：
+            // 以前这里一律当新建库，于是「index.bin 被删/丢失但 seg/*.data 还在」会表现为
+            // **静默空表**，而且下一次 flush 的段号从 max_id+1=1 开始，直接覆盖 seg/000001.data。
+            // 宁可直接拒开，也不允许「看起来是空表」这种默默丢数据的形态。
+            if (try hasSegmentDataFiles(io, dir, alloc, path)) return error.ArchiveMissingButSegmentsExist;
             // 新建库（或目录缺失）：把三层目录建好
             try dir.createDirPath(io, path);
             const wal_dir = try alloc.print("{s}/wal", .{path});
@@ -430,7 +474,7 @@ pub const Table = struct {
             segmod.timing.segs += t1 - t0;
         }
 
-        return .{
+        var t = Table{
             .io = io,
             .dir = dir,
             .alloc = alloc,
@@ -449,6 +493,9 @@ pub const Table = struct {
             .next_seg = id,
             .opts = opts,
         };
+        // 段集合定型后算一次布局标记：不重叠且递增时 `get` 走二分定位（只碰 1 个段）
+        t.recomputeSegLayout();
+        return t;
     }
 
     pub fn deinit(self: *Table) void {
@@ -573,6 +620,10 @@ pub const Table = struct {
         }
         self.visible = seq;
         try self.wal.sync();
+        // **必须和 `put` 一样按 `flush_bytes` 回落**：漏了这一句的后果是「批量导入时 memtable
+        // 无界增长」——1 亿行 × 39 B ≈ 3.9 GB 全留在内存里，最后一次性 flush 要 71 s，
+        // 而且只产出一个巨型段（段数=1 会让点查/合并的实测结果失去意义）。
+        if (self.mem.sizeBytes() >= self.opts.flush_bytes) try self.flush();
     }
 
     pub fn get(self: *Table, key: []const u8, out: *std.ArrayList(u8)) !?[]const u8 {
@@ -583,6 +634,18 @@ pub const Table = struct {
             try out.appendSlice(self.alloc, e.value);
             return out.items;
         }
+        // 段 key 范围**不重叠且递增**时，二分直接定位到唯一候选段，不用逐段倒序试。
+        // 实测背景（容量线 1 亿行）：155 段时逐段试把热态点查从 669k 次/s 拖到 99k 次/s，
+        // 而段头本来就有 `firstKey()`/`maxKey()`，定位成本只有 log2(155)≈7 次比较。
+        if (self.segs_disjoint_asc) {
+            const i = self.findSegByRange(key) orelse return null;
+            if (try self.segs.items[i].get(key, self.visible, out)) |flags| {
+                if (flags != 0) return null;
+                return out.items;
+            }
+            // 范围说在这个段里但段内没有 ⇒ 不存在（段不可变，除墓碑外不会"暂时没有"）
+            return null;
+        }
         var i = self.segs.items.len;
         while (i > 0) {
             i -= 1;
@@ -592,6 +655,48 @@ pub const Table = struct {
             }
         }
         return null;
+    }
+
+    /// 重算「段 key 范围是否严格递增不重叠」这个布局标记（O(段数)，只在段集合变化时调）。
+    ///
+    /// 为什么需要标记而不是每次现算：`get` 是热路径，每次查都 O(n) 就本末倒置了。
+    /// 为什么可以只算一次：段不可变，只有 flush / 合并才会改变段集合。
+    fn recomputeSegLayout(self: *Table) void {
+        self.segs_disjoint_asc = true;
+        if (self.segs.items.len == 0) return;
+        var prev_max: ?[]const u8 = null;
+        for (self.segs.items) |*s| {
+            const fk = s.firstKey() orelse {
+                self.segs_disjoint_asc = false; // 空段：保守回退到逐段扫
+                return;
+            };
+            if (prev_max) |pm| {
+                if (segmod.keyCmp(pm, fk) != .lt) {
+                    self.segs_disjoint_asc = false;
+                    return;
+                }
+            }
+            prev_max = s.maxKey() orelse {
+                self.segs_disjoint_asc = false;
+                return;
+            };
+        }
+    }
+
+    /// 在「不重叠且递增」的段列表里二分：返回唯一可能包含 `key` 的段下标。
+    fn findSegByRange(self: *const Table, key: []const u8) ?usize {
+        var lo: usize = 0;
+        var hi: usize = self.segs.items.len; // [lo, hi)
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const fk = self.segs.items[mid].firstKey() orelse return null;
+            if (segmod.keyCmp(fk, key) == .gt) hi = mid else lo = mid + 1;
+        }
+        if (lo == 0) return null; // 所有段的 firstKey 都 > key
+        const i = lo - 1;
+        const mk = self.segs.items[i].maxKey() orelse return null;
+        if (segmod.keyCmp(mk, key) == .lt) return null; // 落在两段之间的空洞
+        return i;
     }
 
     /// 把 memtable 落盘。
@@ -690,9 +795,10 @@ pub const Table = struct {
             return e;
         };
         self.next_seg = id + 1;
+        // 段集合变了：重算「范围是否不重叠」，供 `get` 二分定位
+        self.recomputeSegLayout();
 
         self.mem.reset();
-
         // WAL 轮换：memtable 已全部落到段，这份 WAL 到此作废。
         //
         // **默认走原地截断**（`reset`）：只付一次 `setLength`，不增删目录项。
@@ -901,6 +1007,7 @@ pub const Table = struct {
         // —— Table 会变成空表（上轮审计 P0-2 的残留路径）。
         self.segs.appendAssumeCapacity(new_seg);
         self.next_seg = id + 1;
+        self.recomputeSegLayout();
 
         // 合并成功：清除自动触发积累的失败状态
         self.auto_compact_error = null;
@@ -2530,4 +2637,177 @@ test "反向段裁剪：范围落在表中段时，起点之前的整段必须�
         try std.testing.expectEqual(@as(u8, 75 + @as(u8, @intCast(i))), r.key[7]);
     }
     t.opts.no_prune_before = false;
+}
+
+test "get 按段范围定位：不重叠时二分只碰一个段，出现重叠后自动回退且结果仍正确" {
+    // 容量线（决策记录九十）实测：155 段时逐段倒序试把热态点查从 669k 次/s 拖到 99k 次/s。
+    // 段头本来就有 firstKey()/maxKey()，所以不重叠时可以二分定位到唯一候选段。
+    // 这条用例同时守住两件事：①不重叠时定位正确；②一旦重叠，标记必须变 false 并回退，
+    // 不能因为"大多数情况不重叠"就在重叠时给出陈旧值。
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-get-range";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+
+    // 3 段：1..10 / 11..20 / 21..30
+    var base: u8 = 1;
+    var s: u8 = 0;
+    while (s < 3) : (s += 1) {
+        var i: u8 = 0;
+        while (i < 10) : (i += 1) {
+            var kb: [8]u8 = @splat(0);
+            kb[7] = base + i;
+            try t.put(&kb, "v");
+        }
+        base += 10;
+        try t.flush();
+    }
+    try std.testing.expectEqual(@as(usize, 3), t.segs.items.len);
+    try std.testing.expect(t.segs_disjoint_asc);
+
+    var vbuf: std.ArrayList(u8) = .empty;
+    defer vbuf.deinit(alloc);
+
+    // 每段中间各命中一次
+    for ([_]u8{ 5, 15, 25 }) |k| {
+        var kb: [8]u8 = @splat(0);
+        kb[7] = k;
+        try std.testing.expect((try t.get(&kb, &vbuf)) != null);
+    }
+    // 首段之前 / 末段之后：必须返回 null（二分边界不能越界、也不能误判存在）
+    {
+        var kb: [8]u8 = @splat(0);
+        try std.testing.expect((try t.get(&kb, &vbuf)) == null);
+    }
+    {
+        var kb: [8]u8 = @splat(0);
+        kb[7] = 31;
+        try std.testing.expect((try t.get(&kb, &vbuf)) == null);
+    }
+
+    // 制造重叠：重写 15（落在第 2 段范围内部）→ 新段范围与旧段重叠
+    {
+        var kb: [8]u8 = @splat(0);
+        kb[7] = 15;
+        try t.put(&kb, "v2");
+        try t.flush();
+    }
+    try std.testing.expect(!t.segs_disjoint_asc); // 自动回退到逐段扫
+    {
+        var kb: [8]u8 = @splat(0);
+        kb[7] = 15;
+        try std.testing.expectEqualStrings("v2", (try t.get(&kb, &vbuf)) orelse unreachable);
+    }
+    {
+        // 回退后其它 key 也必须仍然正确
+        var kb: [8]u8 = @splat(0);
+        kb[7] = 5;
+        try std.testing.expectEqualStrings("v", (try t.get(&kb, &vbuf)) orelse unreachable);
+    }
+}
+
+test "归档丢失保护：有段数据但没有 index.bin 时拒开，不能当成空表（否则下一次 flush 会覆盖 000001.data）" {    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-orphan-segments";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        defer t.deinit();
+        try t.put("k1", "v1");
+        try t.flush(); // 产生 seg/000001.data + seg/index.bin
+    }
+    // 模拟「归档丢失」：只删 index.bin，段数据还在
+    const idx_path = tmp ++ "/seg/index.bin";
+    try dir.deleteFile(io, idx_path);
+
+    // 以前这里会开出一个空表，然后 flush 时 id=1 覆盖 000001.data —— 静默丢数据
+    try std.testing.expectError(
+        error.ArchiveMissingButSegmentsExist,
+        Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 }),
+    );
+    // 段数据文件必须原样还在（我们什么都没删）
+    var d = try dir.openDir(io, tmp ++ "/seg", .{ .iterate = true });
+    defer d.close(io);
+    var found = false;
+    var it = d.iterate();
+    while (try it.next(io)) |e| {
+        if (std.mem.eql(u8, e.name, "000001.data")) found = true;
+    }
+    try std.testing.expect(found);
+}
+
+test "空表重开不能被误判成「归档丢失」：没有 .data 时照常当新库打开" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-empty-reopen";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        defer t.deinit();
+        // 只建目录、不写不 flush：seg/ 目录已存在但没有 .data
+    }
+    var t2 = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t2.deinit();
+    try std.testing.expectEqual(@as(usize, 0), t2.segs.items.len);
+    try t2.put("k", "v");
+    var vbuf: std.ArrayList(u8) = .empty;
+    defer vbuf.deinit(alloc);
+    try std.testing.expectEqualStrings("v", (try t2.get("k", &vbuf)) orelse unreachable);
+}
+
+test "索引归档上限可配：index_max_bytes=0 不限，设小了明确报 FileTooBig" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-index-cap";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        defer t.deinit();
+        try t.put("k1", "v1");
+        try t.flush();
+    }
+    // 默认（0 = 不限制）能开
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        defer t.deinit();
+        try std.testing.expectEqual(@as(usize, 1), t.segs.items.len);
+    }
+    // 上限设成 1 字节 → 明确报 FileTooBig（不是静默降级、也不是当成空表）
+    try std.testing.expectError(
+        error.FileTooBig,
+        Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0, .index_max_bytes = 1 }),
+    );
+    // 上限给足 → 正常打开（证明失败原因就是上限，不是别的东西）
+    {
+        const big = @as(u64, 1) << 40;
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0, .index_max_bytes = big });
+        defer t.deinit();
+        try std.testing.expectEqual(@as(usize, 1), t.segs.items.len);
+    }
 }

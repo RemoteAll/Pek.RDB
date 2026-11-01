@@ -1,0 +1,12 @@
+sqlite_scale_put,100000000,739085.8355797514
+sqlite_scale_disk_bytes,100000000,4232687616
+sqlite_scale_scan,100000000,10312052.611597447
+sqlite_scale_scan_acc,3200000000,0
+sqlite_scale_get_hit,20000,90389.59724203261
+sqlite_scale_get_hit_warm,20000,92497.86792414435
+sqlite_scale_get_miss,20000,516262.26122870424
+sqlite_scale_reopen_us,open,1559
+sqlite_scale_reopen_us,open_first_get,881
+sqlite_scale_reopen_us,open,158
+sqlite_scale_reopen_us,open_first_get,877
+sqlite_scale_done,100000000,0
