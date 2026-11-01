@@ -124,6 +124,38 @@ fn main() -> rusqlite::Result<()> {
     let secs = t0.elapsed().as_secs_f64();
     println!("scan_v,{},{}", bytes / 32, (bytes as f64 / 32.0) / secs);
 
+    // 大样本范围扫描（20 万行，区间 0..200000，与 Zig 侧 scan_full / scan_refs_full 同口径）。
+    // 上面那两档只扫 1 万行，绝对耗时 <1µs，测的是固定开销与计时粒度 ——
+    // 用它比「扫描能力」会让两边区间重叠、永远得不出结论。
+    {
+        let t0 = Instant::now();
+        let mut n: usize = 0;
+        {
+            let mut stmt = conn.prepare("SELECT id FROM t WHERE id >= ?1 AND id < ?2")?;
+            let mut rows = stmt.query(params![0i64, 200_000i64])?;
+            while rows.next()?.is_some() {
+                n += 1;
+            }
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        println!("scan_big,{},{}", n, n as f64 / secs);
+    }
+    {
+        let t0 = Instant::now();
+        let mut bytes: i64 = 0;
+        {
+            let mut stmt = conn.prepare("SELECT id, v FROM t WHERE id >= ?1 AND id < ?2")?;
+            let mut rows = stmt.query(params![0i64, 200_000i64])?;
+            while let Some(row) = rows.next()? {
+                let _id: i64 = row.get(0)?;
+                let v: Vec<u8> = row.get(1)?;
+                bytes += v.len() as i64;
+            }
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        println!("scan_v_big,{},{}", bytes / 32, (bytes as f64 / 32.0) / secs);
+    }
+
     drop(conn);
 
     // 重开 + 首查
@@ -273,6 +305,23 @@ fn main() -> rusqlite::Result<()> {
             }
             let secs = t0.elapsed().as_secs_f64();
             println!("big_count,{},{}", n, n as f64 / secs);
+        }
+
+        // 超内存 · 区间「只数行」（20 万行）：对等 Zig 的 `big_count_range`。
+        // big_scan 只扫 1 万行、绝对耗时 <1µs；big_count 扫 50 万行但起点 0 ——
+        // 这一档固定 20 万行区间，与内存内那档同样本量，便于横比「内存内 vs 超内存」衰减幅度。
+        {
+            let t0 = Instant::now();
+            let mut n: usize = 0;
+            {
+                let mut stmt = c.prepare("SELECT id FROM t WHERE id >= 0 AND id < 200000")?;
+                let mut rows = stmt.query([])?;
+                while rows.next()?.is_some() {
+                    n += 1;
+                }
+            }
+            let secs = t0.elapsed().as_secs_f64();
+            println!("big_count_range,{},{}", n, n as f64 / secs);
         }
 
         drop(c);

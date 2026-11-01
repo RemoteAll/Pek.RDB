@@ -76,8 +76,15 @@ $pairs = @(
     [pscustomobject]@{ Name = '逐行写（autocommit 口径）'; Zig = 'put';         Lite = 'put';      Unit = '行/s';  Higher = $true },
     [pscustomobject]@{ Name = '单事务批量写';             Zig = 'put_batch';   Lite = 'put_txn';  Unit = '行/s';  Higher = $true },
     [pscustomobject]@{ Name = '主键点查';                 Zig = 'get';         Lite = 'get';      Unit = '次/s';  Higher = $true },
-    [pscustomobject]@{ Name = '范围扫描（含值）';         Zig = 'scan';        Lite = 'scan_v';   Unit = '行/s';  Higher = $true },
-    [pscustomobject]@{ Name = '范围扫描（仅 key）';       Zig = 'scan_refs';   Lite = 'scan';     Unit = '行/s';  Higher = $true },
+    # 范围扫描各档。**默认用 20 万行「两边都只数行」对等档**：
+    #   - 1 万行的绝对耗时 <1µs，测的是固定开销与计时粒度，会让两边区间重叠、永远得不出结论（2026-11-01 审计）；
+    #   - scan_refs_full 是「我们收集 20 万条 RefRecord（9.6MB 写入）」vs「SQLite 只推进游标」，两边做的事不同，留档不计入结论；
+    #   - count_range 是两边都「只数行、不收集」，这才是「扫描能力」本身。
+    [pscustomobject]@{ Name = '范围扫描（含值，20 万行）';        Zig = 'scan_full';      Lite = 'scan_v_big'; Unit = '行/s';  Higher = $true },
+    [pscustomobject]@{ Name = '范围扫描（仅 key，20 万行，两边都只数行）'; Zig = 'count_range'; Lite = 'scan_big';   Unit = '行/s';  Higher = $true },
+    [pscustomobject]@{ Name = '范围扫描（我们收集 9.6MB / SQLite 只推进游标，不对等留档）'; Zig = 'scan_refs_full'; Lite = 'scan_big'; Unit = '行/s'; Higher = $true },
+    [pscustomobject]@{ Name = '范围扫描（含值，1 万行，样本过小仅留档）';   Zig = 'scan';      Lite = 'scan_v'; Unit = '行/s';  Higher = $true },
+    [pscustomobject]@{ Name = '范围扫描（仅 key，1 万行，样本过小仅留档）'; Zig = 'scan_refs'; Lite = 'scan';   Unit = '行/s';  Higher = $true },
     [pscustomobject]@{ Name = 'SQL 层插入';               Zig = 'sql_put';     Lite = 'put_txn';  Unit = '行/s';  Higher = $true },
     [pscustomobject]@{ Name = 'SQL 层点查';               Zig = 'sql_get';     Lite = 'get';      Unit = '次/s';  Higher = $true },
     # 全表扫描三档（§16.1.10 / §16.1.11）。**必须分开列**，因为「做的工作」不同：
@@ -96,10 +103,13 @@ $pairs = @(
     # 超内存数据集（200 万行）
     [pscustomobject]@{ Name = '超内存写 200 万行';        Zig = 'big_put';        Lite = 'big_put_txn'; Unit = '行/s'; Higher = $true },
     [pscustomobject]@{ Name = '超内存点查';               Zig = 'big_get';        Lite = 'big_get';     Unit = '次/s'; Higher = $true },
-    # 超内存扫描两档。**必须分开**（同 §16.1.10 的教训：先比「做的工作是否相同」）：
-    #   - big_scan_refs 是「我们收集 1 万条记录到数组」vs「SQLite 只推进游标」，不对等，留档；
-    #   - big_count 是两边都「只数行、不收集不取值」，样本 50 万行，这才是同口径。
+    # 超内存扫描三档。**必须分开**（同 §16.1.10 的教训：先比「做的工作是否相同」）：
+    #   - big_scan_refs 是「我们收集记录到数组」vs「SQLite 只推进游标」，不对等，留档；
+    #   - big_count 是两边都「只数行、不收集不取值」，样本 50 万行；
+    #   - big_count_range 是两边都「只数行」，固定 20 万行区间，与内存内 count_range 同样本量，
+    #     便于直看「内存内 → 超内存」的衰减幅度。
     [pscustomobject]@{ Name = '超内存小范围扫描（我们收集 / SQLite 只推进游标，不对等）'; Zig = 'big_scan_refs'; Lite = 'big_scan'; Unit = '行/s'; Higher = $true },
+    [pscustomobject]@{ Name = '超内存范围扫描（仅 key，20 万行，两边都只数行）'; Zig = 'big_count_range'; Lite = 'big_count_range'; Unit = '行/s'; Higher = $true },
     [pscustomobject]@{ Name = '超内存全表遍历（两边都只数行，50 万行）'; Zig = 'big_count'; Lite = 'big_count'; Unit = '行/s'; Higher = $true },
     [pscustomobject]@{ Name = '超内存冷重开';             Zig = 'big_recover';    Lite = 'big_recover'; Unit = 'ms';   Higher = $false },
     # 随机原地 UPDATE（§16.1 达标线：SQLite 强项）。主口径用 SQLite 单事务（最佳形态），逐行 auto 作参考。

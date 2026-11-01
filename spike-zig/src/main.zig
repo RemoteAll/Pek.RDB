@@ -173,6 +173,25 @@ fn benchMain() !void {
         std.debug.print("scan_full,{d},{d:.0}\n", .{ full.records.len, opsPerSec(@intCast(full.records.len), ns) });
     }
 
+    // 区间「只数行」（20 万行）：与上面 scan_refs_full 的差别只有**不收集**。
+    //
+    // 为什么必须单独一档：`scan_refs_full` 会把 20 万条 RefRecord 收进 ArrayList
+    // （48B × 20 万 = 9.6MB 写入），而 SQLite 侧对等的参照是 `SELECT id ... while rows.next()`
+    // 只推进游标、一条不收集。两边做的事不同，比出来的比值没有意义（前几轮就栽在这上面）。
+    // 这一档两边都只数行，才是真正的「扫描能力」。
+    {
+        const lo0 = keyOf(0);
+        const hi0 = keyOf(200_000);
+        var it = tablemod.MergeIter{};
+        try it.init(&t, &lo0, &hi0);
+        defer it.deinit();
+        const t0 = nowNs(io);
+        var cnt: u64 = 0;
+        while (it.next()) |_| cnt += 1;
+        const ns = nowNs(io) - t0;
+        std.debug.print("count_range,{d},{d:.0}\n", .{ cnt, opsPerSec(cnt, ns) });
+    }
+
     // 多段合并扫描（默认 64MB memtable 会中途自动 flush → 多段）
     {
         const path5 = "bench-data-multi";
@@ -533,6 +552,22 @@ fn benchMain() !void {
             }
             const ns = nowNs(io) - t0;
             std.debug.print("big_count,{d},{d:.0}\n", .{ cnt6, opsPerSec(cnt6, ns) });
+        }
+
+        // 超内存 · 区间「只数行」（20 万行）：对等 SQLite 的 `SELECT id WHERE id >= 0 AND id < 200000`。
+        // 上面 `big_scan_refs` 是收集 RefRecord、SQLite 的 `big_scan` 是只数行，两边不对等；
+        // 且样本只 1 万行（绝对耗时 <1µs，测的是计时粒度）。这一档把两件事一起修掉。
+        {
+            const lo7 = keyOf(0);
+            const hi7 = keyOf(200_000);
+            var it7 = tablemod.MergeIter{};
+            try it7.init(&t6, &lo7, &hi7);
+            defer it7.deinit();
+            const t0 = nowNs(io);
+            var cnt7: u64 = 0;
+            while (it7.next()) |_| cnt7 += 1;
+            const ns = nowNs(io) - t0;
+            std.debug.print("big_count_range,{d},{d:.0}\n", .{ cnt7, opsPerSec(cnt7, ns) });
         }
 
         // 诊断：索引聚合文件大小（现在全部段索引在 seg/index.bin 里）
