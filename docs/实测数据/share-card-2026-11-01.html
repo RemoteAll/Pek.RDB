@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    width:1080px; height:1300px; overflow:hidden;
+    background:
+      radial-gradient(900px 600px at 12% -8%, rgba(56,189,248,.20), transparent 60%),
+      radial-gradient(700px 520px at 105% 8%, rgba(167,139,250,.18), transparent 62%),
+      linear-gradient(160deg,#080d17 0%,#0d1524 46%,#0a1120 100%);
+    color:#e8eefc; font-family:"Microsoft YaHei","Segoe UI",system-ui,sans-serif;
+    padding:52px 64px 44px; display:flex; flex-direction:column;
+  }
+  .eyebrow { font-size:21px; letter-spacing:.32em; color:#6f86ad; font-weight:600; }
+  h1 { font-size:62px; line-height:1.1; margin-top:12px; font-weight:800; letter-spacing:-1px; }
+  h1 .z { background:linear-gradient(90deg,#38bdf8,#a78bfa); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  h1 .s { color:#93a4c2; }
+  .sub { margin-top:12px; font-size:24px; color:#8ea3c6; }
+  .hero { margin-top:26px; display:flex; gap:16px; }
+  .pill {
+    flex:1; border-radius:18px; padding:16px 22px;
+    background:linear-gradient(180deg,rgba(56,189,248,.16),rgba(56,189,248,.05));
+    border:1px solid rgba(56,189,248,.34);
+  }
+  .pill.g { background:linear-gradient(180deg,rgba(52,211,153,.14),rgba(52,211,153,.04)); border-color:rgba(52,211,153,.30); }
+  .pill .n { font-size:50px; font-weight:800; letter-spacing:-1px; }
+  .pill.g .n { color:#34d399; }
+  .pill .l { font-size:20px; color:#9fb3d1; margin-top:2px; }
+  table { margin-top:24px; width:100%; border-collapse:collapse; }
+  thead th {
+    font-size:19px; color:#6f86ad; font-weight:600; text-align:right;
+    padding:0 0 10px; letter-spacing:.06em;
+  }
+  thead th:first-child { text-align:left; }
+  tbody td { padding:8px 0; border-top:1px solid rgba(255,255,255,.07); font-size:24px; }
+  tbody td:first-child { color:#c8d6ee; }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; color:#9fb3d1; font-size:21px; }
+  td.x { text-align:right; font-variant-numeric:tabular-nums; font-weight:800; font-size:28px; color:#38bdf8; width:160px; }
+  td.x.hi { color:#a78bfa; }
+  .bar { height:6px; border-radius:4px; background:rgba(255,255,255,.07); margin-top:6px; overflow:hidden; }
+  .bar > i { display:block; height:100%; border-radius:4px; background:linear-gradient(90deg,#38bdf8,#a78bfa); }
+  .foot { margin-top:auto; padding-top:22px; border-top:1px solid rgba(255,255,255,.08);
+          font-size:18px; line-height:1.6; color:#7d90b0; }
+  .foot b { color:#a9bcd9; font-weight:600; }
+  .tag { display:inline-block; padding:3px 12px; border-radius:999px; font-size:17px;
+         background:rgba(52,211,153,.14); color:#34d399; border:1px solid rgba(52,211,153,.3); margin-right:8px; }
+</style>
+</head>
+<body>
+  <div class="eyebrow">ZIG 存储引擎 · 基准实测</div>
+  <h1><span class="z">Pek.RDB</span> <span class="s">vs</span> SQLite</h1>
+  <div class="sub">同一台机器 · 同一批数据 · 交替采样 · 全部原始数据入库可复现</div>
+
+  <div class="hero">
+    <div class="pill g"><div class="n" id="ahead">–</div><div class="l">项指标全胜（每项 5/5 轮）</div></div>
+    <div class="pill g"><div class="n" id="behind">–</div><div class="l">项落后</div></div>
+    <div class="pill"><div class="n" id="top">–</div><div class="l">最高领先倍数</div></div>
+  </div>
+
+  <table>
+    <thead>
+      <tr><th>场景</th><th>Pek.RDB</th><th>SQLite</th><th>倍数</th></tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+  <div class="foot" id="foot"></div>
+
+<script>
+const DATA = {"ahead":18,"behind":0,"rounds":5,"rows":[{"k":"put","z":1837386,"s":35540,"unit":"/s","ratio":51.7},{"k":"upd_get","z":1257104,"s":149300,"unit":"/s","ratio":8.42},{"k":"upd_random","z":1498540,"s":210558,"unit":"/s","ratio":7.12},{"k":"get","z":947553,"s":145263,"unit":"/s","ratio":6.52},{"k":"big_get","z":586652,"s":142584,"unit":"/s","ratio":4.11},{"k":"big_put","z":2013104,"s":569619,"unit":"/s","ratio":3.53},{"k":"conc4","z":3921392,"s":1157705,"unit":"/s","ratio":3.39},{"k":"conc2","z":2753329,"s":1260890,"unit":"/s","ratio":2.18},{"k":"put_batch","z":1918752,"s":930280,"unit":"/s","ratio":2.06},{"k":"count_10k","z":30266413,"s":15956776,"unit":"/s","ratio":1.9},{"k":"big_count","z":26896008,"s":15952591,"unit":"/s","ratio":1.69},{"k":"scan_refs","z":11002699,"s":9069845,"unit":"/s","ratio":1.21}],"reopen":{"z":0.44,"s":1.98},"disk":{"z":40.92,"s":41.56}};
+const LABELS = {
+  put:'逐行写入', upd_get:'更新后点查', upd_random:'随机更新 10 万行', get:'主键点查',
+  conc4:'并发写 4 线程', big_get:'超内存点查（25 段）', big_put:'超内存批量写 200 万行',
+  conc2:'并发写 2 线程', put_batch:'单事务批量写', count_10k:'范围扫描（只数行）',
+  big_count:'超内存全表遍历', scan_refs:'范围扫描（收集记录）'
+};
+const fmt = n => n >= 1000 ? Math.round(n).toLocaleString('en-US') : n.toFixed(2);
+const maxRatio = Math.max(...DATA.rows.map(r => r.ratio));
+
+document.getElementById('ahead').textContent = DATA.ahead;
+document.getElementById('behind').textContent = DATA.behind;
+document.getElementById('top').textContent = maxRatio.toFixed(1) + '×';
+
+const tb = document.getElementById('rows');
+DATA.rows.forEach(r => {
+  const tr = document.createElement('tr');
+  const w = Math.max(6, Math.round(100 * Math.log(r.ratio) / Math.log(maxRatio)));
+  tr.innerHTML =
+    '<td>' + (LABELS[r.k] || r.k) +
+      '<div class="bar"><i style="width:' + w + '%"></i></div></td>' +
+    '<td class="num">' + fmt(r.z) + r.unit + '</td>' +
+    '<td class="num">' + fmt(r.s) + r.unit + '</td>' +
+    '<td class="x' + (r.ratio >= 4 ? ' hi' : '') + '">' + r.ratio.toFixed(2) + '×</td>';
+  tb.appendChild(tr);
+});
+
+document.getElementById('foot').innerHTML =
+  '<span class="tag">同批 ABBA</span>交替采样 ' + DATA.rounds + ' 轮，每引擎 2 次共 10 个样本取中位；同机同数据。下表为其中 ' + DATA.rows.length + ' 项代表场景。<br>' +
+  '冷重开 100 万行 <b>' + DATA.reopen.z.toFixed(2) + ' ms</b> vs <b>' + DATA.reopen.s.toFixed(2) + ' ms</b>' +
+  '；磁盘 <b>' + DATA.disk.z.toFixed(2) + ' B/行</b> vs <b>' + DATA.disk.s.toFixed(2) + ' B/行</b>（越低越好）。<br>' +
+  '另有 1 项（SQL SELECT * 物化）区间跨 1，判为持平，未计入全胜数。原始 CSV 全部入库，可逐轮复核。';
+</script>
+</body>
+</html>
