@@ -1,13 +1,13 @@
-﻿//! SQLite 对照基准（与 spike-zig 的 bench 同数据集、同口径）。
+﻿//! SQLite 瀵圭収鍩哄噯锛堜笌 spike-zig 鐨?bench 鍚屾暟鎹泦銆佸悓鍙ｅ緞锛夈€?
 //!
-//! 口径：
-//! - `journal_mode=WAL`、`synchronous=NORMAL`（SQLite 的常规推荐配置）；
-//! - 1,000,000 行，主键 i64 递增，值 32B；
-//! - `put` = 逐行 autocommit（对应 Zig 侧的逐行 put + 组提交）；
-//! - `put_txn` = 单事务批量插入（对照批量写）；
-//! - `get` = 10 万次随机主键点查（预编译语句）；
-//! - `scan` = 主键范围 1 万行；
-//! - `recover_ms` = 关闭后重开 + 首查耗时。
+//! 鍙ｅ緞锛?
+//! - `journal_mode=WAL`銆乣synchronous=NORMAL`锛圫QLite 鐨勫父瑙勬帹鑽愰厤缃級锛?
+//! - 1,000,000 琛岋紝涓婚敭 i64 閫掑锛屽€?32B锛?
+//! - `put` = 閫愯 autocommit锛堝搴?Zig 渚х殑閫愯 put + 缁勬彁浜わ級锛?
+//! - `put_txn` = 鍗曚簨鍔℃壒閲忔彃鍏ワ紙瀵圭収鎵归噺鍐欙級锛?
+//! - `get` = 10 涓囨闅忔満涓婚敭鐐规煡锛堥缂栬瘧璇彞锛夛紱
+//! - `scan` = 涓婚敭鑼冨洿 1 涓囪锛?
+//! - `recover_ms` = 鍏抽棴鍚庨噸寮€ + 棣栨煡鑰楁椂銆?
 
 use std::time::Instant;
 
@@ -47,7 +47,7 @@ fn main() -> rusqlite::Result<()> {
     conn.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)")?;
     let value = [b'x'; 32];
 
-    // 逐行 autocommit
+    // 閫愯 autocommit
     let t0 = Instant::now();
     {
         let mut stmt = conn.prepare("INSERT INTO t(id, v) VALUES (?1, ?2)")?;
@@ -58,7 +58,7 @@ fn main() -> rusqlite::Result<()> {
     let secs = t0.elapsed().as_secs_f64();
     println!("put,{},{}", N, N as f64 / secs);
 
-    // 单事务批量插入（独立表 t2）
+    // 鍗曚簨鍔℃壒閲忔彃鍏ワ紙鐙珛琛?t2锛?
     conn.execute_batch("CREATE TABLE t2(id INTEGER PRIMARY KEY, v BLOB)")?;
     let t0 = Instant::now();
     {
@@ -74,7 +74,7 @@ fn main() -> rusqlite::Result<()> {
     let secs = t0.elapsed().as_secs_f64();
     println!("put_txn,{},{}", N, N as f64 / secs);
 
-    // 点查
+    // 鐐规煡
     let t0 = Instant::now();
     let mut hits: i64 = 0;
     {
@@ -95,7 +95,7 @@ fn main() -> rusqlite::Result<()> {
     println!("get,{},{}", GET_N, GET_N as f64 / secs);
     println!("get_hits,{},{}", GET_N, hits);
 
-    // 范围扫描
+    // 鑼冨洿鎵弿
     let t0 = Instant::now();
     let count: i64 = {
         let mut stmt = conn.prepare("SELECT id FROM t WHERE id >= ?1 AND id < ?2")?;
@@ -109,7 +109,7 @@ fn main() -> rusqlite::Result<()> {
     let secs = t0.elapsed().as_secs_f64();
     println!("scan,{},{}", count, count as f64 / secs);
 
-    // 范围扫描（带值，与 Zig 侧同口径）
+    // 鑼冨洿鎵弿锛堝甫鍊硷紝涓?Zig 渚у悓鍙ｅ緞锛?
     let t0 = Instant::now();
     let mut bytes: i64 = 0;
     {
@@ -124,9 +124,9 @@ fn main() -> rusqlite::Result<()> {
     let secs = t0.elapsed().as_secs_f64();
     println!("scan_v,{},{}", bytes / 32, (bytes as f64 / 32.0) / secs);
 
-    // 大样本范围扫描（20 万行，区间 0..200000，与 Zig 侧 scan_full / scan_refs_full 同口径）。
-    // 上面那两档只扫 1 万行，绝对耗时 <1µs，测的是固定开销与计时粒度 ——
-    // 用它比「扫描能力」会让两边区间重叠、永远得不出结论。
+    // 澶ф牱鏈寖鍥存壂鎻忥紙20 涓囪锛屽尯闂?0..200000锛屼笌 Zig 渚?scan_full / scan_refs_full 鍚屽彛寰勶級銆?
+    // 涓婇潰閭ｄ袱妗ｅ彧鎵?1 涓囪锛岀粷瀵硅€楁椂 <1碌s锛屾祴鐨勬槸鍥哄畾寮€閿€涓庤鏃剁矑搴?鈥斺€?
+    // 鐢ㄥ畠姣斻€屾壂鎻忚兘鍔涖€嶄細璁╀袱杈瑰尯闂撮噸鍙犮€佹案杩滃緱涓嶅嚭缁撹銆?
     {
         let t0 = Instant::now();
         let mut n: usize = 0;
@@ -156,12 +156,12 @@ fn main() -> rusqlite::Result<()> {
         println!("scan_v_big,{},{}", bytes / 32, (bytes as f64 / 32.0) / secs);
     }
 
-    // 范围扫描（20 万行）· **收集引用**：对等 Zig 的 `scan_refs`。
+    // 鑼冨洿鎵弿锛?0 涓囪锛壜?**鏀堕泦寮曠敤**锛氬绛?Zig 鐨?`scan_refs`銆?
     //
-    // 为什么必须有这一档：`scan_refs` 会把每条命中记录收进数组（20 万 × 48B = 9.6MB 写入），
-    // 而 `scan_big` 只推进游标、一条都不收 —— 拿这两个比得出「我们 0.70×」是**口径不对等**的产物。
-    // 这里补上「SQLite 也收集」的版本：用 `get_ref` 取引用（**不复制 payload**），
-    // 与 `RefRecord{key 指针,len, seq, flags, value 指针,len}` 做的工作等价。
+    // 涓轰粈涔堝繀椤绘湁杩欎竴妗ｏ細`scan_refs` 浼氭妸姣忔潯鍛戒腑璁板綍鏀惰繘鏁扮粍锛?0 涓?脳 48B = 9.6MB 鍐欏叆锛夛紝
+    // 鑰?`scan_big` 鍙帹杩涙父鏍囥€佷竴鏉￠兘涓嶆敹 鈥斺€?鎷胯繖涓や釜姣斿緱鍑恒€屾垜浠?0.70脳銆嶆槸**鍙ｅ緞涓嶅绛?*鐨勪骇鐗┿€?
+    // 杩欓噷琛ヤ笂銆孲QLite 涔熸敹闆嗐€嶇殑鐗堟湰锛氱敤 `get_ref` 鍙栧紩鐢紙**涓嶅鍒?payload**锛夛紝
+    // 涓?`RefRecord{key 鎸囬拡,len, seq, flags, value 鎸囬拡,len}` 鍋氱殑宸ヤ綔绛変环銆?
     {
         let t0 = Instant::now();
         let mut out: Vec<(i64, i64)> = Vec::with_capacity(200_000);
@@ -180,7 +180,7 @@ fn main() -> rusqlite::Result<()> {
 
     drop(conn);
 
-    // 重开 + 首查
+    // 閲嶅紑 + 棣栨煡
     let t0 = Instant::now();
     let conn2 = open_conn()?;
     let _: Vec<u8> = conn2.query_row("SELECT v FROM t WHERE id = ?1", params![12345i64], |r| r.get(0))?;
@@ -190,10 +190,10 @@ fn main() -> rusqlite::Result<()> {
 
     drop(conn2);
 
-    // ---------------- 并发写（对齐 Zig 侧「跨表并行」：每线程独立库文件） ----------------
+    // ---------------- 骞跺彂鍐欙紙瀵归綈 Zig 渚с€岃法琛ㄥ苟琛屻€嶏細姣忕嚎绋嬬嫭绔嬪簱鏂囦欢锛?----------------
     let conc_per: i64 = 300_000;
     for nt in [1usize, 2, 4] {
-        // (a) 逐行 autocommit —— 对应 Zig 侧逐行 put（Zig 有跨行组提交，SQLite 这里是每行一次提交）
+        // (a) 閫愯 autocommit 鈥斺€?瀵瑰簲 Zig 渚ч€愯 put锛圸ig 鏈夎法琛岀粍鎻愪氦锛孲QLite 杩欓噷鏄瘡琛屼竴娆℃彁浜わ級
         let t0 = Instant::now();
         std::thread::scope(|s| {
             for i in 0..nt {
@@ -221,7 +221,7 @@ fn main() -> rusqlite::Result<()> {
         let total = conc_per as f64 * nt as f64;
         println!("conc_put_{}t_auto,{},{}", nt, total as i64, total / secs);
 
-        // (b) 每线程单事务 —— 对应 Zig 侧批量写能力（SQLite 的最佳形态）
+        // (b) 姣忕嚎绋嬪崟浜嬪姟 鈥斺€?瀵瑰簲 Zig 渚ф壒閲忓啓鑳藉姏锛圫QLite 鐨勬渶浣冲舰鎬侊級
         let t0 = Instant::now();
         std::thread::scope(|s| {
             for i in 0..nt {
@@ -253,7 +253,7 @@ fn main() -> rusqlite::Result<()> {
         println!("conc_put_{}t_txn,{},{}", nt, total as i64, total / secs);
     }
 
-    // ---------------- 超内存数据集（200 万行） ----------------
+    // ---------------- 瓒呭唴瀛樻暟鎹泦锛?00 涓囪锛?----------------
     {
         const BIG: i64 = 2_000_000;
         let path = "bench-big.db";
@@ -278,11 +278,11 @@ fn main() -> rusqlite::Result<()> {
         let secs = t0.elapsed().as_secs_f64();
         println!("big_put_txn,{},{}", BIG, BIG as f64 / secs);
 
-        // 落盘占用：与 Zig 的 `big_disk_bytes` 对等。
+        // 钀界洏鍗犵敤锛氫笌 Zig 鐨?`big_disk_bytes` 瀵圭瓑銆?
         //
-        // 先 `wal_checkpoint(TRUNCATE)` 把 WAL 归并回主库 —— 我们那边 flush 完会删掉 WAL，
-        // 不 checkpoint 就是拿「我们已收尾」比「SQLite 未收尾」，不公平。
-        // 统计 db + -wal + -shm 三个文件的实际字节数（不含任何我们的口径换算）。
+        // 鍏?`wal_checkpoint(TRUNCATE)` 鎶?WAL 褰掑苟鍥炰富搴?鈥斺€?鎴戜滑閭ｈ竟 flush 瀹屼細鍒犳帀 WAL锛?
+        // 涓?checkpoint 灏辨槸鎷裤€屾垜浠凡鏀跺熬銆嶆瘮銆孲QLite 鏈敹灏俱€嶏紝涓嶅叕骞炽€?
+        // 缁熻 db + -wal + -shm 涓変釜鏂囦欢鐨勫疄闄呭瓧鑺傛暟锛堜笉鍚换浣曟垜浠殑鍙ｅ緞鎹㈢畻锛夈€?
         {
             let _ = c.pragma_update(None, "wal_checkpoint", "TRUNCATE");
             let fsz = |p: &str| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
@@ -293,7 +293,7 @@ fn main() -> rusqlite::Result<()> {
             println!("big_disk_bytes_row,1,{:.3}", total as f64 / BIG as f64);
         }
 
-        // 随机点查
+        // 闅忔満鐐规煡
         let t0 = Instant::now();
         let mut hits: i64 = 0;
         {
@@ -314,7 +314,7 @@ fn main() -> rusqlite::Result<()> {
         println!("big_get,{},{}", GET_N, GET_N as f64 / secs);
         println!("big_get_hits,{},{}", GET_N, hits);
 
-        // 范围扫描（仅 key，与 Zig big_scan_refs 同口径）
+        // 鑼冨洿鎵弿锛堜粎 key锛屼笌 Zig big_scan_refs 鍚屽彛寰勶級
         let t0 = Instant::now();
         let count: i64 = {
             let mut stmt = c.prepare("SELECT id FROM t WHERE id >= ?1 AND id < ?2")?;
@@ -328,8 +328,8 @@ fn main() -> rusqlite::Result<()> {
         let secs = t0.elapsed().as_secs_f64();
         println!("big_scan,{},{}", count, count as f64 / secs);
 
-        // 纯遍历计数（不取值）。与上面 big_scan 的差别只是样本从 1 万行放大到 50 万行 ——
-        // 1 万行的绝对耗时 <1µs，测的是固定开销而非扫描能力。
+        // 绾亶鍘嗚鏁帮紙涓嶅彇鍊硷級銆備笌涓婇潰 big_scan 鐨勫樊鍒彧鏄牱鏈粠 1 涓囪鏀惧ぇ鍒?50 涓囪 鈥斺€?
+        // 1 涓囪鐨勭粷瀵硅€楁椂 <1碌s锛屾祴鐨勬槸鍥哄畾寮€閿€鑰岄潪鎵弿鑳藉姏銆?
         {
             let t0 = Instant::now();
             let mut n: usize = 0;
@@ -344,9 +344,9 @@ fn main() -> rusqlite::Result<()> {
             println!("big_count,{},{}", n, n as f64 / secs);
         }
 
-        // 超内存 · 区间「只数行」（20 万行）：对等 Zig 的 `big_count_range`。
-        // big_scan 只扫 1 万行、绝对耗时 <1µs；big_count 扫 50 万行但起点 0 ——
-        // 这一档固定 20 万行区间，与内存内那档同样本量，便于横比「内存内 vs 超内存」衰减幅度。
+        // 瓒呭唴瀛?路 鍖洪棿銆屽彧鏁拌銆嶏紙20 涓囪锛夛細瀵圭瓑 Zig 鐨?`big_count_range`銆?
+        // big_scan 鍙壂 1 涓囪銆佺粷瀵硅€楁椂 <1碌s锛沚ig_count 鎵?50 涓囪浣嗚捣鐐?0 鈥斺€?
+        // 杩欎竴妗ｅ浐瀹?20 涓囪鍖洪棿锛屼笌鍐呭瓨鍐呴偅妗ｅ悓鏍锋湰閲忥紝渚夸簬妯瘮銆屽唴瀛樺唴 vs 瓒呭唴瀛樸€嶈“鍑忓箙搴︺€?
         {
             let t0 = Instant::now();
             let mut n: usize = 0;
@@ -363,9 +363,9 @@ fn main() -> rusqlite::Result<()> {
 
         drop(c);
 
-        // 纯 open（与 Zig 的 `Table.open` 对等）：只开连接 + 两次 pragma，**不做任何查询**。
-        // 原口径里还带了一条 `query_row`，而 Zig 侧 `big_recover` 只量 open ——
-        // 两边做的事不同，比出来的倍数没有意义（这是本项目第 5 次踩同一个坑）。
+        // 绾?open锛堜笌 Zig 鐨?`Table.open` 瀵圭瓑锛夛細鍙紑杩炴帴 + 涓ゆ pragma锛?*涓嶅仛浠讳綍鏌ヨ**銆?
+        // 鍘熷彛寰勯噷杩樺甫浜嗕竴鏉?`query_row`锛岃€?Zig 渚?`big_recover` 鍙噺 open 鈥斺€?
+        // 涓よ竟鍋氱殑浜嬩笉鍚岋紝姣斿嚭鏉ョ殑鍊嶆暟娌℃湁鎰忎箟锛堣繖鏄湰椤圭洰绗?5 娆¤俯鍚屼竴涓潙锛夈€?
         {
             let t0 = Instant::now();
             let c_open = Connection::open(path)?;
@@ -375,7 +375,7 @@ fn main() -> rusqlite::Result<()> {
             drop(c_open);
         }
 
-        // 重开 + 首次点查（原口径，保留作参考，不计入对等结论）
+        // 閲嶅紑 + 棣栨鐐规煡锛堝師鍙ｅ緞锛屼繚鐣欎綔鍙傝€冿紝涓嶈鍏ュ绛夌粨璁猴級
         let t0 = Instant::now();
         let c2 = Connection::open(path)?;
         c2.pragma_update(None, "journal_mode", "WAL")?;
@@ -388,9 +388,9 @@ fn main() -> rusqlite::Result<()> {
         let _ = std::fs::remove_file(format!("{path}-shm"));
     }
 
-    // ---------------- 随机原地 UPDATE（目标线 §16.1：SQLite 强项） ----------------
-    // 在已存在的 100 万行表 t 上随机改 10 万行的值；两种形态都测：
-    //   upd_random_auto = 逐条 autocommit；upd_random_txn = 单事务（SQLite 最佳形态，主对比口径）。
+    // ---------------- 闅忔満鍘熷湴 UPDATE锛堢洰鏍囩嚎 搂16.1锛歋QLite 寮洪」锛?----------------
+    // 鍦ㄥ凡瀛樺湪鐨?100 涓囪琛?t 涓婇殢鏈烘敼 10 涓囪鐨勫€硷紱涓ょ褰㈡€侀兘娴嬶細
+    //   upd_random_auto = 閫愭潯 autocommit锛泆pd_random_txn = 鍗曚簨鍔★紙SQLite 鏈€浣冲舰鎬侊紝涓诲姣斿彛寰勶級銆?
     {
         let c3 = open_conn()?;
         let value2 = [b'y'; 32];
@@ -427,7 +427,7 @@ fn main() -> rusqlite::Result<()> {
         let secs = t0.elapsed().as_secs_f64();
         println!("upd_random_txn,{},{}", GET_N, GET_N as f64 / secs);
 
-        // 更新后点查（与 Zig 侧 upd_get 同口径）
+        // 鏇存柊鍚庣偣鏌ワ紙涓?Zig 渚?upd_get 鍚屽彛寰勶級
         let t0 = Instant::now();
         let mut hits: i64 = 0;
         {
@@ -448,11 +448,11 @@ fn main() -> rusqlite::Result<()> {
         println!("upd_get,{},{}", GET_N, GET_N as f64 / secs);
         println!("upd_get_hits,{},{}", GET_N, hits);
 
-        // DELETE：100 万行表上按主键删 10 万行，一次提交。
+        // DELETE锛?00 涓囪琛ㄤ笂鎸変富閿垹 10 涓囪锛屼竴娆℃彁浜ゃ€?
         //
-        // 口径与 Zig 侧 `del_100k` 逐条对齐：同一个 xorshift64 序列（种子 88172645463325252）、
-        // 同样取 `x % N`、同样「循环内只记账、末尾一次提交」。
-        // 注意 id 可能重复（随机序列会撞），两边都一样，所以剩余行数要实测而不是算。
+        // 鍙ｅ緞涓?Zig 渚?`del_100k` 閫愭潯瀵归綈锛氬悓涓€涓?xorshift64 搴忓垪锛堢瀛?88172645463325252锛夈€?
+        // 鍚屾牱鍙?`x % N`銆佸悓鏍枫€屽惊鐜唴鍙璐︺€佹湯灏句竴娆℃彁浜ゃ€嶃€?
+        // 娉ㄦ剰 id 鍙兘閲嶅锛堥殢鏈哄簭鍒椾細鎾烇級锛屼袱杈归兘涓€鏍凤紝鎵€浠ュ墿浣欒鏁拌瀹炴祴鑰屼笉鏄畻銆?
         {
             let t0 = Instant::now();
             c3.execute_batch("BEGIN")?;
@@ -471,7 +471,7 @@ fn main() -> rusqlite::Result<()> {
             let secs = t0.elapsed().as_secs_f64();
             println!("del_100k,{},{}", GET_N, GET_N as f64 / secs);
         }
-        // 正确性 1：被删的 key 必须查不到
+        // 姝ｇ‘鎬?1锛氳鍒犵殑 key 蹇呴』鏌ヤ笉鍒?
         {
             let mut hits: i64 = 0;
             let mut stmt = c3.prepare("SELECT 1 FROM t WHERE id = ?1")?;
@@ -488,13 +488,13 @@ fn main() -> rusqlite::Result<()> {
             }
             println!("del_deleted_hits,{},{}", GET_N, hits);
         }
-        // 正确性 2：剩余行数（实测，不用 n - get_n 推算 —— 随机序列有重复值）
+        // 姝ｇ‘鎬?2锛氬墿浣欒鏁帮紙瀹炴祴锛屼笉鐢?n - get_n 鎺ㄧ畻 鈥斺€?闅忔満搴忓垪鏈夐噸澶嶅€硷級
         {
             let cnt: i64 = c3.query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))?;
             println!("del_remaining,{},{}", N, cnt);
         }
 
-        // 分页查询（与 Zig 侧 sql_limit10 / sql_full 同口径，同一张 100 万行表）
+        // 鍒嗛〉鏌ヨ锛堜笌 Zig 渚?sql_limit10 / sql_full 鍚屽彛寰勶紝鍚屼竴寮?100 涓囪琛級
         {
             let t0 = Instant::now();
             let mut n: usize = 0;
@@ -508,9 +508,9 @@ fn main() -> rusqlite::Result<()> {
             let secs = t0.elapsed().as_secs_f64();
             println!("sql_limit10,{},{}", n, n as f64 / secs);
         }
-        // SQL 点查：与 Zig 侧 `sql_get` **同一个随机序列、同样的主键分布** ——
-        // 走 SQL 接口做 10 万次主键点查（不是 `get` 那种直连存储 API）。
-        // 随机数用 xorshift64 + 同一个种子，否则两边点的不是同一批 key，比较无意义。
+        // SQL 鐐规煡锛氫笌 Zig 渚?`sql_get` **鍚屼竴涓殢鏈哄簭鍒椼€佸悓鏍风殑涓婚敭鍒嗗竷** 鈥斺€?
+        // 璧?SQL 鎺ュ彛鍋?10 涓囨涓婚敭鐐规煡锛堜笉鏄?`get` 閭ｇ鐩磋繛瀛樺偍 API锛夈€?
+        // 闅忔満鏁扮敤 xorshift64 + 鍚屼竴涓瀛愶紝鍚﹀垯涓よ竟鐐圭殑涓嶆槸鍚屼竴鎵?key锛屾瘮杈冩棤鎰忎箟銆?
         {
             let t0 = Instant::now();
             let mut hits: i64 = 0;
@@ -547,28 +547,39 @@ fn main() -> rusqlite::Result<()> {
             let secs = t0.elapsed().as_secs_f64();
             println!("sql_full,{},{}", n, n as f64 / secs);
         }
-        // 排序 + 分页（top-N）：与 Zig 侧 `sql_orderby_limit10` 同一条语句、同一张 100 万行表。
+        // 鎺掑簭 + 鍒嗛〉锛坱op-N锛夛細涓?Zig 渚?`sql_orderby_limit10` 鍚屼竴鏉¤鍙ャ€佸悓涓€寮?100 涓囪琛ㄣ€?
         //
-        // SQLite 自己也有 sorter 的 top-N 优化（只要前 N 名就不保留全部），
-        // 所以这一档是「两边都有 top-N 优化」的对等比较，而不是拿我们的全量排序比它。
+        // SQLite 鑷繁涔熸湁 sorter 鐨?top-N 浼樺寲锛堝彧瑕佸墠 N 鍚嶅氨涓嶄繚鐣欏叏閮級锛?
+        // 鎵€浠ヨ繖涓€妗ｆ槸銆屼袱杈归兘鏈?top-N 浼樺寲銆嶇殑瀵圭瓑姣旇緝锛岃€屼笉鏄嬁鎴戜滑鐨勫叏閲忔帓搴忔瘮瀹冦€?
+        //
+        // **閲嶅 200 娆″彇涓綅**锛堝璁?2026-11-02锛夛細鍗曟 ~50 碌s 琚満鍣ㄦ姈鍔ㄦ饭娌★紝
+        // 涓?Zig 渚у悓鍙ｅ緞銆俙prepare` 绉诲埌璁℃椂澶?鈥斺€?涓や晶閮戒笉鎶娿€岀紪璇?瑙ｆ瀽銆嶇畻杩涘幓銆?
         {
-            let t0 = Instant::now();
-            let mut n: usize = 0;
-            {
-                let mut stmt = c3.prepare("SELECT * FROM t ORDER BY id DESC LIMIT 10")?;
-                let mut rows = stmt.query([])?;
-                while rows.next()?.is_some() {
-                    n += 1;
+            let mut stmt = c3.prepare("SELECT * FROM t ORDER BY id DESC LIMIT 10")?;
+            const REPS: usize = 200;
+            let mut samples: Vec<(f64, usize)> = Vec::with_capacity(REPS);
+            for _ in 0..REPS {
+                let t0 = Instant::now();
+                let mut n: usize = 0;
+                {
+                    let mut rows = stmt.query([])?;
+                    while rows.next()?.is_some() {
+                        n += 1;
+                    }
                 }
+                samples.push((t0.elapsed().as_secs_f64(), n));
             }
-            let secs = t0.elapsed().as_secs_f64();
-            println!("sql_orderby_limit10,{},{}", n, n as f64 / secs);
+            samples.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            let (med, n) = samples[REPS / 2];
+            println!("sql_orderby_limit10,{},{}", n, n as f64 / med);
+            // 鍗曚綅缁熶竴鎴?**寰**锛堜笌 Zig 渚у悓瀛楁鍚嶏紝渚夸簬涓や晶鐩存帴瀵圭収锛?
+            println!("sql_orderby_limit10_med_us,{},{:.1}", REPS, med * 1e6);
         }
-        // 上面的 sql_full 只推进游标、**不取列值**。SQLite 的 `OP_Column` 是惰性的：
-        // 不调用 `column_*` 就根本不解码，所以那个数字只代表「游标推进」。
-        // 这一档把两列都真读出来（都用零拷贝，不 malloc）：
-        //   id -> i64 值拷贝；v -> `get_ref` 取切片，与 Zig 侧「text 指向 mmap 不复制」同口径。
-        // 这才是与 `sql_each`（我们每行都完整解码两列）对等的比较。
+        // 涓婇潰鐨?sql_full 鍙帹杩涙父鏍囥€?*涓嶅彇鍒楀€?*銆係QLite 鐨?`OP_Column` 鏄儼鎬х殑锛?
+        // 涓嶈皟鐢?`column_*` 灏辨牴鏈笉瑙ｇ爜锛屾墍浠ラ偅涓暟瀛楀彧浠ｈ〃銆屾父鏍囨帹杩涖€嶃€?
+        // 杩欎竴妗ｆ妸涓ゅ垪閮界湡璇诲嚭鏉ワ紙閮界敤闆舵嫹璐濓紝涓?malloc锛夛細
+        //   id -> i64 鍊兼嫹璐濓紱v -> `get_ref` 鍙栧垏鐗囷紝涓?Zig 渚с€宼ext 鎸囧悜 mmap 涓嶅鍒躲€嶅悓鍙ｅ緞銆?
+        // 杩欐墠鏄笌 `sql_each`锛堟垜浠瘡琛岄兘瀹屾暣瑙ｇ爜涓ゅ垪锛夊绛夌殑姣旇緝銆?
         {
             let t0 = Instant::now();
             let mut n: usize = 0;
@@ -589,12 +600,12 @@ fn main() -> rusqlite::Result<()> {
             println!("sql_full_touch_acc,{},{}", n, acc);
         }
 
-        // 聚合 / GROUP BY：与 Zig 侧 `sql_group_by` / `sql_agg_full` 同数据集
-        // （id = 0..N-1、g = id % 100000、x = id % 1000）。
+        // 鑱氬悎 / GROUP BY锛氫笌 Zig 渚?`sql_group_by` / `sql_agg_full` 鍚屾暟鎹泦
+        // 锛坕d = 0..N-1銆乬 = id % 100000銆亁 = id % 1000锛夈€?
         //
-        // 用**独立库文件**：① 不干扰 `t`（加列会改 sql_full / sql_each 的每行字节量，
-        // 历史轮次就没法对齐）；② 能单独量落盘占用（`agg_disk_bytes`），
-        // 因为「读得快」若要归因于「表更小」，两边都得给出字节数。
+        // 鐢?*鐙珛搴撴枃浠?*锛氣憼 涓嶅共鎵?`t`锛堝姞鍒椾細鏀?sql_full / sql_each 鐨勬瘡琛屽瓧鑺傞噺锛?
+        // 鍘嗗彶杞灏辨病娉曞榻愶級锛涒憽 鑳藉崟鐙噺钀界洏鍗犵敤锛坄agg_disk_bytes`锛夛紝
+        // 鍥犱负銆岃寰楀揩銆嶈嫢瑕佸綊鍥犱簬銆岃〃鏇村皬銆嶏紝涓よ竟閮藉緱缁欏嚭瀛楄妭鏁般€?
         {
             let agg_db = "bench-agg.db";
             let agg_wal = "bench-agg.db-wal";
@@ -607,7 +618,7 @@ fn main() -> rusqlite::Result<()> {
             ca.pragma_update(None, "synchronous", "NORMAL")?;
             ca.execute_batch("CREATE TABLE agg(id INTEGER PRIMARY KEY, g INTEGER, x INTEGER)")?;
             {
-                // 灌数据不计时（与 Zig 侧一致：那是准备，不是被测行为）
+                // 鐏屾暟鎹笉璁℃椂锛堜笌 Zig 渚т竴鑷达細閭ｆ槸鍑嗗锛屼笉鏄娴嬭涓猴級
                 ca.execute_batch("BEGIN")?;
                 {
                     let mut stmt = ca.prepare("INSERT INTO agg(id, g, x) VALUES (?1, ?2, ?3)")?;
@@ -617,13 +628,13 @@ fn main() -> rusqlite::Result<()> {
                 }
                 ca.execute_batch("COMMIT")?;
             }
-            // 落盘占用：checkpoint 后取文件大小（与 Zig「flush 后 WAL 归零」的稳态对齐）
+            // 钀界洏鍗犵敤锛歝heckpoint 鍚庡彇鏂囦欢澶у皬锛堜笌 Zig銆宖lush 鍚?WAL 褰掗浂銆嶇殑绋虫€佸榻愶級
             ca.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
-            // io::Error 不能 `?` 成 rusqlite::Error（两边错误类型不同），显式取默认值
+            // io::Error 涓嶈兘 `?` 鎴?rusqlite::Error锛堜袱杈归敊璇被鍨嬩笉鍚岋級锛屾樉寮忓彇榛樿鍊?
             let agg_bytes = std::fs::metadata(agg_db).map(|m| m.len()).unwrap_or(0);
             println!("agg_disk_bytes,{},{}", N, agg_bytes);
 
-            // GROUP BY g：10 万组
+            // GROUP BY g锛?0 涓囩粍
             {
                 let t0 = Instant::now();
                 let mut groups: usize = 0;
@@ -644,7 +655,7 @@ fn main() -> rusqlite::Result<()> {
                 println!("sql_group_by_digest,{},{}", groups, digest);
             }
 
-            // 全表聚合（无 GROUP BY）
+            // 鍏ㄨ〃鑱氬悎锛堟棤 GROUP BY锛?
             {
                 let t0 = Instant::now();
                 let (cnt, sum, min, max): (i64, i64, i64, i64) = ca.query_row(
@@ -659,9 +670,9 @@ fn main() -> rusqlite::Result<()> {
                 println!("sql_agg_minmax,{},{}", min, max);
             }
 
-            // HAVING + ORDER BY 聚合 + LIMIT（top-N）。与 Zig 侧同一条 SQL。
-            // 必须带次级排序键 g：只按 SUM(x) 排序时 100 个组并列，
-            // 两侧的并列顺序不一定相同，digest 就会“都对但对不上”。
+            // HAVING + ORDER BY 鑱氬悎 + LIMIT锛坱op-N锛夈€備笌 Zig 渚у悓涓€鏉?SQL銆?
+            // 蹇呴』甯︽绾ф帓搴忛敭 g锛氬彧鎸?SUM(x) 鎺掑簭鏃?100 涓粍骞跺垪锛?
+            // 涓や晶鐨勫苟鍒楅『搴忎笉涓€瀹氱浉鍚岋紝digest 灏变細鈥滈兘瀵逛絾瀵逛笉涓娾€濄€?
             {
                 let t0 = Instant::now();
                 let mut n: usize = 0;
@@ -685,8 +696,8 @@ fn main() -> rusqlite::Result<()> {
                 println!("sql_having_digest,{},{}", n, digest);
             }
 
-            // 二级索引：与 Zig 侧同一条索引（agg(g)）、同一串查询、同一份 digest。
-            // 边界与 Zig 侧一致：只覆盖单列等值查询。
+            // 浜岀骇绱㈠紩锛氫笌 Zig 渚у悓涓€鏉＄储寮曪紙agg(g)锛夈€佸悓涓€涓叉煡璇€佸悓涓€浠?digest銆?
+            // 杈圭晫涓?Zig 渚т竴鑷达細鍙鐩栧崟鍒楃瓑鍊兼煡璇€?
             {
                 let before = std::fs::metadata(agg_db).map(|m| m.len()).unwrap_or(0);
                 let t0 = Instant::now();

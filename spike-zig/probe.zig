@@ -1,4 +1,4 @@
-﻿const std = @import("std");
+const std = @import("std");
 
 pub fn main() !void {
     var debug_alloc = std.heap.DebugAllocator(.{}){};

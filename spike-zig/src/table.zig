@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-PekRDB-Commercial
 // 个人使用免费；商业使用需商业授权，或同样以 AGPL-3.0 开源（见 LICENSE）。
 const std = @import("std");
 const builtin = @import("builtin");
@@ -87,6 +87,15 @@ pub const Options = struct {
     compact_max_segs: usize = 0,
     /// 分层合并每次合并几个段（`< 2` 视为关闭）。
     tiered_fanout: usize = 4,
+    /// `ORDER BY <pk> DESC LIMIT k` 快速路径（`Table.topKDesc`）允许的最大 k，
+    /// `0` = 禁用该快速路径（审计项，2026-11-02）。
+    ///
+    /// **为什么需要上限**：快速路径的成本是「扫 `k+64` 量级的候选 + 每行拷一份 key +
+    /// 候选全量排序 + 再按 key 归组扫一遍」；而全量路径只是一次 k 路归并 + 排序
+    /// （每行只比一次）。k 接近表大小时快速路径**反而更慢** —— 这是「优化变负优化」
+    /// 的典型场景，所以必须封顶。4096 覆盖「真·分页」量级
+    /// （一页几十到几千行），再大的 LIMIT 交给归并路径。
+    topk_desc_max: usize = 4096,
     /// **仅用于基准 A/B**：置 true 时禁用「顺序拼接」快路径，强制走 k 路堆归并。
     ///
     /// 为什么要这个开关：§16.1.22 的收益原本是拿「本批 25 段 ÷ 本批 1 段」的比值，
@@ -768,13 +777,15 @@ pub const Table = struct {
         self.checkThread();
         out.clearRetainingCapacity();
         if (k == 0) return true;
+        // **大 k 必须回退全量路径**（见 `Options.topk_desc_max` 的注释）：k 大时这条路径
+        // 反而更慢，因为它给每个候选多付一次 key 拷贝与一次候选排序。
+        if (self.opts.topk_desc_max == 0 or k > self.opts.topk_desc_max) return false;
         const alloc = self.alloc;
         const window = k + segmod.INDEX_STRIDE;
 
-        const Cand = TopCand;
         var kbuf: std.ArrayList(u8) = .empty; // 稳定 key 区（段游标的 key 指向双缓冲）
         defer kbuf.deinit(alloc);
-        var cand: std.ArrayList(Cand) = .empty;
+        var cand: std.ArrayList(TopCand) = .empty;
         defer cand.deinit(alloc);
 
         // ---- 1) 段：从后往前；不重叠且已凑够 window 就停 ----
@@ -847,7 +858,7 @@ pub const Table = struct {
 
         // ---- 3) 排序 → 按 key 归组取最新版本 → 从大往小取 k 组 ----
         const ctx = KbufCtx{ .buf = kbuf.items };
-        std.mem.sort(Cand, cand.items, ctx, candLess);
+        std.mem.sort(TopCand, cand.items, ctx, candLess);
 
         var picked: std.ArrayList([]const u8) = .empty; // key 升序
         defer picked.deinit(alloc);
@@ -3457,6 +3468,15 @@ test "topKDesc：跨段 + 旧版本 + 墓碑，取最大的 k 个可见行（降
     // ④ 恰好等于行数（590 行有效）⇒ true，且 590 个
     try std.testing.expect(try t.topKDesc(total - 10, &out));
     try std.testing.expectEqual(@as(usize, total - 10), out.items.len);
+
+    // ⑤ **大 k 必须回退**：快速路径给每个候选多付一次 key 拷贝与一次候选排序，
+    // k 大到接近表大小时比归并路径更慢 ⇒ 超过 `topk_desc_max` 直接返回 false。
+    try std.testing.expect(!try t.topKDesc(t.opts.topk_desc_max + 1, &out));
+    // ⑥ `topk_desc_max = 0` ⇒ 整条快速路径禁用（给「怀疑它出问题」时留的开关）
+    t.opts.topk_desc_max = 0;
+    try std.testing.expect(!try t.topKDesc(10, &out));
+    t.opts.topk_desc_max = 4096;
+    try std.testing.expect(try t.topKDesc(10, &out));
 }
 
 fn tVal(buf: []u8, prefix: u8, n: usize) []const u8 {

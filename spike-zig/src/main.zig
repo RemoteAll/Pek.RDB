@@ -564,6 +564,11 @@ fn benchMain() !void {
         // 改之前：全量解码（100 万行 ≈ 96 MB）+ 全量排序，全为了丢掉 99.999%。
         // 现在扫描时只维护一个 k=10 的堆（`exec.keepTopN`），排序只排 10 行。
         // 与 SQLite 的 `ORDER BY ... LIMIT` sorter top-N 优化同口径（同一条语句）。
+        //
+        // **重复 200 次取中位**（审计 2026-11-02）：这条查询现在是 ~50 µs 级，
+        // 单次采样被机器抖动（几十 µs 级，见 §九十一）完全淹没 —— p24–p29 的
+        // 逐轮比值在 0.6×–1.1× 之间乱跳就是信噪比不足造成的。SQLite 侧同一档
+        // 同样改成 200 次取中位，且把 `prepare` 移到计时外（我们这侧本来就没有解析成本）。
         {
             var items_o = [_]spike.sql.SelectItem{.{ .star = {} }};
             var ord_o = [_]spike.sql.OrderItem{.{ .column = "id", .desc = true }};
@@ -573,13 +578,28 @@ fn benchMain() !void {
                 .order_by = &ord_o,
                 .limit = 10,
             };
+            const reps: usize = 200;
+            // **必须在循环前清零**：这是「本档读了多少行」的确定性指标，不清零会把
+            // 前面 `sql_full` 的 100 万行累加进来，看起来像「排序查询扫了全表」（审计项）。
             t4.scan_rows_read = 0;
-            const t0 = nowNs(io);
-            var rows_o = try spike.exec.selectRows(&t4, &s, sel_o, alloc);
-            const ns = nowNs(io) - t0;
-            defer rows_o.deinit();
-            std.debug.print("sql_orderby_limit10,{d},{d:.0}\n", .{ rows_o.rows.len, opsPerSec(@intCast(rows_o.rows.len), ns) });
+            var samples = try alloc.alloc(u64, reps);
+            defer alloc.free(samples);
+            var got_rows: usize = 0;
+            var r: usize = 0;
+            while (r < reps) : (r += 1) {
+                const t0 = nowNs(io);
+                var rows_o = try spike.exec.selectRows(&t4, &s, sel_o, alloc);
+                samples[r] = nowNs(io) - t0;
+                got_rows += rows_o.rows.len;
+                rows_o.deinit();
+            }
+            std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+            const med = samples[reps / 2];
+            const per = got_rows / reps;
+            std.debug.print("sql_orderby_limit10,{d},{d:.0}\n", .{ per, opsPerSec(@intCast(per), med) });
             std.debug.print("sql_orderby_limit10_readrows,{d},0\n", .{t4.scan_rows_read});
+            // 单位统一成 **微秒**（两岸同一字段名），p31 那批曾是「zig 侧纳秒 / SQLite 侧微秒」
+            std.debug.print("sql_orderby_limit10_med_us,{d},{d:.1}\n", .{ reps, @as(f64, @floatFromInt(med)) / 1000.0 });
         }
         // 投影扫描：同一张表、同样全表范围，只取 1 列（`SELECT id`）。
         //

@@ -287,10 +287,16 @@ pub const Skiplist = struct {
     /// **反向迭代器**：从最大节点往小走（`ORDER BY pk DESC LIMIT k` 的物理基础，
     /// 对齐 RocksDB 的 `Prev()` / sled 的 `DoubleEndedIterator`）。
     ///
-    /// 每步用 `find()` 求前驱（O(log n)），而不是给每个节点加 `prev[]`：节点结构里
-    /// 已经有一个 22×4B 的 `next[]`，再加一份 `prev[]` 会让 memtable 每条记录多 88B
-    /// （40B/行的现状会翻倍）。k 通常是 10~1000，O(k log n) 完全够；真要全表倒序扫
-    /// 再考虑加链。
+    /// 每步走 `Node.prev0`（0 层双向链），O(1)。
+    ///
+    /// **为什么不给每层都加 `prev[]`**：`next[]` 是 `MAX_HEIGHT(=12)×4B = 48B`，
+    /// 每层都配前驱会让 memtable 每条记录再 +48B；只给 0 层配 4B 就够反向逐条走。
+    /// 而且这 4B 实际**没有增加结构体大小**：`MAX_HEIGHT=12` 时无 `prev0` 是 76B、
+    /// 按 8 对齐占 80B，加 `prev0` 后 80B —— 正好落在原有对齐填充里
+    /// （`Node 尺寸：prev0 落在对齐填充里，不得加大结构体` 用例钉住）。
+    ///
+    /// 第一版写的是「每步 `find()` 求前驱（O(log n)）」—— 那版实测 `topKDesc` 每一步
+    /// 都要一次完整下潜，74 步约占整个查询的 40%，换成前驱链后才有明显改善。
     pub const RevIter = struct {
         list: *const Skiplist,
         cur: u32,
@@ -436,12 +442,25 @@ test "反向迭代器：与正向遍历互为逆序（含同 key 多版本）" {
     try std.testing.expectEqual(@as(usize, 0), i);
     // 反向的第一个必须是最小 key 那一端之前的**最大值** (k0005, seq1)：
     // 全序是 (key ASC, seq DESC)，所以它的最大元恰好是同 key 的**最旧**版本。
-    // 这条语义对 `Table.topKDesc` 无影响（那里只取 key，再用 `get()` 拿精确新版本），
-    // 但写成断言避免将来误以为「反向第一个就是最新版本」。
+    // 这条语义对 `Table.topKDesc` 无影响（那里把所有候选按 (key, seq) 重新排序，
+    // 同 key 的第一条才是最旧→最新的正确判据），但写成断言避免将来误以为
+    // 「反向第一个就是最新版本」。
     try std.testing.expectEqualStrings("k0005", first_key);
     try std.testing.expectEqual(@as(u64, 1), first_seq);
     // 反向的最后一个是最小值
     try std.testing.expectEqualStrings("k0000", prev_key.?);
+}
+
+test "Node 尺寸：prev0 落在对齐填充里，不得加大结构体" {
+    // `prev0` 是为反向迭代加的 4B 字段。MAX_HEIGHT=12 时 `next[]` 是 48B，
+    // 无 prev0 的结构体是 76B、按 8 对齐占 80B；加上 prev0 后仍是 80B ——
+    // **一条内存代价都没有**。这个断言防止将来改字段时它默默变成 88B
+    // （memtable 每条记录都要吃这个尺寸，量级是千万条）。
+    const sz = @sizeOf(Node);
+    if (sz > 80) {
+        std.debug.print("Node 尺寸 {d} > 80（prev0 已挤出对齐填充，需要重新评估内存代价）\n", .{sz});
+        return error.NodeTooBig;
+    }
 }
 
 test "反向迭代器：空表 / 单元素 / 提前停止" {

@@ -337,7 +337,9 @@ powershell -File tools\abba-verdict.ps1 -Tag <标签> -Date <日期>
 
 | 批次 | 内容 |
 |---|---|
-| `zig/sqlite-2026-11-02-p28` | **`ORDER BY pk DESC LIMIT k` 反向快速路径的最终批**（3 轮 ABBA）：`sql_orderby_limit10` 从 p24 的 **0.0006×** 一路到 **0.959×（区间 0.825–1.085，未决）**；同批 29 胜 / 0 负 / 1 未决 |
+| `zig/sqlite-2026-11-02-p28` | **`ORDER BY pk DESC LIMIT k` 反向快速路径**（3 轮 ABBA，**旧口径：单次采样 + SQLite `prepare` 在计时内**）：`sql_orderby_limit10` 从 p24 的 **0.0006×** 升到 **0.959×（未决）**；同批 29 胜 / 0 负 / 1 未决。**口径问题见 §九十五**：新口径下该档真实为 0.29× |
+| `zig/sqlite-2026-11-02-p29` | 审计修复后的旧口径回归（3 轮）：`sql_orderby_limit10` 0.867×（0/3）；26 胜 / 3 未决。**与 p28 的差异本身就是“信噪比不足”的实证** |
+| `zig/sqlite-2026-11-02-p31` | **新口径基线**（`sql_orderby_limit10` 改为两侧各 200 次取中位、编译/解析移出计时）：该档 **0.335×（0.210–0.512，稳定落后 ≈3×）**；其余档仍为旧口径（单次），**两批不直接比** |
 | `zig/sqlite-2026-11-02-p27` | 去掉「逐 key `get()`」改归并归组：`sql_orderby_limit10` 0.955×（1/3，未决）；`sql_index_build` 也是 1/3 未决（噪声批次，**不作结论**） |
 | `zig/sqlite-2026-11-02-p26` | 反向快速路径第一步（段尾块定位 + 逐 key `get()`）：`sql_orderby_limit10` **0.685×**（0/3），全批 29 胜 / 1 负 |
 | `zig/sqlite-2026-11-02-p24` | **首次把 `ORDER BY … LIMIT` 纳入对照**：`sql_orderby_limit10` = **0.0006×**（76 行/s vs 125,313 行/s），暴露「全表扫描 + 全量排序 vs rowid 倒走」的 1600 倍差距 |

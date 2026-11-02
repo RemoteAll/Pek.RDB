@@ -725,9 +725,12 @@ pub fn selectRowsHost(
     // **但在交给 `finishFromValues` 之前先做一次 top-N 预筛**：`ORDER BY ... LIMIT k`
     // 只需要前 k 名，而 `finishFromValues` 会把所有候选解码进 `flat/hdrs`（100 万行约 96 MB）
     // 再整体排序 —— 那 99.999% 的工作是白做的（同 §16.1.8 的 LIMIT 提前终止一类）。
+    //
+    // **只当 `k` 明显小于候选数时才预筛**（2× 判据）：预筛要为此保留的 k 行各拷一份值，
+    // 当 k 接近 n 时「少物化 n−k 行」的收益消失、而拷贝的代价还在 ⇒ 反而更慢。
     if (sel.order_by.len > 0 and sel.limit != null) {
         const k = @as(usize, sel.offset orelse 0) + @as(usize, sel.limit.?);
-        if (src.len > k) {
+        if (src.len > k *| 2) {
             var top: std.ArrayList([]const u8) = .empty;
             defer top.deinit(alloc);
             try keepTopN(s, sel, alloc, src, k, &top);
@@ -1787,6 +1790,9 @@ test "ORDER BY + LIMIT：top-N 预筛与全量排序结果逐行一致（含并�
         .{ .items = &proj, .order = &ord_pk_desc, .offset = 7, .limit = 10 },
         .{ .items = &star, .order = &ord_pk_desc, .offset = null, .limit = 1 },
         .{ .items = &star, .order = &ord_pk_asc, .offset = 3, .limit = 10 },
+        // 大 LIMIT（几乎取全表）也必须与全量对照一致：这条覆盖「k 接近表大小」时
+        // 快速路径 / 回退路径的分界（`Options.topk_desc_max`）
+        .{ .items = &star, .order = &ord_pk_desc, .offset = null, .limit = 250 },
     };
 
     for (cases, 0..) |c, ci| {
@@ -1820,6 +1826,21 @@ test "ORDER BY + LIMIT：top-N 预筛与全量排序结果逐行一致（含并�
                 }
             }
         }
+    }
+
+    // 超过 `Options.topk_desc_max` 的大 LIMIT 必须**回退全量路径**且结果仍正确
+    // （审计项：快速路径在 k 大时反而更慢，回退后不能悄悄变成少行/乱序）
+    {
+        var big = try selectRows(&t, &s, .{
+            .items = &star,
+            .table = "t",
+            .order_by = &ord_pk_desc,
+            .limit = 5000,
+        }, alloc);
+        defer big.deinit();
+        try std.testing.expectEqual(@as(usize, 300), big.rows.len);
+        try std.testing.expect(schema_mod.valueCmp(big.rows[0][0], .{ .integer = 299 }) == .eq);
+        try std.testing.expect(schema_mod.valueCmp(big.rows[299][0], .{ .integer = 0 }) == .eq);
     }
 }
 
