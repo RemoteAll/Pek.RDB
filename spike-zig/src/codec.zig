@@ -805,6 +805,59 @@ test "RecIter.nextCmp：就地比较的结果与重建 key 后比较逐行一致
     }
 }
 
+test "RecIter: 超过 64B 内联缓冲的 key 必须回退堆缓冲（内容与顺序都对）" {
+    const alloc = std.testing.allocator;
+    const stride: usize = 3;
+
+    // 6 条 120 字节的 key：前 8 字节公共前缀，第 9 字节递增（保证顺序 = 下标顺序）
+    var keybuf: [6][120]u8 = undefined;
+    var keys: [6][]const u8 = undefined;
+    for (&keybuf, 0..) |*k, i| {
+        @memset(k, 'a' + @as(u8, @intCast(i)));
+        @memset(k[0..8], 'P');
+        std.mem.writeInt(u32, k[116..120], @intCast(i), .little);
+        keys[i] = k;
+    }
+
+    var blob: std.ArrayList(u8) = .empty;
+    defer blob.deinit(alloc);
+    var i: usize = 0;
+    while (i < keys.len) {
+        const n = @min(stride, keys.len - i);
+        try blob.append(alloc, 8); // 块内公共前缀长度
+        var j: usize = 0;
+        while (j < n) : (j += 1) {
+            const key = keys[i + j];
+            var hdr: [6 + 33]u8 = undefined;
+            const hn = writeRecHdr(&hdr, key.len, 0, i + j + 1, 0);
+            try blob.appendSlice(alloc, hdr[0..hn]);
+            // 块首写完整 key，其余写后缀（120B > 64B 内联容量 ⇒ 走堆缓冲）
+            try blob.appendSlice(alloc, if (j == 0) key else key[8..]);
+        }
+        i += n;
+    }
+
+    var it = try RecIter.init(alloc, blob.items, stride, 120);
+    defer it.deinit(alloc);
+    for (keys) |want| {
+        const rec = it.next(alloc) orelse return error.MissingRow;
+        try std.testing.expectEqualStrings(want, rec.key);
+        try std.testing.expectEqual(@as(usize, 120), rec.klen);
+    }
+    try std.testing.expect(it.next(alloc) == null);
+
+    // `nextCmp` 对超长 key 也必须给出与「重建后比较」相同的顺序
+    for (keys) |want| {
+        var it2 = try RecIter.init(alloc, blob.items, stride, 120);
+        defer it2.deinit(alloc);
+        var idx: usize = 0;
+        while (it2.nextCmp(want)) |cv| : (idx += 1) {
+            try std.testing.expectEqual(std.mem.order(u8, keys[idx], want), cv.ord);
+        }
+        try std.testing.expectEqual(keys.len, idx);
+    }
+}
+
 test "KeyArena：跨块分配的切片永不移动；reset 复用；retain 有上界" {
     const alloc = std.testing.allocator;
     var a = KeyArena{ .chunk_size = 64, .retain_bytes = 128 };

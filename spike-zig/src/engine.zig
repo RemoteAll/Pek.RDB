@@ -874,11 +874,17 @@ fn keyArrLess(_: void, a: [16]u8, b: [16]u8) bool {
 }
 
 /// 跑一条查询并交回结果行（调用方 `deinit`）。
+///
+/// `execute` 返回的是 union：非 `.rows` 变体（如 INSERT 的 `.count`）一律报错，
+/// 不要直接取 `.rows`（在 Debug 下会 panic，ReleaseFast 下是 UB）。
 fn queryRows(eng: *Engine, alloc: std.mem.Allocator, text: []const u8) !exec.Rows {
     var p = try sql.parse(alloc, text);
     defer p.deinit();
     const res = try eng.execute(p.stmt, alloc);
-    return res.rows;
+    return switch (res) {
+        .rows => res.rows,
+        else => error.NotARowsStatement,
+    };
 }
 
 // `ORDER BY <已建索引的非主键列>` 走索引的守门用例。
