@@ -37,6 +37,7 @@ const thread_check_supported = std.debug.runtime_safety and switch (builtin.os.t
 const Skiplist = @import("skiplist.zig").Skiplist;
 const walmod = @import("wal.zig");
 const segmod = @import("segment.zig");
+const codec = @import("codec.zig");
 
 const RecordOwned = segmod.RecordOwned;
 
@@ -256,6 +257,99 @@ fn hasSegmentDataFiles(io: std.Io, dir: std.Io.Dir, alloc: std.mem.Allocator, ta
     return false;
 }
 
+/// 归档（`seg/index.bin`）丢失但 `seg/*.data` 还在 ⇒ 从数据文件重建归档。
+///
+/// **为什么允许重建**：`.data` 是自描述的（块头带前缀长度、每条带 klen/vlen/seq/flags），
+/// 缺的只有「稀疏索引 + Bloom + 段头统计」——都是**派生数据**。拒开等于
+/// 「丢一个派生文件就永久打不开库」。
+///
+/// **代价**：每段的数据要完整读一遍，`Writer` 还会把它再写一遍到临时文件
+/// （纯粹为复用它的索引生成逻辑，保证 entries/Bloom/段头与正常 flush 完全一致）。
+/// 这是故障恢复路径，不在热路径上。
+fn rebuildArchive(
+    io: std.Io,
+    dir: std.Io.Dir,
+    base_path: []const u8,
+    alloc: std.mem.Allocator,
+    bloom_bits: u8,
+) !usize {
+    const seg_dir_path = try alloc.print("{s}/seg", .{base_path});
+    defer alloc.free(seg_dir_path);
+
+    // 1) 枚举 `NNNNNN.data` 并按段号升序（段号必须与归档 record 的 id 一致）
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(alloc);
+    {
+        var d = dir.openDir(io, seg_dir_path, .{ .iterate = true }) catch |e| switch (e) {
+            error.FileNotFound => return error.ArchiveMissingButSegmentsExist,
+            else => return e,
+        };
+        defer d.close(io);
+        var it = d.iterate();
+        while (try it.next(io)) |entry| {
+            if (!std.mem.endsWith(u8, entry.name, ".data")) continue;
+            const stem = entry.name[0 .. entry.name.len - ".data".len];
+            const id = std.fmt.parseInt(u32, stem, 10) catch continue;
+            try ids.append(alloc, id);
+        }
+    }
+    if (ids.items.len == 0) return error.ArchiveMissingButSegmentsExist;
+    std.mem.sort(u32, ids.items, {}, std.sort.asc(u32));
+
+    const tmp_path = try alloc.print("{s}/.rebuild.tmp", .{seg_dir_path});
+    defer alloc.free(tmp_path);
+    defer dir.deleteFile(io, tmp_path) catch {};
+
+    var records: std.ArrayList(segmod.ArchiveRecord) = .empty;
+    defer {
+        for (records.items) |r| alloc.free(r.payload);
+        records.deinit(alloc);
+    }
+
+    for (ids.items) |id| {
+        const data_path = try alloc.print("{s}/seg/{d:0>6}.data", .{ base_path, id });
+        defer alloc.free(data_path);
+
+        // Bloom 位图按「文件大小 / 16」估一个上界：估大只是位图偏大（误报更低），
+        // 估小也只是误报率高，**都不影响正确性**（见 `Writer.create` 的说明）。
+        const file_size: u64 = blk: {
+            const f = dir.openFile(io, data_path, .{}) catch |e| switch (e) {
+                error.FileNotFound => continue, // 枚举后被删了：跳过这一段
+                else => return e,
+            };
+            defer f.close(io);
+            break :blk (try f.stat(io)).size;
+        };
+        const est_rows: usize = @as(usize, @intCast(file_size / 16)) + 1;
+
+        var w = try segmod.Writer.create(io, dir, tmp_path, alloc, bloom_bits, est_rows);
+        defer w.deinit();
+        var n_rows: usize = 0;
+        {
+            const m = try segmod.mapWholeFile(io, dir, data_path, 0, 0);
+            var m_mut = m;
+            defer m_mut.destroy();
+            var rit = try codec.RecIter.init(alloc, m.bytes(), segmod.INDEX_STRIDE, 0);
+            defer rit.deinit(alloc);
+            while (rit.next(alloc)) |rec| {
+                n_rows += 1;
+                try w.push(rec.key, rec.seq, rec.flags, rec.value);
+            }
+        }
+        // `.data` 非空却解不出任何记录 ⇒ 块头/记录长度已被破坏（截断、扇区损坏）。
+        // 绝不能当空段写进归档：那等于「静默丢数据」，比拒开危险得多。
+        if (n_rows == 0 and file_size > 0) return error.SegmentCorrupt;
+        const fin = try w.finishBytes();
+        errdefer alloc.free(fin.bytes);
+        try records.append(alloc, .{ .id = id, .payload = fin.bytes });
+    }
+
+    const archive_path = try alloc.print("{s}/seg/index.bin", .{base_path});
+    defer alloc.free(archive_path);
+    _ = try segmod.archiveRewrite(io, dir, archive_path, records.items, alloc);
+    return ids.items.len;
+}
+
 fn openSegmentsFromArchive(
     io: std.Io,
     dir: std.Io.Dir,
@@ -466,16 +560,26 @@ pub const Table = struct {
             // 归档缺失时先分清「全新库」与「归档丢了」：
             // 以前这里一律当新建库，于是「index.bin 被删/丢失但 seg/*.data 还在」会表现为
             // **静默空表**，而且下一次 flush 的段号从 max_id+1=1 开始，直接覆盖 seg/000001.data。
-            // 宁可直接拒开，也不允许「看起来是空表」这种默默丢数据的形态。
-            if (try hasSegmentDataFiles(io, dir, alloc, path)) return error.ArchiveMissingButSegmentsExist;
-            // 新建库（或目录缺失）：把三层目录建好
-            try dir.createDirPath(io, path);
-            const wal_dir = try alloc.print("{s}/wal", .{path});
-            defer alloc.free(wal_dir);
-            try dir.createDirPath(io, wal_dir);
-            const seg_dir = try alloc.print("{s}/seg", .{path});
-            defer alloc.free(seg_dir);
-            try dir.createDirPath(io, seg_dir);
+            //
+            // 现在的处理：**先尝试从 `.data` 重建归档**（它们是自描述的，缺的只是派生数据）；
+            // 只有重建也失败（数据文件本身读不出来）才拒开 —— 拒开仍然是正确的兜底，
+            // 因为「打不开」比「看起来是空表」安全得多。
+            if (try hasSegmentDataFiles(io, dir, alloc, path)) {
+                _ = rebuildArchive(io, dir, path, alloc, opts.bloom_bits) catch
+                    return error.ArchiveMissingButSegmentsExist;
+                idx_map = try segmod.mapWholeFile(io, dir, index_path, opts.index_max_bytes, opts.index_prefault_max_bytes);
+                arch = idx_map.?.bytes();
+                try segmod.archiveCheckMagic(arch);
+            } else {
+                // 新建库（或目录缺失）：把三层目录建好
+                try dir.createDirPath(io, path);
+                const wal_dir = try alloc.print("{s}/wal", .{path});
+                defer alloc.free(wal_dir);
+                try dir.createDirPath(io, wal_dir);
+                const seg_dir = try alloc.print("{s}/seg", .{path});
+                defer alloc.free(seg_dir);
+                try dir.createDirPath(io, seg_dir);
+            }
         }
 
         if (segmod.timing_enabled) {
@@ -3373,7 +3477,70 @@ test "get 按段范围定位：不重叠时二分只碰一个段，出现重叠�
     }
 }
 
-test "归档丢失保护：有段数据但没有 index.bin 时拒开，不能当成空表（否则下一次 flush 会覆盖 000001.data）" {
+test "归档自愈：index.bin 丢失但 .data 还在时从数据段重建，数据一条不丢" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-rebuild-archive";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    // 三段，键范围不重叠（每段一条记录）
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        defer t.deinit();
+        try t.put("a1", "v1");
+        try t.flush();
+        try t.put("b2", "v2");
+        try t.flush();
+        try t.put("c3", "v3");
+        try t.flush();
+        try std.testing.expectEqual(@as(usize, 3), t.segs.items.len);
+    }
+    // 模拟「归档丢失」：只删 index.bin，段数据还在
+    try dir.deleteFile(io, tmp ++ "/seg/index.bin");
+
+    // 期待：**不再拒开**，而是从 .data 重建出稀疏索引 + Bloom + 段头统计
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        defer t.deinit();
+        try std.testing.expectEqual(@as(usize, 3), t.segs.items.len);
+        var vbuf: std.ArrayList(u8) = .empty;
+        defer vbuf.deinit(alloc);
+        try std.testing.expectEqualStrings("v1", (try t.get("a1", &vbuf)) orelse unreachable);
+        try std.testing.expectEqualStrings("v2", (try t.get("b2", &vbuf)) orelse unreachable);
+        try std.testing.expectEqualStrings("v3", (try t.get("c3", &vbuf)) orelse unreachable);
+        try std.testing.expect((try t.get("zz", &vbuf)) == null);
+        // 重建后的段号必须接在 max_id 之后，不能从 1 重新开始覆盖 000001.data
+        try t.put("d4", "v4");
+        try t.flush();
+    }
+    // 重建的归档本身要能被下一次 open 正常读回（不是「只有本进程能用」）
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        defer t.deinit();
+        try std.testing.expectEqual(@as(usize, 4), t.segs.items.len);
+        var vbuf: std.ArrayList(u8) = .empty;
+        defer vbuf.deinit(alloc);
+        try std.testing.expectEqualStrings("v1", (try t.get("a1", &vbuf)) orelse unreachable);
+        try std.testing.expectEqualStrings("v3", (try t.get("c3", &vbuf)) orelse unreachable);
+        try std.testing.expectEqualStrings("v4", (try t.get("d4", &vbuf)) orelse unreachable);
+    }
+    // 段数据文件必须原样还在（自愈只写 index.bin，不碰 .data）
+    var d = try dir.openDir(io, tmp ++ "/seg", .{ .iterate = true });
+    defer d.close(io);
+    var n_data: usize = 0;
+    var it = d.iterate();
+    while (try it.next(io)) |e| {
+        if (std.mem.endsWith(u8, e.name, ".data")) n_data += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), n_data);
+}
+
+test "归档自愈失败仍拒开：段数据本身读不出来时报 ArchiveMissingButSegmentsExist（不许当空表）" {
     const alloc = std.testing.allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
     defer threaded.deinit();
@@ -3390,24 +3557,19 @@ test "归档丢失保护：有段数据但没有 index.bin 时拒开，不能当
         try t.put("k1", "v1");
         try t.flush(); // 产生 seg/000001.data + seg/index.bin
     }
-    // 模拟「归档丢失」：只删 index.bin，段数据还在
-    const idx_path = tmp ++ "/seg/index.bin";
-    try dir.deleteFile(io, idx_path);
+    // 归档丢失 **且** 数据段被破坏（截断成 4 字节）⇒ 重建不出可信索引，必须拒开
+    try dir.deleteFile(io, tmp ++ "/seg/index.bin");
+    {
+        const p = tmp ++ "/seg/000001.data";
+        const w = try dir.createFile(io, p, .{ .truncate = true });
+        try w.writePositionalAll(io, "XXXX", 0);
+        w.close(io);
+    }
 
-    // 以前这里会开出一个空表，然后 flush 时 id=1 覆盖 000001.data —— 静默丢数据
     try std.testing.expectError(
         error.ArchiveMissingButSegmentsExist,
         Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 }),
     );
-    // 段数据文件必须原样还在（我们什么都没删）
-    var d = try dir.openDir(io, tmp ++ "/seg", .{ .iterate = true });
-    defer d.close(io);
-    var found = false;
-    var it = d.iterate();
-    while (try it.next(io)) |e| {
-        if (std.mem.eql(u8, e.name, "000001.data")) found = true;
-    }
-    try std.testing.expect(found);
 }
 
 test "空表重开不能被误判成「归档丢失」：没有 .data 时照常当新库打开" {
