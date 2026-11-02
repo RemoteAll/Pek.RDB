@@ -93,8 +93,10 @@ pub const Options = struct {
     /// 这是「单次写停顿」的直接乘数：实测单轮 tier 合并 p-max ≈ 45 ms（50 万行）/
     /// 96 ms（200 万行），写成 `4` 就意味着最坏一次写要独占 **4×** 那么久
     /// （见 `docs/实测数据/合并阻塞-2026-11-03-run{1..3}.csv`）。
-    /// 取 `1`：每次写最多被一次合并挡住，段数由**后续每次写**各自推进一轮来收敛
-    /// （收敛慢一点，但 write 的 tail latency 不被放大）。
+    /// 取 `1`：每次写最多被一次合并挡住，段数由**后续每次写**各自推进一轮来收敛。
+    /// **如实记代价**：若段数一次性暴增（批量导入 100 段后就不再写），段数会停在
+    /// `compact_max_segs` 之上不动 —— 此时需要显式调 `compactTier()` 收敛，
+    /// 或者接受「写停后点查按较高段数工作」。用 tail latency 换这个，是刻意的取舍。
     ///
     /// 注意它只限制「一次写里连做几轮」，**不改变**单轮本身的耗时 ——
     /// 真正的「后台合并不阻塞写」需要线程，见 `docs/架构设计.md` 的说明。
@@ -268,6 +270,20 @@ fn hasSegmentDataFiles(io: std.Io, dir: std.Io.Dir, alloc: std.mem.Allocator, ta
     return false;
 }
 
+/// 判断 `RecIter` 是否**真的读到了末尾**（而不是「解码失败提前收工」）。
+///
+/// **这是归档自愈正确性的关键一环**：`codec.RecIter.next` 在三种情况下都返回 `null` ——
+/// ① 正常读完；② 数据损坏（`readRec` 返回 null、块前缀比基准 key 还长）；
+/// ③ `kbuf.resize` 分配失败。后两种以前被当成「正常结束」，于是**截断在第 100 行的段
+/// 会被重建成只含 99 行的段**，而且一声不响 —— 正是本项目最不允许的「静默丢数据」。
+///
+/// 判据只能用 `pos`，**不能用 `blk_left`**：块头里没有「本块实际行数」，最后一块
+/// 天生就是不满的（`blk_left = stride − N ≠ 0`），拿它判会把自己骗成「损坏」。
+/// `readRec` 失败时不前移 `pos`，因此「`pos` 没走到文件末尾」就等价于「有字节没解出来」。
+fn expectIterEnd(rit: *const codec.RecIter, bytes: []const u8) !void {
+    if (rit.pos < bytes.len) return error.SegmentCorrupt;
+}
+
 /// 归档（`seg/index.bin`）丢失但 `seg/*.data` 还在 ⇒ 从数据文件重建归档。
 ///
 /// **为什么允许重建**：`.data` 是自描述的（块头带前缀长度、每条带 klen/vlen/seq/flags），
@@ -306,59 +322,89 @@ fn rebuildArchive(
     }
     if (ids.items.len == 0) return error.ArchiveMissingButSegmentsExist;
     std.mem.sort(u32, ids.items, {}, std.sort.asc(u32));
-
-    const tmp_path = try alloc.print("{s}/.rebuild.tmp", .{seg_dir_path});
-    defer alloc.free(tmp_path);
-    defer dir.deleteFile(io, tmp_path) catch {};
-
-    var records: std.ArrayList(segmod.ArchiveRecord) = .empty;
-    defer {
-        for (records.items) |r| alloc.free(r.payload);
-        records.deinit(alloc);
+    // 同一段号只保留一份（`1.data` 与 `000001.data` 同时存在时 parseInt 会得到同一个 id）：
+    // 归档里两条同 id record 虽然由 `openSegmentsFromArchive` 负责「后者胜」，
+    // 但那是兜底；重建时就应当只产出一条，否则归档凭空变大。
+    {
+        var w: usize = 0;
+        for (ids.items) |v| {
+            if (w == 0 or ids.items[w - 1] != v) {
+                ids.items[w] = v;
+                w += 1;
+            }
+        }
+        ids.shrinkRetainingCapacity(w);
     }
 
+    // 两个临时文件必须**不同名**：数据段的 `Writer` 会 truncate 自己的输出路径，
+    // 而归档的 `ArchiveWriter` 在整个循环期间都开着它 —— 同名就会把已经写好的
+    // magic 与 records 清掉。
+    const seg_tmp = try alloc.print("{s}/.rebuild-seg.tmp", .{seg_dir_path});
+    defer alloc.free(seg_tmp);
+    defer dir.deleteFile(io, seg_tmp) catch {};
+    const arc_tmp = try alloc.print("{s}/.rebuild-archive.tmp", .{seg_dir_path});
+    defer alloc.free(arc_tmp);
+
+    const archive_path = try alloc.print("{s}/seg/index.bin", .{base_path});
+    defer alloc.free(archive_path);
+
+    // **流式写**归档：内存峰值只保留「当前那一段」的索引字节。
+    // 一次性收齐 records 在段数多时会爆（1 亿行约 4883 段 / 156 MB 索引，再往上就是 GB 级），
+    // 而归档自愈恰恰是「本来就出事了」的路径，不能在这一步再要一份全量内存。
+    var aw = try segmod.ArchiveWriter.create(io, dir, arc_tmp, archive_path);
+    defer aw.deinit(); // 失败即删临时文件；成功（finish）后是 no-op
+    var n_segs: usize = 0;
     for (ids.items) |id| {
         const data_path = try alloc.print("{s}/seg/{d:0>6}.data", .{ base_path, id });
         defer alloc.free(data_path);
 
-        // Bloom 位图按「文件大小 / 16」估一个上界：估大只是位图偏大（误报更低），
-        // 估小也只是误报率高，**都不影响正确性**（见 `Writer.create` 的说明）。
-        const file_size: u64 = blk: {
-            const f = dir.openFile(io, data_path, .{}) catch |e| switch (e) {
-                error.FileNotFound => continue, // 枚举后被删了：跳过这一段
-                else => return e,
-            };
-            defer f.close(io);
-            break :blk (try f.stat(io)).size;
+        // 0 字节 `.data` = 崩溃残留（`flushImpl` 就是这以后再覆盖同一路径），跳过即可。
+        // 这就是为什么用 `mapWholeFile` 而不是 `openFile`+`stat`：它顺带把
+        // 「空文件」变成 `FileNotFound`，不依赖 caller 自己判 size。
+        const m = segmod.mapWholeFile(io, dir, data_path, 0, 0) catch |e| switch (e) {
+            error.FileNotFound => continue, // 枚举后被删了 / 0 字节残留
+            else => return e,
         };
-        const est_rows: usize = @as(usize, @intCast(file_size / 16)) + 1;
+        var m_mut = m;
+        defer m_mut.destroy();
+        const bytes = m.bytes();
 
-        var w = try segmod.Writer.create(io, dir, tmp_path, alloc, bloom_bits, est_rows);
-        defer w.deinit();
+        // **第一遍只数行数**：Bloom 位图大小必须按**真实行数**定 ——
+        // 位图大小写进索引头且不可变，估大会让自愈后的索引**永久膨胀**
+        // （按 `size/16` 估实测约为真实行数的 2.5 倍，而 Bloom 占索引体积 80%）。
         var n_rows: usize = 0;
         {
-            const m = try segmod.mapWholeFile(io, dir, data_path, 0, 0);
-            var m_mut = m;
-            defer m_mut.destroy();
-            var rit = try codec.RecIter.init(alloc, m.bytes(), segmod.INDEX_STRIDE, 0);
+            var rit = try codec.RecIter.init(alloc, bytes, segmod.INDEX_STRIDE, 0);
             defer rit.deinit(alloc);
+            while (rit.next(alloc)) |_| n_rows += 1;
+            try expectIterEnd(&rit, bytes);
+        }
+
+        // **第二遍真正写出**（同一份 mmap，不重新建映射）。
+        var w = try segmod.Writer.create(io, dir, seg_tmp, alloc, bloom_bits, n_rows);
+        defer w.deinit();
+        {
+            var rit = try codec.RecIter.init(alloc, bytes, segmod.INDEX_STRIDE, 0);
+            defer rit.deinit(alloc);
+            var written: usize = 0;
             while (rit.next(alloc)) |rec| {
-                n_rows += 1;
+                written += 1;
                 try w.push(rec.key, rec.seq, rec.flags, rec.value);
             }
+            try expectIterEnd(&rit, bytes);
+            // 两遍结果必须一致（同一份映射、同一解码器，理论上不可能不同；
+            // 不同就说明有人在中间改了文件，宁可拒绝也不能写出半段）
+            if (written != n_rows) return error.SegmentCorrupt;
         }
-        // `.data` 非空却解不出任何记录 ⇒ 块头/记录长度已被破坏（截断、扇区损坏）。
-        // 绝不能当空段写进归档：那等于「静默丢数据」，比拒开危险得多。
-        if (n_rows == 0 and file_size > 0) return error.SegmentCorrupt;
         const fin = try w.finishBytes();
-        errdefer alloc.free(fin.bytes);
-        try records.append(alloc, .{ .id = id, .payload = fin.bytes });
+        // 写完立刻交给归档、立刻释放：不要攒在数组里（那正是要避免的全量内存）
+        defer alloc.free(fin.bytes);
+        try aw.add(id, fin.bytes);
+        n_segs += 1;
     }
-
-    const archive_path = try alloc.print("{s}/seg/index.bin", .{base_path});
-    defer alloc.free(archive_path);
-    _ = try segmod.archiveRewrite(io, dir, archive_path, records.items, alloc);
-    return ids.items.len;
+    if (n_segs == 0) return error.ArchiveMissingButSegmentsExist;
+    _ = try aw.finish();
+    return n_segs;
 }
 
 fn openSegmentsFromArchive(
@@ -513,6 +559,9 @@ pub const Table = struct {
     /// 合并（`compact` / `compactTier`）累计纳秒，**含内部先落盘的 flushImpl**。
     /// 这是判定「要不要把合并挪到后台线程」的唯一依据：它量的是**单次写路径被独占多久**，
     /// 拿总吞吐或写放大都推不出来（写放大与阻塞无关）。
+    ///
+    /// 口径注意：早退（`did == false`，只是几次比较）也计在这里，但**不计入**
+    /// `compact_calls` —— 所以 `ns_compact / compact_calls` 会略偏大（早退代价是 ns 级）。
     ns_compact: u64 = 0,
     /// 单次合并最长耗时（纳秒）。
     ns_compact_max: u64 = 0,
@@ -584,8 +633,12 @@ pub const Table = struct {
             // 只有重建也失败（数据文件本身读不出来）才拒开 —— 拒开仍然是正确的兜底，
             // 因为「打不开」比「看起来是空表」安全得多。
             if (try hasSegmentDataFiles(io, dir, alloc, path)) {
-                _ = rebuildArchive(io, dir, path, alloc, opts.bloom_bits) catch
-                    return error.ArchiveMissingButSegmentsExist;
+                // **错误不向下吞**：以前这里把重建的**任何**错误都换成
+                // `ArchiveMissingButSegmentsExist`，于是「段文件被截断」和
+                // 「段文件不存在」用同一个词报告，运维看不出该修哪一个。
+                // 现在只有「确实没有 .data」才是那个错误（由 `rebuildArchive` 自己返回），
+                // 损坏一律原样抛 `SegmentCorrupt` / IO 错误。
+                _ = try rebuildArchive(io, dir, path, alloc, opts.bloom_bits);
                 idx_map = try segmod.mapWholeFile(io, dir, index_path, opts.index_max_bytes, opts.index_prefault_max_bytes);
                 arch = idx_map.?.bytes();
                 try segmod.archiveCheckMagic(arch);
@@ -3630,7 +3683,7 @@ test "归档自愈：index.bin 丢失但 .data 还在时从数据段重建，数
     try std.testing.expectEqual(@as(usize, 4), n_data);
 }
 
-test "归档自愈失败仍拒开：段数据本身读不出来时报 ArchiveMissingButSegmentsExist（不许当空表）" {
+test "归档自愈失败仍拒开：段数据被破坏时报 SegmentCorrupt（不许当空表、也不许当 ArchiveMissing）" {
     const alloc = std.testing.allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
     defer threaded.deinit();
@@ -3647,7 +3700,9 @@ test "归档自愈失败仍拒开：段数据本身读不出来时报 ArchiveMis
         try t.put("k1", "v1");
         try t.flush(); // 产生 seg/000001.data + seg/index.bin
     }
-    // 归档丢失 **且** 数据段被破坏（截断成 4 字节）⇒ 重建不出可信索引，必须拒开
+    // 归档丢失 **且** 数据段被破坏（截断成 4 字节）⇒ 重建不出可信索引，必须拒开。
+    // 错误必须是 `SegmentCorrupt` 而不是 `ArchiveMissingButSegmentsExist`：
+    // 后者会让运维去查「归档怎么没了」，实际坏的是数据段。
     try dir.deleteFile(io, tmp ++ "/seg/index.bin");
     {
         const p = tmp ++ "/seg/000001.data";
@@ -3657,9 +3712,117 @@ test "归档自愈失败仍拒开：段数据本身读不出来时报 ArchiveMis
     }
 
     try std.testing.expectError(
-        error.ArchiveMissingButSegmentsExist,
+        error.SegmentCorrupt,
         Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 }),
     );
+}
+
+/// 把整个文件读成堆内存（测试用）。
+fn readAllBytes(dir: std.Io.Dir, io: std.Io, path: []const u8, alloc: std.mem.Allocator) ![]u8 {
+    const f = try dir.openFile(io, path, .{});
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    const buf = try alloc.alloc(u8, @intCast(size));
+    errdefer alloc.free(buf);
+    const n = try f.readPositionalAll(io, buf, 0);
+    return buf[0..n];
+}
+
+test "归档自愈：段内**部分**损坏时必须报错，不许只重建前半段（静默丢数据）" {
+    // 上一版只挡了「一条都解不出」，而 `RecIter.next` 在**损坏**时也返回 null
+    // （不是报错）—— 截断在第 100 行就会被静默读成「只有 99 行」。
+    // 这里把最后 10 字节切掉，前几条记录完好，必须仍然报错。
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-heal-partial-corrupt";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    const data_path = tmp ++ "/seg/000001.data";
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        defer t.deinit();
+        for (0..5) |i| {
+            var kb: [8]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kb, "k{d}", .{i});
+            try t.put(k, "value-value-value");
+        }
+        try t.flush(); // 5 条都落在同一段、同一个块里
+        try std.testing.expectEqual(@as(usize, 1), t.segs.items.len);
+    }
+    const orig = try readAllBytes(dir, io, data_path, alloc);
+    defer alloc.free(orig);
+    try std.testing.expect(orig.len > 20);
+
+    try dir.deleteFile(io, tmp ++ "/seg/index.bin");
+    {
+        const f = try dir.createFile(io, data_path, .{ .truncate = true });
+        try f.writePositionalAll(io, orig[0 .. orig.len - 10], 0);
+        f.close(io);
+    }
+
+    try std.testing.expectError(
+        error.SegmentCorrupt,
+        Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 }),
+    );
+}
+
+test "归档自愈产物与正常 flush 的 index.bin 逐字节相同（Bloom 大小必须按真实行数）" {
+    // 不只验「能打开」：若 bloom 位图按错误的上界估，文件会白白变大且开不回来 ——
+    // 那份膨胀是**永久**的（位图大小写进索引头）。字节相等是最强的同构证明。
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-heal-byte-equal";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    const idx_path = tmp ++ "/seg/index.bin";
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        defer t.deinit();
+        for (0..3) |i| {
+            var kb: [8]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kb, "a{d}", .{i});
+            try t.put(k, "v");
+        }
+        try t.flush();
+        for (0..4) |i| {
+            var kb: [8]u8 = undefined;
+            const k = try std.fmt.bufPrint(&kb, "b{d}", .{i});
+            try t.put(k, "vv");
+        }
+        try t.flush();
+        try std.testing.expectEqual(@as(usize, 2), t.segs.items.len);
+    }
+
+    const before = try readAllBytes(dir, io, idx_path, alloc);
+    defer alloc.free(before);
+
+    try dir.deleteFile(io, idx_path);
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        defer t.deinit();
+        try std.testing.expectEqual(@as(usize, 2), t.segs.items.len);
+    }
+
+    const after = try readAllBytes(dir, io, idx_path, alloc);
+    defer alloc.free(after);
+
+    try std.testing.expectEqual(before.len, after.len);
+    if (!std.mem.eql(u8, before, after)) {
+        var i: usize = 0;
+        while (i < before.len and before[i] == after[i]) : (i += 1) {}
+        std.debug.print("归档自愈产物与正常 flush 不同：首个差异在偏移 {d}（len {d} vs {d}）\n", .{ i, before.len, after.len });
+        return error.ArchiveNotReproducible;
+    }
 }
 
 test "空表重开不能被误判成「归档丢失」：没有 .data 时照常当新库打开" {

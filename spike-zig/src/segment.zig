@@ -525,23 +525,66 @@ fn writeRecord(f: std.Io.File, io: std.Io, at: u64, id: u32, payload: []const u8
     return at + 16 + payload.len;
 }
 
+/// **流式**建归档：写临时文件 → 逐段追加 → sync → 原子 rename。
+///
+/// 为什么需要它：`archiveRewrite` 要求一次性给齐 `[]const ArchiveRecord`，
+/// 归档自愈（`Table.rebuildArchive`）于是要先把全库每段的索引字节都握在手里 ——
+/// 段数越多越糟糕（1 亿行约 4883 段、156 MB 索引；再往上就是 GB 级）。
+/// 流式之后峰值只是**当前那一段**的索引字节。
+///
+/// 写盘次序与 `archiveRewrite` 逐字节相同（`archiveRewrite` 现在就是调它实现的）。
+pub const ArchiveWriter = struct {
+    io: std.Io,
+    dir: std.Io.Dir,
+    f: std.Io.File,
+    /// 两者都是**借用**切片，调用方必须活得比本对象长
+    tmp_path: []const u8,
+    final_path: []const u8,
+    at: u64 = ARCHIVE_MAGIC.len,
+    finished: bool = false,
+
+    pub fn create(io: std.Io, dir: std.Io.Dir, tmp_path: []const u8, final_path: []const u8) !ArchiveWriter {
+        const f = try dir.createFile(io, tmp_path, .{ .read = true, .truncate = true });
+        errdefer f.close(io);
+        try f.writePositionalAll(io, ARCHIVE_MAGIC, 0);
+        return .{ .io = io, .dir = dir, .f = f, .tmp_path = tmp_path, .final_path = final_path };
+    }
+
+    pub fn add(self: *ArchiveWriter, id: u32, payload: []const u8) !void {
+        self.at = try writeRecord(self.f, self.io, self.at, id, payload);
+    }
+
+    /// 成功即完成改名。调用后不可再用本对象（`deinit` 会变成 no-op）。
+    pub fn finish(self: *ArchiveWriter) !u64 {
+        try self.f.sync(self.io);
+        self.f.close(self.io);
+        try self.dir.rename(self.tmp_path, self.dir, self.final_path, self.io);
+        self.finished = true;
+        return self.at;
+    }
+
+    /// 失败路径：关文件 + 删临时文件（不碰目标归档）。
+    pub fn deinit(self: *ArchiveWriter) void {
+        if (self.finished) return;
+        self.f.close(self.io);
+        self.dir.deleteFile(self.io, self.tmp_path) catch {};
+        self.finished = true;
+    }
+};
+
 /// 重写整个归档（compaction 用）：写临时文件 → 原子 rename 覆盖目标。
 /// 这样「重写归档途中断电」不会留下半个文件导致整个库打不开。
 /// 返回新的有效末尾。
+///
+/// 会给齐全部 records 的调用方用它；宁可分批的（归档自愈）直接用 `ArchiveWriter`。
 pub fn archiveRewrite(io: std.Io, dir: std.Io.Dir, path: []const u8, records: []const ArchiveRecord, alloc: std.mem.Allocator) !u64 {
     const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
     defer alloc.free(tmp_path);
 
-    var at: u64 = 8;
-    {
-        const f = try dir.createFile(io, tmp_path, .{ .read = true, .truncate = true });
-        defer f.close(io);
-        try f.writePositionalAll(io, ARCHIVE_MAGIC, 0);
-        for (records) |r| at = try writeRecord(f, io, at, r.id, r.payload);
-        try f.sync(io);
-    }
-    try dir.rename(tmp_path, dir, path, io);
-    return at;
+    var w = try ArchiveWriter.create(io, dir, tmp_path, path);
+    defer w.deinit();
+    for (records) |r| try w.add(r.id, r.payload);
+    return try w.finish();
 }
 
 /// 追加一段索引，从 `at` 处开始写（会覆盖该位置之后的残片），返回新的有效末尾。
@@ -1189,6 +1232,53 @@ pub const RefCursor = struct {
         return null;
     }
 };
+
+test "ArchiveWriter 流式写入与 archiveRewrite 一次性写入逐字节相同" {
+    // 归档自愈走的是流式路径（`ArchiveWriter`），compaction 走的是批量路径
+    // （`archiveRewrite` → 内部调 `ArchiveWriter`）。两者必须产出完全一样的文件，
+    // 否则「自愈出来的归档」与「正常写出的归档」会有细微差异，将来一改格式就分叉。
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-seg-archive-writer";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+    try dir.createDirPath(io, tmp);
+
+    const payloads = [_][]const u8{ "aaa", "bbbb", "", "cc" };
+    const p_batch = tmp ++ "/batch.bin";
+    const p_stream = tmp ++ "/stream.bin";
+
+    var recs: [payloads.len]ArchiveRecord = undefined;
+    for (payloads, 0..) |p, i| recs[i] = .{ .id = @intCast(i + 1), .payload = p };
+    _ = try archiveRewrite(io, dir, p_batch, &recs, alloc);
+
+    {
+        const stream_tmp = tmp ++ "/stream.tmp";
+        var w = try ArchiveWriter.create(io, dir, stream_tmp, p_stream);
+        defer w.deinit();
+        for (payloads, 0..) |p, i| try w.add(@intCast(i + 1), p);
+        _ = try w.finish();
+    }
+
+    var m1 = try mapWholeFile(io, dir, p_batch, 0, 0);
+    defer m1.destroy();
+    var m2 = try mapWholeFile(io, dir, p_stream, 0, 0);
+    defer m2.destroy();
+    try std.testing.expectEqualSlices(u8, m1.bytes(), m2.bytes());
+
+    // 顺带确认读回顺序/内容与写入一致（含空 payload 这种边界）
+    var it = ArchiveIter{ .buf = m2.bytes() };
+    var i: usize = 0;
+    while (it.next()) |r| : (i += 1) {
+        try std.testing.expectEqual(@as(u32, @intCast(i + 1)), r.id);
+        try std.testing.expectEqualStrings(payloads[i], r.payload);
+    }
+    try std.testing.expectEqual(payloads.len, i);
+}
 
 test "segment idx 被翻位后必须报错（不静默返回错误结果）" {
     const alloc = std.testing.allocator;
