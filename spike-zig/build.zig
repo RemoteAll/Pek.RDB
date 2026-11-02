@@ -76,9 +76,12 @@ pub fn build(b: *std.Build) void {
     //   zig build run-scale -Doptimize=ReleaseFast -Dscale-rows=100000000 -Dscale-dir=scale-1e8
     const scale_rows = b.option(u64, "scale-rows", "run-scale: rows to insert") orelse 2_000_000;
     const scale_dir = b.option([]const u8, "scale-dir", "run-scale: data directory") orelse "scale-data";
+    // 段数单变量实验用：同样行数、只改 flush_bytes 造出不同段数。
+    const scale_flush = b.option(u64, "scale-flush-bytes", "run-scale: flush_bytes (smaller = more segments)") orelse (64 << 20);
     const scale_opts = b.addOptions();
     scale_opts.addOption(u64, "rows", scale_rows);
     scale_opts.addOption([]const u8, "dir", scale_dir);
+    scale_opts.addOption(u64, "flush_bytes", scale_flush);
     const scale_exe = b.addExecutable(.{
         .name = "spike-scale",
         .root_module = b.createModule(.{

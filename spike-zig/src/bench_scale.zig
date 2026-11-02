@@ -62,7 +62,10 @@ pub fn main() !void {
     for (valbuf) |*v| @memset(v, 'x');
     for (0..1024) |i| vals[i] = &valbuf[i];
 
-    var t = try tablemod.Table.open(io, dir, root, alloc, .{ .wal_sync_every = 0 });
+    var t = try tablemod.Table.open(io, dir, root, alloc, .{
+        .wal_sync_every = 0,
+        .flush_bytes = @intCast(build_options.flush_bytes),
+    });
     var t_live = true;
     defer if (t_live) t.deinit();
 
@@ -146,7 +149,6 @@ pub fn main() !void {
             if (try t.get(&kb, &vbuf)) |_| hits2 += 1;
         }
         putLine("scale_get_hit_warm,{d},{d:.0}", .{ hits2, perSec(probes, nowNs(io) - t2) });
-
         var found_but_should_not: u64 = 0;
         const t1 = nowNs(io);
         i = 0;
