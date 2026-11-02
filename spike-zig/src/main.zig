@@ -658,83 +658,10 @@ fn benchMain() !void {
             std.debug.print("sql_orderby_limit500_breakdown_decode,{d},{d}\n", .{ tm2.calls, tm2.decode / calls2 });
             std.debug.print("sql_orderby_limit500_breakdown_sort,{d},{d}\n", .{ tm2.calls, tm2.sort / calls2 });
         }
-        // **微探针 2**：复刻 `topKDesc` 快路径的循环体（倒扫 + keyCmp + 分组），但不 append，
-        // 用来判定「剩下的钱是花在 keyCmp/分组上，还是花在 out.append 的分配上」。
-        {
-            const reps: usize = 200;
-            inline for (.{ 10, 500 }) |steps| {
-                var prev_key: []const u8 = &.{};
-                var have = false;
-                var groups: usize = 0;
-                var sink: usize = 0;
-                const t1 = nowNs(io);
-                var r: usize = 0;
-                while (r < reps) : (r += 1) {
-                    var it2 = t4.mem.revIterator();
-                    var c2: usize = 0;
-                    have = false;
-                    while (it2.next()) |e| {
-                        if (have and spike.segment.keyCmp(e.key, prev_key) != .eq) {
-                            groups += 1;
-                            sink +%= e.value.len;
-                        }
-                        prev_key = e.key;
-                        have = true;
-                        c2 += 1;
-                        if (c2 >= steps) break;
-                    }
-                }
-                const ns1 = nowNs(io) - t1;
-                std.debug.print("probe_mem_revgroup{d},{d},{d}\n", .{ steps, reps, ns1 / reps });
-                // (c) 再加上 `out.append` —— 用来确认「剩下的成本是不是 append 本身」
-                var out2: std.ArrayList([]const u8) = .empty;
-                defer out2.deinit(alloc);
-                const t2 = nowNs(io);
-                r = 0;
-                while (r < reps) : (r += 1) {
-                    out2.clearRetainingCapacity();
-                    try out2.ensureTotalCapacity(alloc, steps);
-                    var it3 = t4.mem.revIterator();
-                    var c3: usize = 0;
-                    var prev3: []const u8 = &.{};
-                    var have3 = false;
-                    var best3: []const u8 = &.{};
-                    while (it3.next()) |e| {
-                        if (have3 and spike.segment.keyCmp(e.key, prev3) != .eq) {
-                            try out2.append(alloc, best3);
-                            if (out2.items.len >= steps) break;
-                        }
-                        prev3 = e.key;
-                        best3 = e.value;
-                        have3 = true;
-                        c3 += 1;
-                    }
-                }
-                const ns2 = nowNs(io) - t2;
-                std.debug.print("probe_mem_revpush{d},{d},{d}\n", .{ steps, reps, ns2 / reps });
-                if (groups == 0 and sink == 12345) std.debug.print("nohit,0,0\n", .{});
-            }
-        }
-        {
-            const reps: usize = 200;
-            inline for (.{ 10, 500 }) |steps| {
-                var acc: usize = 0;
-                const t0 = nowNs(io);
-                var r: usize = 0;
-                while (r < reps) : (r += 1) {
-                    var it = t4.mem.revIterator();
-                    var c: usize = 0;
-                    while (it.next()) |e| {
-                        acc +%= e.key.len +% e.value.len;
-                        c += 1;
-                        if (c >= steps) break;
-                    }
-                }
-                const ns = nowNs(io) - t0;
-                std.debug.print("probe_mem_rev{d},{d},{d}\n", .{ steps, reps, ns / reps });
-                if (acc == std.math.maxInt(usize)) std.debug.print("nohit,0,0\n", .{});
-            }
-        }
+        // 上一轮的三个临时微探针（`probe_mem_rev*` / `*_revgroup*` / `*_revpush*`）已删除：
+        // 它们的作用是判定「k=500 的 155 µs 花在哪」，结论（`sizeBytes()` ≈122 B/行 ⇒ 一次
+        // `flush_bytes` 就落段 ⇒ 走多来源路径全量排序 628 条候选）已写进 `docs/决策记录.md` §九十六，
+        // 留在基准里每次都要额外跑 1200 次倒扫，纯属噪声。
         // 投影扫描：同一张表、同样全表范围，只取 1 列（`SELECT id`）。
         //
         // 为什么单独一档：SQLite 的 `OP_Column` 是惰性的（不调 `sqlite3_column_*` 就
@@ -803,8 +730,11 @@ fn benchMain() !void {
             dir.deleteTree(io, path5) catch {};
             const cols5 = [_]spike.schema.Column{
                 .{ .name = "id", .col_type = .integer, .primary_key = true },
-                .{ .name = "g", .col_type = .integer },
-                .{ .name = "x", .col_type = .integer },
+                // `g` 声明 NOT NULL：`ORDER BY g` 走索引的前提（NULL 不入索引，
+                // 可空列会把 NULL 行漏掉，所以 `selectRowsHost` 只对 NOT NULL 列启用）。
+                // 数据里本来就没有 NULL，磁盘格式与历史轮次一致。
+                .{ .name = "g", .col_type = .integer, .not_null = true },
+                .{ .name = "x", .col_type = .integer, .not_null = true },
             };
             var s5 = try spike.schema.Schema.init(alloc, "bench_agg", &cols5);
             defer s5.deinit(alloc);
@@ -1027,6 +957,44 @@ fn benchMain() !void {
                     std.debug.print("sql_index_eq_digest,{d},{d}\n", .{ total_rows, digest });
                     // 确定性指标：走索引时**主表一行都不扫**（不靠计时推断）
                     std.debug.print("sql_index_eq_readrows,{d},0\n", .{t5.scan_rows_read});
+                }
+
+                // `ORDER BY g ASC LIMIT 10`：索引顺序就是 `g` 的顺序 ⇒ 读 10 条索引项 + 10 次回表。
+                //
+                // 与 SQLite 同口径：投影里有**非索引列** `x`，两侧都必须回表；
+                // 200 次取中位（同 `sql_orderby_limit10` 的口径，单次采样是 µs 级噪声区）。
+                {
+                    const reps: usize = 200;
+                    var items_ob = [_]spike.sql.SelectItem{ .{ .column = "x" }, .{ .column = "g" } };
+                    var ord_ob = [_]spike.sql.OrderItem{.{ .column = "g", .desc = false }};
+                    const sel_ob = spike.sql.Select{
+                        .items = &items_ob,
+                        .table = "bench_agg",
+                        .order_by = &ord_ob,
+                        .limit = 10,
+                    };
+                    t5.scan_rows_read = 0; // 循环前清零：这是确定性指标，不能累加前面的读行数
+                    var samples = try alloc.alloc(u64, reps);
+                    defer alloc.free(samples);
+                    var got_rows: usize = 0;
+                    var digest: i64 = 0;
+                    var r: usize = 0;
+                    while (r < reps) : (r += 1) {
+                        const t0 = nowNs(io);
+                        var rows_ob = try spike.exec.selectRowsHost(&t5, &s5, sel_ob, alloc, &host);
+                        samples[r] = nowNs(io) - t0;
+                        got_rows += rows_ob.rows.len;
+                        for (rows_ob.rows) |rr| digest +%= rr[0].integer *% 31 +% rr[1].integer;
+                        rows_ob.deinit();
+                    }
+                    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+                    const med = samples[reps / 2];
+                    const per = got_rows / reps;
+                    std.debug.print("sql_orderby_index10,{d},{d:.0}\n", .{ per, opsPerSec(@intCast(per), med) });
+                    std.debug.print("sql_orderby_index10_rows,{d},0\n", .{got_rows});
+                    std.debug.print("sql_orderby_index10_digest,{d},{d}\n", .{ got_rows, digest });
+                    std.debug.print("sql_orderby_index10_med_us,{d},{d:.1}\n", .{ reps, @as(f64, @floatFromInt(med)) / 1000.0 });
+                    std.debug.print("sql_orderby_index10_readrows,{d},0\n", .{t5.scan_rows_read});
                 }
             }
         }

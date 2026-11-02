@@ -616,7 +616,7 @@ fn main() -> rusqlite::Result<()> {
             let ca = Connection::open(agg_db)?;
             ca.pragma_update(None, "journal_mode", "WAL")?;
             ca.pragma_update(None, "synchronous", "NORMAL")?;
-            ca.execute_batch("CREATE TABLE agg(id INTEGER PRIMARY KEY, g INTEGER, x INTEGER)")?;
+            ca.execute_batch("CREATE TABLE agg(id INTEGER PRIMARY KEY, g INTEGER NOT NULL, x INTEGER NOT NULL)")?;
             {
                 // 鐏屾暟鎹笉璁℃椂锛堜笌 Zig 渚т竴鑷达細閭ｆ槸鍑嗗锛屼笉鏄娴嬭涓猴級
                 ca.execute_batch("BEGIN")?;
@@ -734,6 +734,40 @@ fn main() -> rusqlite::Result<()> {
                 println!("sql_index_eq,{},{}", total_rows, lookups as f64 / secs);
                 println!("sql_index_eq_rows,{},0", total_rows);
                 println!("sql_index_eq_digest,{},{}", total_rows, digest);
+
+                // ORDER BY <indexed col> ASC LIMIT 10：与 Zig 侧 `sql_orderby_index10` 同一条语句。
+                // 索引 `idx_g(g)` 直接给出 g 的顺序，投影里的 `x` 不是索引列 ⇒ 两侧都必须回表；
+                // 同样 200 次取中位，`prepare` 在计时外。
+                {
+                    let mut stmt = ca.prepare("SELECT x, g FROM agg ORDER BY g ASC LIMIT 10")?;
+                    const REPS: usize = 200;
+                    let mut samples: Vec<(f64, usize)> = Vec::with_capacity(REPS);
+                    let mut got_rows: usize = 0;
+                    let mut digest: i64 = 0;
+                    for _ in 0..REPS {
+                        let t0 = Instant::now();
+                        let mut n: usize = 0;
+                        let mut d: i64 = 0;
+                        {
+                            let mut rows = stmt.query([])?;
+                            while let Some(r) = rows.next()? {
+                                d = d
+                                    .wrapping_add(r.get::<_, i64>(0)?.wrapping_mul(31))
+                                    .wrapping_add(r.get::<_, i64>(1)?);
+                                n += 1;
+                            }
+                        }
+                        samples.push((t0.elapsed().as_secs_f64(), n));
+                        got_rows += n;
+                        digest = digest.wrapping_add(d);
+                    }
+                    samples.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    let (med, n) = samples[REPS / 2];
+                    println!("sql_orderby_index10,{},{}", n, n as f64 / med);
+                    println!("sql_orderby_index10_rows,{},0", got_rows);
+                    println!("sql_orderby_index10_digest,{},{}", got_rows, digest);
+                    println!("sql_orderby_index10_med_us,{},{:.1}", REPS, med * 1e6);
+                }
             }
         }
         drop(c3);

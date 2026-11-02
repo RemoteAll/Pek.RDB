@@ -313,7 +313,8 @@ pub const Schema = struct {
     }
 };
 
-/// 把「8 字节定长」的值分量写进 `dst`（数值型：integer/bigint/datetime/real/double）。
+/// 把「8 字节定长」的值分量写进 `dst`。**按 `Value` 的运行时类型分派**（`.integer` / `.real`），
+/// 与列类型无关 —— 列类型到「定长/变长」的映射在 `columnComponentIsFixed` 里。
 ///
 /// 返回 `false` 表示不是数值型，调用方走通用路径（text/blob 是变长 + 转义）。
 /// **存在的意义是消除重复实现**：`appendValueComponent` 与索引回填的快路径都用它，
@@ -332,6 +333,23 @@ pub fn writeFixedComponent(dst: *[8]u8, v: sql.Value) bool {
         },
         else => return false,
     }
+}
+
+/// 「该列的行值进索引键时，值分量是否一定是 8 字节定长」——
+/// **`writeFixedComponent` 的列级镜像，唯一用途是让"切主键"与"写值分量"同源**。
+///
+/// 为什么必须有：索引键不带类型 tag（`值分量 ++ 主键分量` 两段都自定界，靠内容区分）。
+/// 切主键时手上只有一个 key，没有 `Value`，只能按**列类型**推断值分量有多长。
+/// 这份推断一旦与实际编码脱节，`indexPkSlice` 就会从错误的位置切主键 ——
+/// 表现是「查出来的是别的行」或「一行都查不到」，而且**不报错**。
+///
+/// `boolean` 必须在定长一列：行编码里它只占 1 字节，但**值分量走的是 `.integer` 分支**
+/// （`appendValueComponent` 只看 `Value` 的运行时类型），仍是 8 字节。
+pub fn columnComponentIsFixed(col_type: sql.ColumnType) bool {
+    return switch (col_type) {
+        .integer, .bigint, .datetime, .real, .double, .boolean => true,
+        .text, .blob => false,
+    };
 }
 
 /// 单个值分量编码：**顺序保持 + 自定界**（数值 8 字节定长；text/blob 转义后以 `0x00 0x01` 收尾）。

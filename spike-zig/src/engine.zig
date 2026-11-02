@@ -873,6 +873,203 @@ fn keyArrLess(_: void, a: [16]u8, b: [16]u8) bool {
     return std.mem.order(u8, &a, &b) == .lt;
 }
 
+/// 跑一条查询并交回结果行（调用方 `deinit`）。
+fn queryRows(eng: *Engine, alloc: std.mem.Allocator, text: []const u8) !exec.Rows {
+    var p = try sql.parse(alloc, text);
+    defer p.deinit();
+    const res = try eng.execute(p.stmt, alloc);
+    return res.rows;
+}
+
+// `ORDER BY <已建索引的非主键列>` 走索引的守门用例。
+//
+// 对照组不能用「同一条 SQL 关掉索引」——所以表里放两列同值（`g` 有索引、`h` 没有）：
+// `ORDER BY g` 走索引（新路径），`ORDER BY h` 走全量扫描 + 排序（旧路径），
+// 两者必须**逐行一致**（含并列行：索引键是 `g ++ id`，所以同 g 按 id 升序，
+// 与全量路径的稳定排序结果相同）。
+test "ORDER BY 索引列：正序/降序 + LIMIT/OFFSET 走索引，结果与全量扫描逐行一致" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const root = "test-engine-order-idx";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    var eng = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    defer eng.deinit();
+
+    try run(&eng, alloc, "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER NOT NULL, h INTEGER NOT NULL)");
+
+    // 300 行，g 只有 23 个取值（大量并列）；h 与 g 同值但不建索引
+    var b: usize = 0;
+    while (b < 6) : (b += 1) {
+        var sb: std.ArrayList(u8) = .empty;
+        defer sb.deinit(alloc);
+        try sb.appendSlice(alloc, "INSERT INTO t (id, g, h) VALUES ");
+        for (0..50) |j| {
+            const i: i64 = @intCast(b * 50 + j);
+            const g: i64 = @intCast(@mod(i * 7, 23));
+            try sb.appendSlice(alloc, if (j == 0) "" else ", ");
+            var num: [64]u8 = undefined;
+            try sb.appendSlice(alloc, try std.fmt.bufPrint(&num, "({d}, {d}, {d})", .{ i, g, g }));
+        }
+        try run(&eng, alloc, sb.items);
+    }
+    try run(&eng, alloc, "CREATE INDEX idx_g ON t (g)");
+
+    // 每条用例：`[0]` 走索引列 `g`，`[1]` 走无索引的同值列 `h`（对照组，全量扫描 + 排序），
+    // `[2]` 标记该用例是否**必须**走索引（降序目前回退全量路径，见 exec.zig 的说明）。
+    const cases = [_]struct { by_idx: []const u8, full: []const u8, must_index: bool }{
+        .{ .by_idx = "SELECT id, g FROM t ORDER BY g ASC LIMIT 10", .full = "SELECT id, g FROM t ORDER BY h ASC LIMIT 10", .must_index = true },
+        .{ .by_idx = "SELECT id, g FROM t ORDER BY g LIMIT 10", .full = "SELECT id, g FROM t ORDER BY h LIMIT 10", .must_index = true },
+        .{ .by_idx = "SELECT id, g FROM t ORDER BY g ASC LIMIT 10 OFFSET 5", .full = "SELECT id, g FROM t ORDER BY h ASC LIMIT 10 OFFSET 5", .must_index = true },
+        .{ .by_idx = "SELECT id, g FROM t ORDER BY g ASC LIMIT 1", .full = "SELECT id, g FROM t ORDER BY h ASC LIMIT 1", .must_index = true },
+        .{ .by_idx = "SELECT id, g FROM t ORDER BY g ASC LIMIT 40 OFFSET 280", .full = "SELECT id, g FROM t ORDER BY h ASC LIMIT 40 OFFSET 280", .must_index = true },
+        // 降序 + 超过行数（取全表）：必须与对照组一致，但**不要求**走索引
+        .{ .by_idx = "SELECT id, g FROM t ORDER BY g DESC LIMIT 300", .full = "SELECT id, g FROM t ORDER BY h DESC LIMIT 300", .must_index = false },
+    };
+
+    for (cases, 0..) |c, ci| {
+        eng.get("t").?.table.scan_rows_read = 0;
+        var got = try queryRows(&eng, alloc, c.by_idx);
+        defer got.deinit();
+        const idx_scanned = eng.get("t").?.table.scan_rows_read;
+
+        var want = try queryRows(&eng, alloc, c.full);
+        defer want.deinit();
+
+        if (got.rows.len != want.rows.len) {
+            std.debug.print("case {d}: 行数 {d} != {d}\n", .{ ci, got.rows.len, want.rows.len });
+            return error.RowCountMismatch;
+        }
+        for (got.rows, want.rows, 0..) |gr, wr, ri| {
+            if (gr[0].integer != wr[0].integer or gr[1].integer != wr[1].integer) {
+                std.debug.print("case {d} 第 {d} 行: idx={any} full={any}\n", .{ ci, ri, gr, wr });
+                return error.ValueMismatch;
+            }
+        }
+        // 确定性证据：该走索引的用例下 `scan_rows_read` 必须为 0（不扫主表，只有回表）
+        if (c.must_index and idx_scanned != 0) {
+            std.debug.print("case {d}: 走索引却扫了主表 {d} 行\n", .{ ci, idx_scanned });
+            return error.IndexPathScannedTable;
+        }
+    }
+}
+
+// 可空列**不能**走索引排序：NULL 不入索引，走索引会把 NULL 行整批漏掉，
+// 而升序里 NULL 恰恰排在最前面。这条用例钉住「宁可慢也不能少行」。
+test "ORDER BY 可空索引列：NULL 行不能丢（必须回退全表，不走索引）" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const root = "test-engine-order-idx-null";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    var eng = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    defer eng.deinit();
+
+    try run(&eng, alloc, "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER)");
+    try run(&eng, alloc, "INSERT INTO t (id, g) VALUES (1, 9), (2, NULL), (3, 4), (4, NULL)");
+    try run(&eng, alloc, "CREATE INDEX idx_g ON t (g)");
+
+    eng.get("t").?.table.scan_rows_read = 0;
+    var got = try queryRows(&eng, alloc, "SELECT id, g FROM t ORDER BY g ASC LIMIT 3");
+    defer got.deinit();
+    const scanned = eng.get("t").?.table.scan_rows_read;
+
+    // NULL 排最前（与 SQLite 一致），然后才是 4 —— 共 3 行，一行都不能少
+    try std.testing.expectEqual(@as(usize, 3), got.rows.len);
+    try std.testing.expect(got.rows[0][1] == .null);
+    try std.testing.expect(got.rows[1][1] == .null);
+    try std.testing.expectEqual(@as(i64, 3), got.rows[2][0].integer);
+    try std.testing.expect(scanned > 0); // 回退了全表路径（走索引就会漏)
+}
+
+// text 索引列：`indexPkSlice` 必须按 `0x00 0x01` 终止符切主键
+// （数值是 8 字节定长，text 是转义 + 终止符 —— 两条分支都得有用例）。
+test "ORDER BY NOT NULL 的 text 索引列：走索引且结果与全表一致" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const root = "test-engine-order-idx-text";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    var eng = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    defer eng.deinit();
+
+    try run(&eng, alloc, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL, alias TEXT NOT NULL)");
+    try run(&eng, alloc,
+        \\INSERT INTO t (id, name, alias) VALUES
+        \\  (1, 'delta', 'delta'), (2, 'alpha', 'alpha'), (3, 'charlie', 'charlie'),
+        \\  (4, 'bravo', 'bravo'), (5, 'echo', 'echo'), (6, 'alpha2', 'alpha2')
+    );
+    try run(&eng, alloc, "CREATE INDEX idx_name ON t (name)");
+
+    eng.get("t").?.table.scan_rows_read = 0;
+    var got = try queryRows(&eng, alloc, "SELECT id, name FROM t ORDER BY name ASC LIMIT 3");
+    defer got.deinit();
+    const scanned = eng.get("t").?.table.scan_rows_read;
+
+    var want = try queryRows(&eng, alloc, "SELECT id, name FROM t ORDER BY alias ASC LIMIT 3");
+    defer want.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), got.rows.len);
+    for (got.rows, want.rows) |gr, wr| {
+        try std.testing.expectEqual(wr[0].integer, gr[0].integer);
+        try std.testing.expectEqualStrings(wr[1].text, gr[1].text);
+    }
+    try std.testing.expectEqual(@as(i64, 2), got.rows[0][0].integer); // alpha
+    try std.testing.expectEqual(@as(u64, 0), scanned); // 真走了索引
+}
+// boolean 索引列：**值分量是 8 字节定长**（走 `.integer` 分支），而它在行编码里只占 1 字节 ——
+// 「切主键」必须按**值分量**的实际长度算，不能按行编码的长度算。
+// 这条用例能抓到那个 bug：0/1 的 `encodeI64Key` 尾部恰好有 `00 01`，按 text 分支切会错位。
+test "ORDER BY NOT NULL 的 boolean 索引列：值分量仍是 8 字节定长" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const root = "test-engine-order-idx-bool";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    var eng = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    defer eng.deinit();
+
+    try run(&eng, alloc, "CREATE TABLE t (id INTEGER PRIMARY KEY, flag BOOLEAN NOT NULL, flag2 BOOLEAN NOT NULL)");
+    try run(&eng, alloc, "INSERT INTO t (id, flag, flag2) VALUES (1, 1, 1), (2, 0, 0), (3, 1, 1), (4, 0, 0), (5, 1, 1)");
+    try run(&eng, alloc, "CREATE INDEX idx_flag ON t (flag)");
+
+    eng.get("t").?.table.scan_rows_read = 0;
+    var got = try queryRows(&eng, alloc, "SELECT id, flag FROM t ORDER BY flag ASC LIMIT 2");
+    defer got.deinit();
+    const scanned = eng.get("t").?.table.scan_rows_read;
+
+    var want = try queryRows(&eng, alloc, "SELECT id, flag FROM t ORDER BY flag2 ASC LIMIT 2");
+    defer want.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), got.rows.len);
+    for (got.rows, want.rows) |gr, wr| {
+        try std.testing.expectEqual(wr[0].integer, gr[0].integer);
+        try std.testing.expectEqual(wr[1].integer, gr[1].integer);
+    }
+    try std.testing.expectEqual(@as(i64, 2), got.rows[0][0].integer); // flag=0 且 id 最小
+    try std.testing.expectEqual(@as(u64, 0), scanned); // 真走了索引
+}
+
 // 分块回填的守门用例。
 //
 // 为什么必须有：分块路径（`chunk_rows` 小到 7）在正式基准里跑不到（1M 行 < 4M/块），

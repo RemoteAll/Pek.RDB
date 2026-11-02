@@ -1676,6 +1676,12 @@ pub const MergeIter = struct {
     /// 的双缓冲，而「上一个产出」可能距当前行 2 行以上（同 key 的多个版本被跳过的场景）——
     /// 那时双缓冲可能刚好轮回到同一个 buffer 把它覆盖掉，比较就退化成「自己和自己比」
     /// → 误判重复 → **整行丢失**。`last_buf` 容量按段头里的 `max_klen` 预留，永远够。
+    ///
+    /// `last_buf` 指向 `last_inline`（所有段 key 都 ≤ 64B 时，主键/索引键是常见情形）
+    /// 或者 `last_heap`（超长 key）。**deinit 只能 free `last_heap`** ——
+    /// free 内联数组是 UB（曾写错过，靠这条注释盯着）。
+    last_inline: [64]u8 = undefined,
+    last_heap: []u8 = &.{},
     last_buf: []u8 = &.{},
     last_key: []const u8 = &.{},
     have_last: bool = false,
@@ -1767,11 +1773,17 @@ pub const MergeIter = struct {
         var pruned_before: usize = 0;
         // init 中途失败时要自己清干净：调用方是在 init 成功后才注册 defer deinit 的
         errdefer self.deinit();
-        // `last_key` 的稳定副本：容量取「段头里记录的最大 key 长度」上界
+        // `last_key` 的稳定副本：段 key 上界 ≤ 64B 就用内联数组（免一次 malloc），
+        // 超长才堆分配 —— 容量必须 ≥ `max_klen`，否则 `setLast` 会退回「引用游标双缓冲」那条悬吊路径。
         {
             var mk: usize = 0;
             for (table.segs.items) |*s| mk = @max(mk, @as(usize, s.max_klen));
-            if (mk > 0) self.last_buf = try alloc.alloc(u8, mk);
+            if (mk > 0 and mk <= self.last_inline.len) {
+                self.last_buf = self.last_inline[0..mk];
+            } else if (mk > 0) {
+                self.last_heap = try alloc.alloc(u8, mk);
+                self.last_buf = self.last_heap;
+            }
         }
         // 子集归并用在合并路径上，而合并前已把 memtable 落盘；仍然不碰 memtable，
         // 否则会把「未落盘的写」卷进合并结果，而它们还没进 WAL 轮换的边界。
@@ -1858,7 +1870,8 @@ pub const MergeIter = struct {
     pub fn deinit(self: *MergeIter) void {
         if (self.cur.len > 0) self.table.alloc.free(self.cur);
         if (self.heap.len > 0) self.table.alloc.free(self.heap);
-        if (self.last_buf.len > 0) self.table.alloc.free(self.last_buf);
+        // **只能 free `last_heap`**：`last_buf` 可能指向结构体内的 `last_inline`（free 它是 UB）
+        if (self.last_heap.len > 0) self.table.alloc.free(self.last_heap);
         for (self.cursors.items) |*c| c.deinit(self.table.alloc);
         self.cursors.deinit(self.table.alloc);
         self.table.merge_compares_total += self.compares;

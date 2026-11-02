@@ -1042,9 +1042,11 @@ pub const Segment = struct {
 
         var pos: usize = begin;
         while (pos < end) {
-            const rec = it.next(self.alloc) orelse break;
+            // **就地比较，不重建 key**：块内是「公共前缀 + 后缀」，重建要走两次 memcpy，
+            // 而点查只需要顺序（`RecIter.nextCmp` 的说明里有完整理由）。
+            const rec = it.nextCmp(key) orelse break;
             pos = rec.next;
-            switch (keyCmp(rec.key, key)) {
+            switch (rec.ord) {
                 .lt => continue,
                 .gt => return null,
                 .eq => {

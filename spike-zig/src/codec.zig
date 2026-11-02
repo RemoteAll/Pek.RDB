@@ -444,20 +444,22 @@ pub const RecIter = struct {
     pfx: usize = 0,
     /// 本块首 key（指向 `buf`，稳定）
     base: []const u8 = &.{},
+    /// 重建 key 的**内联缓冲**：索引键（8+8）、主键键（8~24）绝大多数落在 64B 内，
+    /// 内联之后点查路径**一次堆分配都不做**。超长 key 才回退到 `kbuf`。
+    inl: [2][64]u8 = undefined,
     kbuf: [2]std.ArrayList(u8) = .{ .empty, .empty },
     cur: usize = 1,
     /// 设了就表示「重建出来的 key 要落成长期稳定切片」：不开双缓冲，直接向 arena 要内存。
     /// 给「先收集、后使用」的 API（`Table.scanRefs`）用，省掉一次额外 memcpy。
     sink: ?*KeyArena = null,
 
-    /// `max_key`：本段内 key 长度上界（段头里有，用来一次性预留重建缓冲，避免热路径分配）
+    /// `max_key` / `alloc` **已不再用于预分配**：缓冲改成惰性（内联优先，超长才堆分配）。
+    /// 保留参数是为了不动几十个调用点；预分配换来的只是「超长 key 时少一次 realloc」，
+    /// 而代价是**每次建游标都付两次 malloc**（点查/索引扫描每次查询都要建游标）。
     pub fn init(alloc: std.mem.Allocator, buf: []const u8, stride: usize, max_key: usize) !RecIter {
-        var it = RecIter{ .buf = buf, .stride = stride };
-        errdefer it.deinit(alloc);
-        const cap = if (max_key == 0) 1 else max_key;
-        try it.kbuf[0].ensureTotalCapacity(alloc, cap);
-        try it.kbuf[1].ensureTotalCapacity(alloc, cap);
-        return it;
+        _ = alloc;
+        _ = max_key;
+        return RecIter{ .buf = buf, .stride = stride };
     }
 
     pub fn deinit(self: *RecIter, alloc: std.mem.Allocator) void {
@@ -489,7 +491,7 @@ pub const RecIter = struct {
         self.pos = h.next;
         self.blk_left -= 1;
         if (self.pfx == 0) return h; // 零拷贝
-        if (self.pfx > self.base.len or h.klen > self.kbuf[0].capacity) return null; // 文件损坏
+        if (self.pfx > self.base.len) return null; // 文件损坏
         if (self.sink) |arena| {
             const k = arena.alloc(alloc, h.klen) catch return null;
             @memcpy(k[0..self.pfx], self.base[0..self.pfx]);
@@ -497,14 +499,79 @@ pub const RecIter = struct {
             return .{ .key = k, .value = h.value, .seq = h.seq, .flags = h.flags, .klen = h.klen, .next = h.next };
         }
         self.cur ^= 1;
+        if (h.klen <= self.inl[self.cur].len) {
+            const ib = self.inl[self.cur][0..h.klen];
+            @memcpy(ib[0..self.pfx], self.base[0..self.pfx]);
+            @memcpy(ib[self.pfx..], h.key);
+            return .{ .key = ib, .value = h.value, .seq = h.seq, .flags = h.flags, .klen = h.klen, .next = h.next };
+        }
         const kb = &self.kbuf[self.cur];
         kb.resize(alloc, h.klen) catch return null;
         @memcpy(kb.items[0..self.pfx], self.base[0..self.pfx]);
         @memcpy(kb.items[self.pfx..], h.key);
         return .{ .key = kb.items, .value = h.value, .seq = h.seq, .flags = h.flags, .klen = h.klen, .next = h.next };
     }
+
+    /// 点查专用：把「重建 key 再比较」换成**就地比较**，结果只回一个顺序。
+    ///
+    /// 为什么必须有：块内非首行只存「公共前缀 + 后缀」，所以必须顺序解码；但解码**不需要**
+    /// 把 key 拼出来 —— 先比前缀、再比后缀，能得到同样的顺序，且一次 `memcpy` 都不做。
+    /// `Segment.getSeq` 的块内线性扫描是热态点查的主要成本（一个块 64 行、平均要看到中间），
+    /// 每次都要 `resize` + 两次 `memcpy`；10 万行表上这就是「每次点查重建 30 多个 key」。
+    ///
+    /// `value` 指向 `buf`（零拷贝），只在本次返回后有效 —— 与 `next()` 同口径。
+    pub const CmpView = struct {
+        ord: std.math.Order,
+        value: []const u8,
+        seq: u64,
+        flags: u8,
+        next: usize,
+    };
+
+    pub fn nextCmp(self: *RecIter, target: []const u8) ?CmpView {
+        if (self.pos >= self.buf.len) return null;
+        if (self.blk_left == 0) {
+            self.pfx = self.buf[self.pos];
+            self.pos += 1;
+            self.blk_left = self.stride;
+            const h0 = readRec(self.buf, self.pos, 0) orelse return null;
+            self.pos = h0.next;
+            self.blk_left -= 1;
+            self.base = h0.key;
+            // 块首记录是完整 key，直接零拷贝比较
+            return .{
+                .ord = std.mem.order(u8, h0.key, target),
+                .value = h0.value,
+                .seq = h0.seq,
+                .flags = h0.flags,
+                .next = h0.next,
+            };
+        }
+        const h = readRec(self.buf, self.pos, self.pfx) orelse return null;
+        self.pos = h.next;
+        self.blk_left -= 1;
+        if (self.pfx > self.base.len) return null; // 文件损坏（与 `next()` 同判据）
+        return .{
+            .ord = cmpWithPrefix(self.base, self.pfx, h.key, target),
+            .value = h.value,
+            .seq = h.seq,
+            .flags = h.flags,
+            .next = h.next,
+        };
+    }
 };
 
+/// 比较「`base[0..pfx] ++ suffix`」（本行 key）与 `target`，**不重建 key**。
+///
+/// 前缀段若已分出大小就直接返回（整块所有行共享这一段前缀，所以这一步对块内每行的结论一致）；
+/// 前缀相同时再比后缀 —— 与「拼出完整 key 再 `mem.order`」的结果逐位相同。
+fn cmpWithPrefix(base: []const u8, pfx: usize, suffix: []const u8, target: []const u8) std.math.Order {
+    const p = @min(pfx, base.len);
+    const ord_pre = std.mem.order(u8, base[0..p], target[0..@min(p, target.len)]);
+    if (ord_pre != .eq) return ord_pre;
+    if (target.len < p) return .gt; // 本行至少有 p 字节前缀，target 更短 ⇒ target 是前缀 ⇒ target < 本行
+    return std.mem.order(u8, suffix, target[p..]);
+}
 
 test "readRec: 定长 6B 头 + 哨兵逃逸 往返 + 边界（空值 / 长 key / 大 seq）" {
     const K254: [254]u8 = @splat('x');
@@ -602,7 +669,7 @@ test "RecIter: 块内公共前缀往返（pfx=0 / pfx>0 / 残块 / 空 key）" {
     const keys = [_][]const u8{
         "abc000", "abc001", "abc002", "abc003", // 块 1：pfx=3
         "abc004", "xyz005", "qqq006", "zzz007", // 块 2：pfx=0
-        "",      "zzz999", // 块 3：pfx=0（空 key 的公共前缀是 0）
+        "", "zzz999", // 块 3：pfx=0（空 key 的公共前缀是 0）
     };
 
     var blob: std.ArrayList(u8) = .empty;
@@ -666,6 +733,74 @@ test "RecIter: 块内公共前缀往返（pfx=0 / pfx>0 / 残块 / 空 key）" {
         if (bi * stride + 1 < keys.len) {
             const r1 = it2.next(alloc) orelse return error.MissingRow;
             try std.testing.expectEqualStrings(keys[bi * stride + 1], r1.key);
+        }
+    }
+}
+
+test "RecIter.nextCmp：就地比较的结果与重建 key 后比较逐行一致（含前缀压缩块）" {
+    const alloc = std.testing.allocator;
+    const stride: usize = 4;
+
+    // 与「块内公共前缀往返」同一份数据：块 1 pfx=3、块 2 pfx=0、块 3 残块且含空 key
+    const keys = [_][]const u8{
+        "abc000", "abc001", "abc002", "abc003",
+        "abc004", "xyz005", "qqq006", "zzz007",
+        "",       "zzz999",
+    };
+
+    var blob: std.ArrayList(u8) = .empty;
+    defer blob.deinit(alloc);
+    {
+        var i: usize = 0;
+        while (i < keys.len) {
+            const n = @min(stride, keys.len - i);
+            var pfx = keys[i].len;
+            var j: usize = 1;
+            while (j < n) : (j += 1) {
+                const a = keys[i][0..pfx];
+                const b = keys[i + j];
+                const m = @min(a.len, b.len);
+                var k: usize = 0;
+                while (k < m and a[k] == b[k]) k += 1;
+                pfx = k;
+            }
+            try blob.append(alloc, @intCast(pfx));
+            j = 0;
+            while (j < n) : (j += 1) {
+                const key = keys[i + j];
+                const val = [_]u8{@intCast('0' + (i + j) % 10)};
+                var hdr: [6 + 33]u8 = undefined;
+                const hn = writeRecHdr(&hdr, key.len, val.len, i + j + 1, 0);
+                try blob.appendSlice(alloc, hdr[0..hn]);
+                try blob.appendSlice(alloc, if (j == 0) key else key[pfx..]);
+                try blob.appendSlice(alloc, &val);
+            }
+            i += n;
+        }
+    }
+
+    // 每个 target 都必须给出与「拼出完整 key 再比较」逐行一致的顺序。
+    // 覆盖：空、纯前缀、命中、未命中（块内/块间/尾部）、比某行短、比某行长、超长。
+    const targets = [_][]const u8{
+        "",       "a",       "abc",    "abc00",    "abc000", "abc0010", "abc002",
+        "abc003", "abc004",  "abc00z", "b",        "qqq005", "xyz",     "zzz",
+        "zzz999", "zzz9990", "zzzz",   "zzzzzzzz",
+    };
+    for (targets) |t| {
+        var it_a = try RecIter.init(alloc, blob.items, stride, 8);
+        defer it_a.deinit(alloc);
+        var it_b = try RecIter.init(alloc, blob.items, stride, 8);
+        defer it_b.deinit(alloc);
+        while (true) {
+            const a = it_a.next(alloc);
+            const b = it_b.nextCmp(t);
+            try std.testing.expectEqual(a == null, b == null);
+            if (a == null) break;
+            try std.testing.expectEqual(std.mem.order(u8, a.?.key, t), b.?.ord);
+            try std.testing.expectEqual(a.?.seq, b.?.seq);
+            try std.testing.expectEqual(a.?.flags, b.?.flags);
+            try std.testing.expectEqualStrings(a.?.value, b.?.value);
+            try std.testing.expectEqual(a.?.next, b.?.next);
         }
     }
 }

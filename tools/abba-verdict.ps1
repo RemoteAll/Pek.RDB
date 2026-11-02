@@ -66,6 +66,10 @@ $pairs = @(
     # Secondary index: both sides build the same index agg(g) over the same 1M rows, then
     # run the same 5000 equality lookups (shared xorshift key sequence) and compare digests.
     @('sql_index_eq', 'sql_index_eq', $true),
+    # ORDER BY <indexed col> ASC LIMIT 10: same SQL on both sides (`ORDER BY g ASC LIMIT 10`);
+    # idx_g(g) gives the order directly, the projected `x` is not in the index so both sides
+    # must fetch the row. 200 reps median, statement prepared outside the timed region.
+    @('sql_orderby_index10', 'sql_orderby_index10', $true),
     # Index build time is a one-shot latency-like metric (milliseconds, lower is better).
     @('sql_index_build', 'sql_index_build', $false),
     # The three items below are per-row writes on our side vs a single transaction on SQLite (its

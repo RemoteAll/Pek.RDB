@@ -134,6 +134,89 @@ fn delIndexEntries(host: ?*const IndexHost, s: *const schema_mod.Schema, vals: [
     }
 }
 
+/// 从索引键（`值分量 ++ 主键分量`，两段都自定界）里切出**主键分量**。
+///
+/// 数值型值分量是 8 字节定长（`codec.encodeI64Key` / IEEE 位变换），text/blob 则是
+/// 「转义后以 `0x00 0x01` 收尾」（原文里的 `0x00` 被写成 `0x00 0xFF`）。
+/// **必须按列的存储类型判定**：两种编码都不带类型 tag，光看字节区分不开。
+fn indexPkSlice(s: *const schema_mod.Schema, ci: usize, key: []const u8) ![]const u8 {
+    if (schema_mod.columnComponentIsFixed(s.columns[ci].col_type)) {
+        if (key.len < 8) return error.Truncated;
+        return key[8..];
+    }
+    var i: usize = 0;
+    while (i + 1 < key.len) : (i += 1) {
+        if (key[i] != 0) continue;
+        if (key[i + 1] == 0xFF) {
+            i += 1; // 转义：这个 0 是原文的一部分
+            continue;
+        }
+        if (key[i + 1] == 0x01) return key[i + 2 ..];
+        return error.Truncated; // `0x00` 后面只能是 0xFF（转义）或 0x01（终止符）
+    }
+    return error.Truncated;
+}
+
+/// `ORDER BY <已建索引的非主键列> ASC`（无 WHERE）⇒ 直接扫索引表，凑够 `offset+limit` 就停。
+///
+/// 索引键是 `值分量 ++ 主键分量` 且**顺序保持**，所以索引表的顺序就是
+/// 「该列升序、同值按主键升序」——这正好等于全量路径（主表按主键顺序扫描 + 稳定排序）
+/// 的结果顺序，两条路径逐行一致（见 `engine.zig` 的守门用例）。
+///
+/// 每个索引键切出主键后**回表**取整行；脏项（索引有、行已删）直接跳过 ——
+/// 与 `indexCollect` 的回表复核是同一套约定。
+///
+/// **降序不走这里**：`g++id` 倒序扫得到的是「同值按主键降序」，与全量路径的
+/// 「同值按主键升序」不同；要在并列处截断得取整组，语义与成本都还没摊清，
+/// 先让 `DESC` 回退全量路径（正确优先）。`Table.topKDesc` 也不能复用：它输出的是
+/// **值**，而索引表的值是空的。
+///
+/// 返回 `null` = 这条路径不适用/没凑够（无 LIMIT、全是脏项等），调用方回退全量路径。
+fn selectByIndexOrder(
+    host: *const IndexHost,
+    t: *tablemod.Table,
+    s: *const schema_mod.Schema,
+    sel: sql.Select,
+    ci: usize,
+    alloc: std.mem.Allocator,
+) !?Rows {
+    const itbl = host.onColumn(ci) orelse return null;
+    const limit = sel.limit orelse return null;
+    const want = @as(usize, sel.offset orelse 0) + @as(usize, limit);
+
+    // 回表拿到的整行**连续存进一个缓冲**（`t.get` 复用 `vbuf` ⇒ 每行都必须拷走）。
+    // 攒成一段再切切片，而不是每行 `dupe` 一次：k 行就少 k-1 次分配/释放。
+    var store: std.ArrayList(u8) = .empty;
+    defer store.deinit(alloc);
+    var spans: std.ArrayList([2]usize) = .empty; // {off, len}
+    defer spans.deinit(alloc);
+    var vbuf: std.ArrayList(u8) = .empty;
+    defer vbuf.deinit(alloc);
+
+    var it = tablemod.MergeIter{};
+    try it.init(itbl, &[_]u8{}, &[_]u8{});
+    defer it.deinit();
+    while (it.next()) |rec| {
+        if (spans.items.len >= want) break;
+        const pk = try indexPkSlice(s, ci, rec.key);
+        const raw = (try t.get(pk, &vbuf)) orelse continue; // 脏项
+        try spans.append(alloc, .{ store.items.len, raw.len });
+        try store.appendSlice(alloc, raw);
+    }
+    if (spans.items.len == 0) return null;
+    // 切片在这之后才建：`store` 不再增长，指针稳定
+    const rows = try alloc.alloc([]const u8, spans.items.len);
+    defer alloc.free(rows);
+    for (spans.items, 0..) |sp, i| rows[i] = store.items[sp[0]..][0..sp[1]];
+
+    // **索引顺序已经满足 ORDER BY**：把 `order_by` 清掉再交给统一装配 —— 装配层就会
+    // ①跳过排序、②只 decode 投影用到的列（`want = proj.indices`）。这两件事本来由
+    // 「排序列必须先解码」那条约束逼出来的，索引路径不需要付。
+    var sel2 = sel;
+    sel2.order_by = &[_]sql.OrderItem{};
+    return try finishFromValues(t.io, s, sel2, alloc, rows);
+}
+
 fn evalWhere(a: sql.Value, op: sql.CmpOp, b: sql.Value) bool {
     const ord = schema_mod.valueCmp(a, b);
     return switch (op) {
@@ -628,6 +711,23 @@ pub fn selectRowsHost(
                         try indexCollect(h, t, s, ci, w.value, alloc, &owned, max);
                         return finishFromValues(t.io, s, sel, alloc, owned.items);
                     }
+                }
+            }
+        }
+    }
+
+    // 索引排序：`ORDER BY <已建索引的非主键列> ASC LIMIT n`（无 WHERE）⇒ 索引顺序即该列顺序，
+    // 顺序扫到凑够就停，既不必扫主表也不必对结果排序（§九十七）。
+    //
+    // **只对 `NOT NULL` 列启用**：NULL 不入索引（`putIndexEntries` 里 `isNullValue` 直接跳过），
+    // 可空列走索引会把 NULL 行整批漏掉 —— 而升序里 NULL 恰恰排在最前面。
+    // （把 NULL 也编进索引、按「比任何值都小」排序是后续项；在那之前宁可走全表。）
+    if (host) |h| {
+        if (sel.where == null and sel.order_by.len == 1 and sel.limit != null and !sel.order_by[0].desc) {
+            const o = sel.order_by[0];
+            if (s.indexOf(o.column)) |ci| {
+                if (ci != s.pk_index and s.columns[ci].not_null and h.onColumn(ci) != null) {
+                    if (try selectByIndexOrder(h, t, s, sel, ci, alloc)) |rows| return rows;
                 }
             }
         }
