@@ -84,6 +84,8 @@ pub fn main() !void {
         .flush_bytes = @intCast(build_options.flush_bytes),
         .data_prefault_max_bytes = build_options.data_prefault,
         .durable_commit = build_options.durable,
+        .compact_max_segs = @intCast(build_options.tiered_max),
+        .tiered_fanout = @intCast(build_options.tiered_fanout),
     });
     var t_live = true;
     defer if (t_live) t.deinit();

@@ -469,7 +469,12 @@ pub const Finished = struct {
 // 格式：ARCHIVE_MAGIC(8) 之后为连续 record：{ u32 len, u32 crc32Fast(payload), payload[len] }；
 // payload 就是单段 `.idx` 的完整内容（自带 magic 与尾部 CRC，读取时仍逐段校验、能定位损坏段）。
 // 只追加不改写，所以 flush 的代价仍是一段索引的大小。
-pub const ARCHIVE_MAGIC = "PEKZAG06";
+//
+// `PEKZAG07` 起支持**删除标记**（`len == 0` = 该段已被分层合并掉）：
+// 合并只换掉几个段，若每次都 `archiveRewrite` 整份归档，成本就是
+// O(总索引) × 合并次数 —— 实测 1 亿行 / 4883 段场景要重写两千多次 × 156 MB，
+// **56 分钟都跑不完**。追加式把它降到 O(新段索引)，归档膨胀到 2× 活数据才重写一次。
+pub const ARCHIVE_MAGIC = "PEKZAG07";
 
 /// 校验归档文件头。空文件（新建库）视为合法。
 pub fn archiveCheckMagic(bytes: []const u8) !void {
@@ -491,6 +496,7 @@ pub const ArchiveIter = struct {
     pos: usize = 8,
 
     /// 取下一段索引；遇到截断的 record（追加时崩溃）就停下，等效于该段不存在。
+    /// `payload.len == 0` 表示**删除标记**（该段已被合并掉），调用方必须把它当成「移除同 id」处理。
     pub fn next(self: *ArchiveIter) ?ArchiveRecord {
         if (self.buf.len < 16 or self.pos + 16 > self.buf.len) return null;
         const len: usize = @intCast(std.mem.readInt(u32, self.buf[self.pos..][0..4], .little));
@@ -559,6 +565,35 @@ pub fn archiveAppend(io: std.Io, dir: std.Io.Dir, path: []const u8, id: u32, pay
     try f.setLength(io, new_end);
     try f.sync(io);
     return new_end;
+}
+
+/// 追加「段已被合并掉」的删除标记（`len == 0`）。
+///
+/// 成本只与「被删的段数」有关，与归档总大小无关 —— 这是分层合并能在 4883 段场景下
+/// 跑得起来的唯一原因。崩溃语义：标记写了一半（16 字节头未写全）时
+/// `ArchiveIter` 会在那里停下，相当于“还没删”，旧段继续有效，不丢数据。
+pub fn archiveAppendDead(io: std.Io, dir: std.Io.Dir, path: []const u8, ids: []const u32, at_in: u64) !u64 {
+    if (ids.len == 0) return at_in;
+    const f = try dir.createFile(io, path, .{ .read = true, .truncate = false });
+    defer f.close(io);
+    var at = at_in;
+    if ((try f.stat(io)).size < ARCHIVE_MAGIC.len) {
+        try f.writePositionalAll(io, ARCHIVE_MAGIC, 0);
+        at = 8;
+    } else if (at < 8) {
+        at = 8;
+    }
+    var hdr: [16]u8 = undefined;
+    for (ids) |id| {
+        std.mem.writeInt(u32, hdr[0..4], 0, .little); // len = 0 ⇒ 删除标记
+        std.mem.writeInt(u32, hdr[4..8], id, .little);
+        std.mem.writeInt(u64, hdr[8..16], 0, .little);
+        try f.writePositionalAll(io, &hdr, at);
+        at += 16;
+    }
+    try f.setLength(io, at);
+    try f.sync(io);
+    return at;
 }
 
 // ---------------- 读取 ----------------
@@ -964,6 +999,16 @@ pub const Segment = struct {
     /// 点查：Bloom 否定 → 稀疏索引定位 → 读出该段记录扫描。
     /// out 为避免每次分配的复用缓冲；返回 flags。
     pub fn get(self: *Segment, key: []const u8, snapshot: u64, out: *std.ArrayList(u8)) !?u8 {
+        var dummy: u64 = 0;
+        return self.getSeq(key, snapshot, out, &dummy);
+    }
+
+    /// 同 `get`，额外回传命中记录的**版本号**（`seq_out`）。
+    ///
+    /// 为什么需要：段之间 key 范围重叠时（分层合并 `compactTier` 之后是常态），
+    /// 「段序 = 新旧序」不成立 —— 合并出的段带着旧数据却被追加在末尾。
+    /// 唯一正确的判定是「seq 最大的可见版本」，所以点查必须拿得到 seq。
+    pub fn getSeq(self: *Segment, key: []const u8, snapshot: u64, out: *std.ArrayList(u8), seq_out: *u64) !?u8 {
         try self.ensureParsed();
         if (!self.mayContain(key)) return null;
         if (self.entries.items.len == 0) return null;
@@ -990,6 +1035,7 @@ pub const Segment = struct {
                     if (rec.seq <= snapshot) {
                         out.clearRetainingCapacity();
                         try out.appendSlice(self.alloc, rec.value);
+                        seq_out.* = rec.seq;
                         return rec.flags;
                     }
                 },

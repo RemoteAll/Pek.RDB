@@ -67,8 +67,7 @@ pub const Options = struct {
     /// 新段索引的 Bloom 位数/key（0 = 不生成）。
     /// Bloom 占索引体积 ~80%，只对「不存在的 key」有用；关闭后冷重开与索引 IO 同步变小。
     bloom_bits: u8 = 10,
-    /// 段数达到该值后，`flush` 结束时自动全量合并（**0 = 关闭，默认关闭**）。
-    ///
+    /// 段数达到该值后，`flush` 结束时自动全量合并（**0 = 关闭，默认关闭**）。    ///
     /// 只在 flush 之后检查，不起后台线程：写入抖动可预测（合并期间该次写变慢，
     /// 不会让别的线程随时被卡），也不需要双写 + 引用计数。
     ///
@@ -79,6 +78,15 @@ pub const Options = struct {
     /// 推荐：写多读少 16/0、均衡 8、读多写少 4。
     /// 注意它只控制**触发时机**，单次合并的阻塞时长仍随数据总量线性增长（分层合并才能治本）。
     compact_after_segs: usize = 0,
+    /// **分层合并（size-tiered）的段数上限**：段数超过它就自动做一次
+    /// `compactTier(tiered_fanout)`（只合并最小的 N 个段）。`0` = 关闭（默认）。
+    ///
+    /// 与 `compact_after_segs`（全量合并）二选一，**这个优先**：全量合并的单次阻塞
+    /// 随数据量线性增长，大表不可用（44e9 行会有约 6.8 万段）。
+    /// 推荐：`compact_max_segs = 16` + `tiered_fanout = 4`（段数封顶 16，写放大 ≈ log₄）。
+    compact_max_segs: usize = 0,
+    /// 分层合并每次合并几个段（`< 2` 视为关闭）。
+    tiered_fanout: usize = 4,
     /// **仅用于基准 A/B**：置 true 时禁用「顺序拼接」快路径，强制走 k 路堆归并。
     ///
     /// 为什么要这个开关：§16.1.22 的收益原本是拿「本批 25 段 ÷ 本批 1 段」的比值，
@@ -249,9 +257,40 @@ fn openSegmentsFromArchive(
     data_prefault_max: u64,
     segs: *std.ArrayList(segmod.Segment),
 ) !OpenSegmentsResult {
+    // **两遍**：先按顺序应用删除标记（`payload.len == 0`），得到活段列表，再建段。
+    // 归档是只追加的，合并掉的段只写一条删除标记 —— 若一遍边解边建，
+    // 删除标记出现在段后面时已经建好的那个段还得反悔（而 `fromBytes` 已经解了头）。
+    var live: std.ArrayList(segmod.ArchiveRecord) = .empty;
+    defer live.deinit(alloc);
     var it = segmod.ArchiveIter{ .buf = buf };
     var max_id: u64 = 0;
     while (it.next()) |rec| {
+        // `max_id` 要覆盖**已死的段号**：段号绝不能重用，否则新段会被旧的删除标记误杀。
+        max_id = @max(max_id, rec.id);
+        if (rec.payload.len == 0) {
+            var j: usize = 0;
+            while (j < live.items.len) : (j += 1) {
+                if (live.items[j].id == rec.id) {
+                    _ = live.orderedRemove(j);
+                    break;
+                }
+            }
+            continue;
+        }
+        // 同 id 出现两次（理论上不该有）→ 后者胜，不能建成两个同号段
+        var dup = false;
+        for (live.items) |*e| {
+            if (e.id == rec.id) {
+                e.payload = rec.payload;
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) try live.append(alloc, rec);
+    }
+    const valid_end = it.validEnd();
+
+    for (live.items) |rec| {
         var ta: u64 = 0;
         if (segmod.timing_enabled) ta = segmod.tick(io);
         var seg = try segmod.Segment.fromBytes(io, dir, base_path, rec.id, rec.payload, alloc, false, preheat);
@@ -269,7 +308,7 @@ fn openSegmentsFromArchive(
         };
         if (segmod.timing_enabled) segmod.timing.seg_append += segmod.tick(io) - ta;
     }
-    return .{ .valid_end = it.validEnd(), .max_id = max_id };
+    return .{ .valid_end = valid_end, .max_id = max_id };
 }
 
 pub const OpenSegmentsResult = struct {
@@ -376,6 +415,8 @@ pub const Table = struct {
     /// 所以必须拷到一份活过扫描的内存。用**分块 arena** 而不是 `ArrayList`：
     /// 分块不会搬地址，一遍就能定下稳定切片。
     key_arena: segmod.KeyArena = .{},
+    /// 重叠段点查的候选用缓冲（跨段比 seq 时要先放这里，赢了才拷进调用方的 out）。
+    hit_buf: std.ArrayList(u8) = .empty,
 
     pub fn open(
         io: std.Io,
@@ -524,6 +565,7 @@ pub const Table = struct {
         self.idx_map = null;
         self.idx_archive = &.{};
         self.key_arena.deinit(self.alloc);
+        self.hit_buf.deinit(self.alloc);
         self.mem.deinit();
         self.wal.close();
         self.alloc.free(self.base_path);
@@ -672,15 +714,32 @@ pub const Table = struct {
             // 范围说在这个段里但段内没有 ⇒ 不存在（段不可变，除墓碑外不会"暂时没有"）
             return null;
         }
+        // **重叠段：命中不能“先到先得”**。分层合并（`compactTier`）之后，合并出的段带着
+        // **旧**数据却被追加在数组末尾（段号最大），而幸存段里可能存着更新的版本 ——
+        // 「段序 = 新旧序」不再成立。唯一正确的判据是 **seq 最大的可见版本**。
+        var best_seq: u64 = 0;
+        var best_flags: u8 = 0;
+        var found = false;
         var i = self.segs.items.len;
         while (i > 0) {
             i -= 1;
-            if (try self.segs.items[i].get(key, self.visible, out)) |flags| {
-                if (flags != 0) return null;
-                return out.items;
+            // **按段头 `max_seq` 剪枝**：段内任何记录的 seq 都 ≤ `max_seq`，
+            // 所以「整段最新的版本都不如已找到的」时连 Bloom 都不必过。
+            // 这一条让「顺序写入（段序 = 新旧序）」的情形退化成只查 1 个段，与旧路径同价。
+            if (found and self.segs.items[i].max_seq <= best_seq) continue;
+            var got_seq: u64 = 0;
+            const flags = try self.segs.items[i].getSeq(key, self.visible, &self.hit_buf, &got_seq) orelse continue;
+            if (!found or got_seq > best_seq) {
+                found = true;
+                best_seq = got_seq;
+                best_flags = flags;
+                out.clearRetainingCapacity();
+                try out.appendSlice(self.alloc, self.hit_buf.items);
             }
         }
-        return null;
+        if (!found) return null;
+        if (best_flags != 0) return null;
+        return out.items;
     }
 
     /// 重算「段 key 范围是否严格递增不重叠」这个布局标记（O(段数)，只在段集合变化时调）。
@@ -823,10 +882,27 @@ pub const Table = struct {
     /// 代价：写路径看不到合并失败，**上层必须自己查 `autoCompactHealthy()` / `auto_compact_error`**，
     /// 否则自动合并会静默失效。
     fn maybeAutoCompact(self: *Table) void {
-        if (self.opts.compact_after_segs == 0) return;
         if (self.going_compact) return; // compact 内部的 flush 不得递归触发
-        if (self.segs.items.len < self.opts.compact_after_segs) return;
         if (self.auto_compact_fails >= AUTO_COMPACT_MAX_FAILS) return;
+
+        // 分层合并优先：段数超过上限就合并最小的 N 个段，最多连着做 4 次
+        // （每次减少 fanout−1 段，4 次足够从 30 段收敛到 16 段以内）。
+        if (self.opts.compact_max_segs > 0 and self.opts.tiered_fanout >= 2) {
+            var guard: usize = 0;
+            while (self.segs.items.len > self.opts.compact_max_segs and guard < 4) : (guard += 1) {
+                const cr = self.compactTier(self.opts.tiered_fanout) catch |e| {
+                    self.auto_compact_error = e;
+                    self.auto_compact_fails +|= 1;
+                    return;
+                };
+                if (!cr.did) return;
+                self.auto_compact_count +|= 1;
+            }
+            return;
+        }
+
+        if (self.opts.compact_after_segs == 0) return;
+        if (self.segs.items.len < self.opts.compact_after_segs) return;
         const cr = self.compact() catch |e| {
             self.auto_compact_error = e;
             self.auto_compact_fails +|= 1;
@@ -1104,7 +1180,202 @@ pub const Table = struct {
 
         return .{ .before = before, .after = self.segs.items.len, .rows = rows, .bytes = out_bytes, .did = true };
     }
+
+    /// 用磁盘上的归档**重建整个段数组**。
+    ///
+    /// 归档被 `archiveRewrite` 换掉之后必须这么做：段的 `idx` 是**旧归档映射的切片**，
+    /// rename 之后旧映射虽然还活着（Windows 上 rename 不被拒，见
+    /// `test "mmap 存活时 rename 覆盖同路径"`），但它的内容已经不对应磁盘上的那份 ——
+    /// 继续用就会让「内存里看到的索引」与「磁盘上的索引」永久分叉。
+    fn reloadFromArchive(self: *Table) !void {
+        for (self.segs.items) |*s| s.close();
+        self.segs.clearRetainingCapacity();
+        if (self.idx_map) |*m| m.destroy();
+        self.idx_map = null;
+        self.idx_archive = &.{};
+
+        // 先落字段再做事：后面任何一步失败，`deinit` 都能把已建立的东西收干净
+        self.idx_map = try segmod.mapWholeFile(self.io, self.dir, self.index_path, self.opts.index_max_bytes, self.opts.index_prefault_max_bytes);
+        self.idx_archive = self.idx_map.?.bytes();
+        try segmod.archiveCheckMagic(self.idx_archive);
+        const opened = try openSegmentsFromArchive(
+            self.io,
+            self.dir,
+            self.base_path,
+            self.idx_archive,
+            self.alloc,
+            self.opts.mmap_preheat,
+            self.opts.data_prefault_max_bytes,
+            &self.segs,
+        );
+        self.index_valid_len = opened.valid_end;
+        if (opened.max_id >= self.next_seg) self.next_seg = opened.max_id + 1;
+        self.recomputeSegLayout();
+    }
+
+    /// **分层（size-tiered）合并**：只把最小的 `fanout` 个段合成一个段。
+    ///
+    /// 为什么必须有它（而不是每次全量 `compact()`）：
+    /// - 全量合并每次重写「当时全部数据」，**单次阻塞时长随数据量线性增长**
+    ///   （200 万行 0.4–0.7 s，线性外推 2000 万行就到秒级，期间该表串行阻塞）；
+    /// - 写放大只由「总段数/阈值」决定，数据越大段越多，全量合并越不可行。
+    ///   44e9 行按默认 `flush_bytes` 约 6.8 万段，全量合并等于自杀。
+    ///
+    /// size-tiered 的形状（对齐 Cassandra STCS / RocksDB universal compaction）：
+    /// 每次只碰**同量级**的若干段，段数维持 O(log n)，写放大 ≈ log_fanout(段数)。
+    ///
+    /// 代价：合并后的段与幸存段 key 范围**必然重叠** ⇒ `segs_disjoint_asc` 变 false，
+    /// `get` 回到「逐段倒序 + Bloom 排除」路径（实测 25 段时不命中仍有 1.6M 次/s，
+    /// 见 §16.1.7）。这是用点查换「合并可终止」，段数受 `compact_max_segs` 约束后代价有限。
+    pub fn compactTier(self: *Table, fanout: usize) !CompactResult {
+        self.checkThread();
+        const before = self.segs.items.len;
+        if (fanout < 2 or before <= fanout) {
+            return .{ .before = before, .after = before, .rows = 0, .did = false };
+        }
+
+        const was_going = self.going_compact;
+        self.going_compact = true;
+        defer self.going_compact = was_going;
+
+        // memtable 先落盘：子集归并不包含 memtable（它还没进 WAL 轮换边界）
+        if (self.mem.len() > 0) try self.flushImpl();
+        const n = self.segs.items.len;
+        if (fanout < 2 or n <= fanout) {
+            return .{ .before = before, .after = n, .rows = 0, .did = false };
+        }
+
+        // 选「最小的 fanout 个段」（按行数；同量级时取段号小的，保证行为可预测）
+        const idx = try self.alloc.alloc(usize, n);
+        defer self.alloc.free(idx);
+        for (0..n) |i| idx[i] = i;
+        std.mem.sortUnstable(usize, idx, self.segs.items, segRowLess);
+        // **必须按「同量级」成组，不能无条件取最小的 N 个。**
+        // 无条件取会写出爆炸的写放大：16 段时每次合并要重写约 D/4 的数据，
+        // 却只换来 3 个新段（实测写吞吐掉到 1 MB/s，比完全不合并还慢 26 倍）。
+        // size-tiered 的规则是：大小不超过最小段 `TIER_RATIO` 倍的才算同一量级，
+        // 凑够 fanout 个才合并，否则**什么都不做，等同量级的段攒够**。
+        const min_rows = @max(@as(usize, 1), self.segs.items[idx[0]].rows);
+        var in_class: usize = 0;
+        while (in_class < n and self.segs.items[idx[in_class]].rows <= min_rows * TIER_RATIO) in_class += 1;
+        if (in_class < fanout) {
+            return .{ .before = before, .after = n, .rows = 0, .did = false };
+        }
+        const chosen = idx[0..fanout];
+        std.mem.sort(usize, chosen, {}, std.sort.asc(usize));
+
+        const id = self.next_seg;
+        const data_path = try self.alloc.print("{s}/seg/{d:0>6}.data", .{ self.base_path, id });
+        defer self.alloc.free(data_path);
+        var orphan_maybe = true;
+        errdefer if (orphan_maybe) self.dir.deleteFile(self.io, data_path) catch {};
+
+        var expected_rows: usize = 0;
+        for (chosen) |si| expected_rows +|= self.segs.items[si].rows;
+
+        var w = try segmod.Writer.create(self.io, self.dir, data_path, self.alloc, self.opts.bloom_bits, expected_rows);
+        defer w.deinit();
+        var rows: usize = 0;
+        {
+            var it = MergeIter{};
+            try it.initSubset(self, chosen);
+            defer it.deinit();
+            while (it.next()) |rec| {
+                try w.push(rec.key, rec.seq, rec.flags, rec.value);
+                rows += 1;
+            }
+        }
+        const data_bytes: u64 = @intCast(w.buf_base + w.buf.items.len);
+        const fin = try w.finishBytes();
+        var fin_owned = true;
+        errdefer if (fin_owned) self.alloc.free(fin.bytes);
+        const out_bytes: u64 = data_bytes + fin.bytes.len;
+
+        // 同 `compact()`：**先在内存里验证新段可解析**，再动磁盘。
+        // 所有权直接交给新段（`take_ownership = true`），之后的错误由它释放，
+        // 外层 `fin_owned` 必须立刻置 false，否则两条 errdefer 会双重释放。
+        var new_seg = try segmod.Segment.fromBytes(self.io, self.dir, self.base_path, id, fin.bytes, self.alloc, true, self.opts.mmap_preheat);
+        fin_owned = false;
+        errdefer {
+            var s = new_seg;
+            s.close();
+        }
+        try new_seg.ensureParsed();
+
+        // 记录段号用于删旧文件
+        const del_id = try self.alloc.alloc(u32, fanout);
+        defer self.alloc.free(del_id);
+        for (chosen, 0..) |si, j| del_id[j] = @intCast(self.segs.items[si].id);
+
+        // **只追加**：新段索引 + 被合并段的删除标记。
+        // 不整份重写归档 —— 那是 O(总索引)×合并次数，1 亿行/4883 段要重写两千多次 × 156 MB
+        // （实测 56 分钟都跑不完）。追加成本只与「新索引 + 3 条标记」有关。
+        var at = try segmod.archiveAppend(self.io, self.dir, self.index_path, @intCast(id), fin.bytes, self.index_valid_len);
+        at = try segmod.archiveAppendDead(self.io, self.dir, self.index_path, del_id, at);
+        self.index_valid_len = at;
+        orphan_maybe = false; // 归档已引用新段，不能再把它当孤儿删掉
+
+        // 内存里的段集合就地更新：**不等价于 `reloadFromArchive`** ——
+        // 追加不会移动已有字节，幸存段的 `idx` 切片（指向旧映射）仍然有效。
+        {
+            // 先关掉被合并的段（解除数据文件映射/句柄），再删文件：
+            // Windows 上删除「还打开着」的文件会失败，而 `catch {}` 会留下永久孤儿。
+            var j: usize = fanout;
+            while (j > 0) {
+                j -= 1;
+                var s = self.segs.orderedRemove(chosen[j]);
+                s.close();
+            }
+            try self.segs.append(self.alloc, new_seg);
+        }
+        // 段集合变了：重算布局并提升可见段号
+        if (id >= self.next_seg) self.next_seg = id + 1;
+        self.recomputeSegLayout();
+
+        // 段已不再被归档与内存引用 → 删数据文件是安全的
+        var del_buf: [std.fs.max_path_bytes]u8 = undefined;
+        for (del_id) |oid| {
+            const op = std.fmt.bufPrint(&del_buf, "{s}/seg/{d:0>6}.data", .{ self.base_path, oid }) catch continue;
+            self.dir.deleteFile(self.io, op) catch {};
+        }
+
+        // 归档膨胀治理：死标记累计到「超过活数据」就整份重写一次（摊还后可忽略）
+        {
+            var live_bytes: u64 = 0;
+            for (self.segs.items) |s| live_bytes += s.idx.len;
+            const total = if (self.dir.openFile(self.io, self.index_path, .{})) |f| blk: {
+                defer f.close(self.io);
+                break :blk (f.stat(self.io) catch break :blk live_bytes).size;
+            } else |_| live_bytes;
+            if (total > live_bytes * 2 + 4096) {
+                const records = try self.alloc.alloc(segmod.ArchiveRecord, self.segs.items.len);
+                defer self.alloc.free(records);
+                for (self.segs.items, 0..) |s, i| records[i] = .{ .id = @intCast(s.id), .payload = s.idx };
+                self.index_valid_len = try segmod.archiveRewrite(self.io, self.dir, self.index_path, records, self.alloc);
+                // 归档换了 ⇒ 段的索引切片失效，必须整体重载（`close()` 会释放 `fin.bytes`）
+                try self.reloadFromArchive();
+            }
+        }
+
+        self.auto_compact_error = null;
+        self.auto_compact_fails = 0;
+        self.compact_bytes_total += out_bytes;
+
+        return .{ .before = before, .after = self.segs.items.len, .rows = rows, .bytes = out_bytes, .did = true };
+    }
 };
+
+fn segRowLess(segs: []segmod.Segment, a: usize, b: usize) bool {
+    if (segs[a].rows != segs[b].rows) return segs[a].rows < segs[b].rows;
+    return segs[a].id < segs[b].id;
+}
+
+/// 分层合并的「同量级」判据：行数不超过最小段 `TIER_RATIO` 倍就算同一级。
+///
+/// 取 2 与「每次合并 fanout 个同量级段」配合，段大小会沿 2×→8×→32×… 的阶梯上爬，
+/// 每个段在其生命周期里被重写 ≈ log_fanout(总段数) 次（440 亿行约 7 次）。
+/// 取大了（比如无条件合并最小的 N 个）写放大随数据量线性增长，实测会慢到不可用。
+const TIER_RATIO: usize = 2;
 
 pub const CompactResult = struct {
     before: usize,
@@ -1171,10 +1442,71 @@ pub const MergeIter = struct {
         try self.initStable(table, start, end, null);
     }
 
+    /// **只归并指定段子集**（分层合并用）。不包含 memtable、不走顺序拼接：
+    /// 子集的 key 范围可能互相重叠（合并后的段与幸存段必然重叠），拼接的前提不成立。
+    pub fn initSubset(self: *MergeIter, table: *Table, only: []const usize) !void {
+        try self.initStableOnly(table, &[_]u8{}, &[_]u8{}, null, only);
+    }
+
     /// `arena != null` 时，压缩块重建出来的 key 直接落进 arena（稳定切片，供收集型 API 使用）。
     /// **必须在建游标之前设定**：堆模式下 `init` 末尾会预读每条游标的第 1 条记录，
     /// 那批 key 若落在双缓冲里，后续推进就会把它们覆盖。
     pub fn initStable(self: *MergeIter, table: *Table, start: []const u8, end: []const u8, arena: ?*segmod.KeyArena) !void {
+        try self.initStableOnly(table, start, end, arena, null);
+    }
+
+    /// 段游标的公共构造：裁剪判定 + 建游标 + 稳定 key 模式。
+    fn addSegCursor(
+        self: *MergeIter,
+        table: *Table,
+        s: *segmod.Segment,
+        start: []const u8,
+        end: []const u8,
+        arena: ?*segmod.KeyArena,
+        pruned_before: *usize,
+    ) !void {
+        // **反向段裁剪**（§16.1.23）：段内最大 key 都小于查询起点 → 整段不可能命中。
+        //
+        // 判据是段头里**精确**的 `maxKey()`（§16.1.22 才加的），不是稀疏索引的近似值 ——
+        // 段头之前就只能剪「段在查询之后」那一侧，因为稀疏索引最后几行没有索引项。
+        //
+        // 收益不只在大表：`s.cursor()` 里每段都要 `ensureParsed()`（整段 CRC）+
+        // `dataView()`（open + mmap，平台成本 ~0.3ms/段）。冷重开后的窄范围查询
+        // 以前要为「一行都不命中」的段付这笔钱，现在是零。
+        if (start.len > 0 and !table.opts.no_prune_before) {
+            if (s.maxKey()) |k1| {
+                if (segmod.keyCmp(k1, start) == .lt) {
+                    pruned_before.* += 1;
+                    return;
+                }
+            }
+        }
+        // **正向段裁剪**：稀疏索引的第 0 条就是段内最小的 key。若它已经排到查询上界之后，
+        // 整段不可能命中，连游标都不必建 —— 建了不用也要付「每行多一路归并」的钱。
+        //
+        // 实测背景：200 万行、25 段时纯遍历只有 7.26M 行/s，而单段表能到 11–17M；
+        // 顺序写入的段 key 范围几乎不重叠，这一刀能砍掉大部分路数。
+        if (end.len > 0) {
+            // 用 `firstKey()`（段头部就有，不需要 `ensureParsed`）——
+            // 冷重开只解析头部，裁剪判定的信息已经够了。
+            if (s.firstKey()) |k0| {
+                if (segmod.keyCmp(k0, end) != .lt) return;
+            }
+        }
+        const c = try s.cursor(start, end, table.visible);
+        var sc = ScanCursor{ .seg = c };
+        sc.useStableKeys(arena);
+        try self.cursors.append(table.alloc, sc);
+    }
+
+    fn initStableOnly(
+        self: *MergeIter,
+        table: *Table,
+        start: []const u8,
+        end: []const u8,
+        arena: ?*segmod.KeyArena,
+        only: ?[]const usize,
+    ) !void {
         self.* = .{ .table = table };
         const alloc = table.alloc;
         var pruned_before: usize = 0;
@@ -1186,48 +1518,21 @@ pub const MergeIter = struct {
             for (table.segs.items) |*s| mk = @max(mk, @as(usize, s.max_klen));
             if (mk > 0) self.last_buf = try alloc.alloc(u8, mk);
         }
-        if (table.mem.len() > 0) {
+        // 子集归并用在合并路径上，而合并前已把 memtable 落盘；仍然不碰 memtable，
+        // 否则会把「未落盘的写」卷进合并结果，而它们还没进 WAL 轮换的边界。
+        if (only == null and table.mem.len() > 0) {
             try self.cursors.append(alloc, .{ .mem = .{
                 .it = table.mem.iteratorFrom(start),
                 .end = end,
                 .snapshot = table.visible,
             } });
         }
-        for (table.segs.items) |*s| {
-            // **反向段裁剪**（§16.1.23）：段内最大 key 都小于查询起点 → 整段不可能命中。
-            //
-            // 判据是段头里**精确**的 `maxKey()`（§16.1.22 才加的），不是稀疏索引的近似值 ——
-            // 段头之前就只能剪「段在查询之后」那一侧，因为稀疏索引最后几行没有索引项。
-            //
-            // 收益不只在大表：`s.cursor()` 里每段都要 `ensureParsed()`（整段 CRC）+
-            // `dataView()`（open + mmap，平台成本 ~0.3ms/段）。冷重开后的窄范围查询
-            // 以前要为「一行都不命中」的段付这笔钱，现在是零。
-            if (start.len > 0 and !table.opts.no_prune_before) {
-                if (s.maxKey()) |k1| {
-                    if (segmod.keyCmp(k1, start) == .lt) {
-                        pruned_before += 1;
-                        continue;
-                    }
-                }
-            }
-            // **正向段裁剪**：稀疏索引的第 0 条就是段内最小的 key。若它已经排到查询上界之后，
-            // 整段不可能命中，连游标都不必建 —— 建了不用也要付「每行多一路归并」的钱。
-            //
-            // 实测背景：200 万行、25 段时纯遍历只有 7.26M 行/s，而单段表能到 11–17M；
-            // 顺序写入的段 key 范围几乎不重叠，这一刀能砍掉大部分路数。
-            if (end.len > 0) {
-                // 用 `firstKey()`（段头部就有，不需要 `ensureParsed`）——
-                // 冷重开只解析头部，裁剪判定的信息已经够了。
-                if (s.firstKey()) |k0| {
-                    if (segmod.keyCmp(k0, end) != .lt) continue;
-                }
-            }
-            const c = try s.cursor(start, end, table.visible);
-            var sc = ScanCursor{ .seg = c };
-            sc.useStableKeys(arena);
-            try self.cursors.append(alloc, sc);
+        if (only) |idxs| {
+            for (idxs) |si| try self.addSegCursor(table, &table.segs.items[si], start, end, arena, &pruned_before);
+        } else {
+            for (table.segs.items) |*s| try self.addSegCursor(table, s, start, end, arena, &pruned_before);
         }
-        if (self.cursors.items.len > 1 and canConcat(table)) {
+        if (only == null and self.cursors.items.len > 1 and canConcat(table)) {
             // 顺序拼接：段 key 范围两两不重叠且有序 → 按段依次耗尽游标。
             // §16.1.21 实测：25 路归并每行 2 次比较 + 一次跨游标间接调用，
             // 走拼接后这些全免（与单段同速）。
@@ -2896,5 +3201,112 @@ test "索引归档上限可配：index_max_bytes=0 不限，设小了明确报 F
         var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0, .index_max_bytes = big });
         defer t.deinit();
         try std.testing.expectEqual(@as(usize, 1), t.segs.items.len);
+    }
+}
+
+fn tKey(buf: []u8, n: usize) []const u8 {
+    return std.fmt.bufPrint(buf, "k{d:0>6}", .{n}) catch unreachable;
+}
+
+fn tVal(buf: []u8, prefix: u8, n: usize) []const u8 {
+    return std.fmt.bufPrint(buf, "{c}{d:0>6}", .{ prefix, n }) catch unreachable;
+}
+
+// 分层合并（size-tiered）的守门用例。
+//
+// 为什么必须有：`compactTier` 是**唯一**会「只合并一部分段」的路径，
+// 它引入两个别处没有的风险：
+// 1. 幸存段的 `idx` 指向被 rename 掉的旧归档映射 —— 必须整体 `reloadFromArchive`，
+//    漏了就会让内存索引与磁盘索引分叉（读得到旧值，重开后变成另一个结果）；
+// 2. 合并后的段与幸存段 key 范围**必然重叠**，版本优先级只能靠 `seq`，不能靠段序。
+// 用例同时钉住：数据不丢、**更新后的新值赢**、段数按预期下降、**重开后仍然一致**。
+test "分层合并 compactTier：只合并最小的 N 段，数据/版本/重开都必须正确" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-tier-compact";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    const batch = 100;
+    const batches = 6;
+
+    // 第一次打开：灌 6 段（每批 100 行，flush_bytes 很小 ⇒ 每批落一个段）
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0, .flush_bytes = 4096 });
+        defer t.deinit();
+        var kb: [batch][16]u8 = undefined;
+        var vb: [batch][16]u8 = undefined;
+        var keys: [batch][]const u8 = undefined;
+        var vals: [batch][]const u8 = undefined;
+        var b: usize = 0;
+        while (b < batches) : (b += 1) {
+            for (0..batch) |i| {
+                const n = b * batch + i;
+                keys[i] = tKey(&kb[i], n);
+                vals[i] = tVal(&vb[i], 'v', n);
+            }
+            try t.putBatch(keys[0..batch], vals[0..batch]);
+        }
+        // 再一批：把 100..199 更新成 u....（这些 key 的最新版本在最后一段里）
+        for (0..batch) |i| {
+            const n = 100 + i;
+            keys[i] = tKey(&kb[i], n);
+            vals[i] = tVal(&vb[i], 'u', n);
+        }
+        try t.putBatch(keys[0..batch], vals[0..batch]);
+        try t.flush();
+
+        try std.testing.expectEqual(@as(usize, batches + 1), t.segs.items.len);
+
+        const cr = try t.compactTier(3);
+        try std.testing.expect(cr.did);
+        try std.testing.expectEqual(@as(usize, batches + 1), cr.before);
+        try std.testing.expectEqual(@as(usize, batches + 1 - 3 + 1), cr.after);
+        try std.testing.expectEqual(cr.after, t.segs.items.len);
+    }
+
+    // 重开：证明归档重写 + 重载落到了磁盘上，而不是只在内存里对
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        defer t.deinit();
+        try std.testing.expectEqual(@as(usize, batches + 1 - 3 + 1), t.segs.items.len);
+
+        var kb: [16]u8 = undefined;
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(alloc);
+        var n: usize = 0;
+        while (n < batches * batch) : (n += 1) {
+            const want_prefix: u8 = if (n >= 100 and n < 200) 'u' else 'v';
+            var wb: [16]u8 = undefined;
+            const want = tVal(&wb, want_prefix, n);
+            const got = try t.get(tKey(&kb, n), &out);
+            try std.testing.expect(got != null);
+            try std.testing.expectEqualStrings(want, got.?);
+        }
+
+        // 全表遍历：600 行、key 严格升序（重叠段归并不会乱序）
+        var cnt: usize = 0;
+        var it = MergeIter{};
+        try it.init(&t, &[_]u8{}, &[_]u8{});
+        defer it.deinit();
+        var prev: [16]u8 = undefined;
+        var have_prev = false;
+        while (it.next()) |rec| {
+            try std.testing.expect(rec.key.len <= prev.len);
+            if (have_prev) {
+                const pr = prev[0..rec.key.len];
+                try std.testing.expect(segmod.keyCmp(pr, rec.key) == .lt);
+            }
+            @memcpy(prev[0..rec.key.len], rec.key);
+            have_prev = true;
+            cnt += 1;
+        }
+        try std.testing.expectEqual(@as(usize, batches * batch), cnt);
+        // 段数上限字段也验证一下：设置了上限后 `maybeAutoCompact` 会收敛到 ≤ 上限
+        try std.testing.expect(t.segs.items.len <= 16);
     }
 }

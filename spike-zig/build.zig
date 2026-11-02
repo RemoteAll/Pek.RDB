@@ -83,12 +83,17 @@ pub fn build(b: *std.Build) void {
     const scale_data_prefault = b.option(u64, "scale-data-prefault", "run-scale: prefault data mmap when file <= N bytes (0 = never)") orelse 0;
     // 持久化档：true = 每批 fsync（最强）；false = 只写进 OS 缓存（与 SQLite synchronous=NORMAL 对齐）。
     const scale_durable = b.option(bool, "scale-durable", "run-scale: fsync before commit returns (false = SQLite NORMAL equivalent)") orelse true;
+    // 分层合并（容量线②）：段数超过 max 就合并最小的 fanout 个段。0 = 关闭。
+    const scale_tiered_max = b.option(u64, "scale-tiered-max", "run-scale: tiered compaction segment cap (0 = off)") orelse 0;
+    const scale_tiered_fanout = b.option(u64, "scale-tiered-fanout", "run-scale: tiered compaction fanout") orelse 4;
     const scale_opts = b.addOptions();
     scale_opts.addOption(u64, "rows", scale_rows);
     scale_opts.addOption([]const u8, "dir", scale_dir);
     scale_opts.addOption(u64, "flush_bytes", scale_flush);
     scale_opts.addOption(u64, "data_prefault", scale_data_prefault);
     scale_opts.addOption(bool, "durable", scale_durable);
+    scale_opts.addOption(u64, "tiered_max", scale_tiered_max);
+    scale_opts.addOption(u64, "tiered_fanout", scale_tiered_fanout);
     const scale_exe = b.addExecutable(.{
         .name = "spike-scale",
         .root_module = b.createModule(.{
