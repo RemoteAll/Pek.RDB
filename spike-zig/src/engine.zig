@@ -1061,6 +1061,94 @@ test "JOIN：INNER/LEFT、ON 反向、索引路径、裸名歧义、不支持的
     try std.testing.expectError(error.UnexpectedToken, queryRows(&eng, alloc, "SELECT t.id FROM t JOIN u ON t.uid > u.id"));
 }
 
+// JOIN 的边界与「以前会静默」的形态：`*` 投影、1:N 多匹配、LEFT+WHERE 滤 NULL、
+// 空表、JOIN 与 `LIMIT ?` 组合、ORDER BY 列不存在、JOIN+GROUP BY。
+test "JOIN 边界：* 投影 / 1:N / LEFT+WHERE / 空表 / LIMIT ? / 错误形态" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const root = "test-engine-join-edge";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    var eng = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    defer eng.deinit();
+
+    try run(&eng, alloc, "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER NOT NULL)");
+    try run(&eng, alloc, "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER NOT NULL, v TEXT NOT NULL)");
+    try run(&eng, alloc, "CREATE TABLE empty_t (id INTEGER PRIMARY KEY, k INTEGER NOT NULL)");
+    try run(&eng, alloc, "INSERT INTO a (id, k) VALUES (1, 7), (2, 8)");
+    // b 里 k=7 有两行（1:N），k=9 没有对应左行
+    try run(&eng, alloc, "INSERT INTO b (id, k, v) VALUES (10, 7, 'x'), (11, 7, 'y'), (12, 9, 'z')");
+
+    // `*` 投影：合成 schema 是 2 + 3 = 5 列，列名带表名限定
+    {
+        var rows = try queryRows(&eng, alloc, "SELECT * FROM a JOIN b ON a.k = b.k ORDER BY a.id, b.id");
+        defer rows.deinit();
+        // a 的 k 只有 7/8；b 里 k=7 两行、k=9 一行 ⇒ INNER 只匹配到 2 行
+        // （a.id=2 的 k=8 在 b 里没有，k=9 在 a 里没有）
+        try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
+        try std.testing.expectEqual(@as(usize, 5), rows.columns.len);
+        try std.testing.expectEqualStrings("a.id", rows.columns[0]);
+        try std.testing.expectEqualStrings("b.v", rows.columns[4]);
+    }
+
+    // 1:N：a.id=1 匹配 b 的两行，都要出现
+    {
+        var rows = try queryRows(&eng, alloc, "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k WHERE a.id = 1 ORDER BY b.id");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
+        try std.testing.expectEqual(@as(i64, 10), rows.rows[0][1].integer);
+        try std.testing.expectEqual(@as(i64, 11), rows.rows[1][1].integer);
+    }
+
+    // LEFT JOIN + WHERE：补出来的 NULL 行会被 `b.v = 'x'` 滤掉（SQL 语义）
+    {
+        var rows = try queryRows(&eng, alloc, "SELECT a.id, b.v FROM a LEFT JOIN b ON a.k = b.k WHERE b.v = 'x'");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+        try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
+    }
+    // 同一 SQL 去掉 WHERE：a.id=2 那行右表列是 NULL
+    {
+        var rows = try queryRows(&eng, alloc, "SELECT a.id, b.v FROM a LEFT JOIN b ON a.k = b.k ORDER BY a.id, b.id");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 3), rows.rows.len);
+        try std.testing.expect(rows.rows[2][1] == .null);
+    }
+
+    // 空表：INNER ⇒ 0 行；LEFT ⇒ 左表行 + 全 NULL
+    {
+        var rows = try queryRows(&eng, alloc, "SELECT a.id FROM a JOIN empty_t ON a.k = empty_t.k");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 0), rows.rows.len);
+    }
+    {
+        var rows = try queryRows(&eng, alloc, "SELECT a.id, empty_t.id FROM a LEFT JOIN empty_t ON a.k = empty_t.k ORDER BY a.id");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
+        try std.testing.expect(rows.rows[0][1] == .null);
+    }
+
+    // JOIN 与 `LIMIT ?` 组合（参数绑定走 executeWithParams，JOIN 走自己的派发）
+    {
+        var p = try sql.parse(alloc, "SELECT a.id FROM a JOIN b ON a.k = b.k ORDER BY a.id, b.id LIMIT ?");
+        defer p.deinit();
+        const params = [_]sql.Value{.{ .integer = 2 }};
+        const res = try eng.executeWithParams(p.stmt, &params, alloc);
+        var rows = res.rows;
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 2), rows.rows.len);
+    }
+
+    // 两处「以前会静默」的形态现在必须报错
+    try std.testing.expectError(error.ColumnNotFound, queryRows(&eng, alloc, "SELECT a.id FROM a JOIN b ON a.k = b.k ORDER BY nosuchcol"));
+    try std.testing.expectError(error.UnsupportedStatement, queryRows(&eng, alloc, "SELECT a.id FROM a JOIN b ON a.k = b.k GROUP BY a.id"));
+}
+
 fn keyArrLess(_: void, a: [16]u8, b: [16]u8) bool {
     return std.mem.order(u8, &a, &b) == .lt;
 }

@@ -278,8 +278,18 @@ fn pkOrderOnly(s: *const schema_mod.Schema, order: []const sql.OrderItem) ?bool 
     return order[0].desc;
 }
 
+/// 排序前校验 `ORDER BY` 的每一列都能解析到。
+///
+/// 为什么必须有：`rowLess` 是排序比较器，**不能返回错误**，解析失败只能退化成
+/// 「相等」⇒ 整条 ORDER BY 静默失效（结果顺序乱但不报错）。这一层把错误提前报出来。
+fn validateOrderBy(s: *const schema_mod.Schema, order: []const sql.OrderItem) !void {
+    for (order) |o| _ = try resolveColumn(s, o.column);
+}
+
 fn rowLess(ctx: SortCtx, a: []sql.Value, b: []sql.Value) bool {
     for (ctx.order) |o| {
+        // 解析已在 `validateOrderBy` 里做过；这里退化成 false 只是防御（排序比较器
+        // 不能返回错误），不会静默漏列的根因已经挡住了。
         const idx = resolveColumn(ctx.schema, o.column) catch return false;
         const ord = schema_mod.valueCmp(a[idx], b[idx]);
         if (ord == .eq) continue;
@@ -592,6 +602,9 @@ pub fn selectJoin(
     alloc: std.mem.Allocator,
 ) !Rows {
     const jc = sel.join orelse return error.UnsupportedStatement;
+    // `GROUP BY` / `HAVING` 在 JOIN 路径没实现：不拦的话会被**完全忽略**，
+    // 静默返回未分组的明细行（投影里的聚合项则会由 buildProjection 报错）。
+    if (sel.group_by.len > 0 or sel.having != null) return error.UnsupportedStatement;
 
     const l = try resolveJoinSide(jc.left, left.name, right.name, left.schema, right.schema);
     const r = try resolveJoinSide(jc.right, left.name, right.name, left.schema, right.schema);
@@ -670,6 +683,8 @@ fn finishFromRows(
     rows: []const []sql.Value,
 ) !Rows {
     var t0 = stamp(io);
+    // 排序前列校验：比较器不能返回错误，解析失败会静默变成「不排序」
+    try validateOrderBy(s, sel.order_by);
     const proj = try buildProjection(alloc, s, sel.items);
     if (timing_enabled) {
         const t1 = stamp(io);
@@ -1322,6 +1337,8 @@ fn finishFromValues(
     src: []const []const u8,
 ) !Rows {
     var t0 = stamp(io);
+    // 排序前列校验：比较器不能返回错误，解析失败会静默变成「不排序」
+    try validateOrderBy(s, sel.order_by);
     const proj = try buildProjection(alloc, s, sel.items);
     if (timing_enabled) {
         const t1 = stamp(io);
