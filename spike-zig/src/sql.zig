@@ -30,6 +30,8 @@ pub const TokenTag = enum {
     ge,
     minus,
     plus,
+    /// `?` —— 无编号占位符，**按出现顺序** 1-based 编号（与 SQLite 对裸 `?` 的语义一致）
+    question,
 };
 
 pub const Token = struct {
@@ -119,6 +121,10 @@ pub const Lexer = struct {
             '\'' => return self.lexString(),
             '"', '`' => return self.lexQuotedIdent(c),
             '[' => return self.lexBracketIdent(),
+            '?' => {
+                self.pos += 1;
+                return .{ .tag = .question, .text = "?" };
+            },
             else => {},
         }
         if (std.ascii.isAlphabetic(c) or c == '_') return self.lexIdent();
@@ -297,6 +303,12 @@ pub const Select = struct {
     order_by: []OrderItem = &.{},
     limit: ?u32 = null,
     offset: ?u32 = null,
+    /// `LIMIT ?` / `OFFSET ?`：存**参数序号**（1-based），取值推迟到执行时（`Engine.executeWithParams`）。
+    /// 0 = 不是占位符。与 `limit`/`offset` 互斥（parser 只会设其中一个）——
+    /// 增加两个字段而不是把 `limit` 改成 union，是为了不改动几十处已有的
+    /// `.limit = 10` 构造点。
+    limit_param: u8 = 0,
+    offset_param: u8 = 0,
 };
 
 pub const Assign = struct {
@@ -339,6 +351,8 @@ const Parser = struct {
     arena: std.mem.Allocator,
     lexer: Lexer,
     tok: Token = .{ .tag = .eof, .text = "" },
+    /// 已出现的 `?` 个数：下一个占位符的序号就是 `param_seq + 1`。
+    param_seq: u8 = 0,
 
     /// SQL 字符串字面量里的 '' 表示一个单引号；复制到 arena 时还原。
     fn dupUnescaped(arena: std.mem.Allocator, text: []const u8) Error![]const u8 {
@@ -358,6 +372,16 @@ const Parser = struct {
 
     fn advance(self: *Parser) Error!void {
         self.tok = try self.lexer.next();
+    }
+
+    /// 取下一个 `?` 的序号（1-based）。
+    ///
+    /// 目前只有 `LIMIT ?` / `OFFSET ?` 用得到；其它位置的 `?` 会被 `expectTag`/
+    /// `parseValue` 报 `UnexpectedToken`（即「不支持」），**不会静默当成值**。
+    fn nextParam(self: *Parser) Error!u8 {
+        if (self.param_seq == std.math.maxInt(u8)) return error.UnsupportedStatement;
+        self.param_seq += 1;
+        return self.param_seq;
     }
 
     fn isKw(tok: Token, kw: []const u8) bool {
@@ -725,11 +749,22 @@ const Parser = struct {
         }
 
         if (try self.acceptKw("limit")) {
-            const t = try self.expectTag(.number);
-            sel.limit = std.fmt.parseInt(u32, t.text, 10) catch return error.InvalidNumber;
+            // `LIMIT ?`：只记序号，值在执行时给（同一条语句可换参数反复执行）
+            if (self.tok.tag == .question) {
+                try self.advance();
+                sel.limit_param = try self.nextParam();
+            } else {
+                const t = try self.expectTag(.number);
+                sel.limit = std.fmt.parseInt(u32, t.text, 10) catch return error.InvalidNumber;
+            }
             if (try self.acceptKw("offset")) {
-                const o = try self.expectTag(.number);
-                sel.offset = std.fmt.parseInt(u32, o.text, 10) catch return error.InvalidNumber;
+                if (self.tok.tag == .question) {
+                    try self.advance();
+                    sel.offset_param = try self.nextParam();
+                } else {
+                    const o = try self.expectTag(.number);
+                    sel.offset = std.fmt.parseInt(u32, o.text, 10) catch return error.InvalidNumber;
+                }
             }
         }
 
@@ -887,6 +922,47 @@ test "parse create table" {
             try std.testing.expect(c.columns[1].not_null);
         },
         else => return error.TestUnexpectedResult,
+    }
+}
+
+// `LIMIT ?` / `OFFSET ?`：parser 只记**序号**（按出现顺序 1-based），不取值。
+// 若在 parse 阶段就把值固化，「同一 AST 换参数复用」就不成立了。
+test "parse limit offset placeholders" {
+    {
+        var p = try parse(std.testing.allocator, "SELECT * FROM t LIMIT ?");
+        defer p.deinit();
+        switch (p.stmt) {
+            .select => |s| {
+                try std.testing.expectEqual(@as(u8, 1), s.limit_param);
+                try std.testing.expectEqual(@as(u8, 0), s.offset_param);
+                try std.testing.expect(s.limit == null);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    {
+        var p = try parse(std.testing.allocator, "SELECT * FROM t LIMIT ? OFFSET ?");
+        defer p.deinit();
+        switch (p.stmt) {
+            .select => |s| {
+                try std.testing.expectEqual(@as(u8, 1), s.limit_param);
+                try std.testing.expectEqual(@as(u8, 2), s.offset_param); // 第二个 `?`
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    // 字面值仍走原路径：不再有占位符序号
+    {
+        var p = try parse(std.testing.allocator, "SELECT * FROM t LIMIT 7 OFFSET 3");
+        defer p.deinit();
+        switch (p.stmt) {
+            .select => |s| {
+                try std.testing.expectEqual(@as(u8, 0), s.limit_param);
+                try std.testing.expectEqual(@as(u32, 7), s.limit.?);
+                try std.testing.expectEqual(@as(u32, 3), s.offset.?);
+            },
+            else => return error.TestUnexpectedResult,
+        }
     }
 }
 

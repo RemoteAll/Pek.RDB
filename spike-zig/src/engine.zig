@@ -487,6 +487,15 @@ pub const Engine = struct {
     }
 
     pub fn execute(self: *Engine, stmt: sql.Statement, alloc: std.mem.Allocator) !Result {
+        return self.executeWithParams(stmt, null, alloc);
+    }
+
+    /// 带参数的执行入口（目前只有 `LIMIT ?` / `OFFSET ?` 用得上）。
+    ///
+    /// `params` 按**占位符出现顺序** 1-based 对应；`null` 等价于 `&.{}`。
+    /// 设计上只把「取值的时机」推到执行时：同一条 AST 可以换不同参数反复执行，
+    /// 无需重解析（SQLite 的 `sqlite3_bind_*` 就是这个形状）。
+    pub fn executeWithParams(self: *Engine, stmt: sql.Statement, params: ?[]const sql.Value, alloc: std.mem.Allocator) !Result {
         switch (stmt) {
             .create_table => |def| return .{ .created = try self.createTable(def) },
             .create_index => |def| return .{ .created = try self.createIndex(def) },
@@ -495,7 +504,11 @@ pub const Engine = struct {
                 var host = exec.IndexHost{ .schema = &e.schema, .tables = &e.idx_tables };
                 return .{ .inserted = try exec.insertRowsHost(&e.table, &e.schema, ins, alloc, &host) };
             },
-            .select => |sel| {
+            .select => |sel_in| {
+                var sel = sel_in;
+                // **`params == null` 也要过一遍解析**：否则 `LIMIT ?` 会因 `limit == null`
+                // 而静默返回全部行（把「忘了绑参数」变成「翻页失效」这种难查的 bug）。
+                try applyLimitParams(&sel, params orelse &[_]sql.Value{});
                 const e = self.tables.getPtr(sel.table) orelse return error.TableNotFound;
                 var host = exec.IndexHost{ .schema = &e.schema, .tables = &e.idx_tables };
                 return .{ .rows = try exec.selectRowsHost(&e.table, &e.schema, sel, alloc, &host) };
@@ -847,6 +860,27 @@ test "二级索引：关闭重开后仍走索引；崩在回填中途会重建�
     }
 }
 
+/// 把 `LIMIT ?` / `OFFSET ?` 的参数序号解析成具体值（字面值原样保留）。
+fn applyLimitParams(sel: *sql.Select, params: []const sql.Value) !void {
+    if (sel.limit_param != 0) sel.limit = try paramAsCount(params, sel.limit_param);
+    if (sel.offset_param != 0) sel.offset = try paramAsCount(params, sel.offset_param);
+}
+
+/// 参数必须是**非负整数**且 ≤ `u32` 上限。
+///
+/// 拒绝浮点/文本而不是做隐式转换：SQLite 对 `LIMIT 'abc'` 同样报错，
+/// 而「悄悄取整」会把调用方的类型 bug 变成很难查的翻页错位。
+fn paramAsCount(params: []const sql.Value, idx: u8) !u32 {
+    if (idx == 0 or idx > params.len) return error.MissingParameter;
+    return switch (params[idx - 1]) {
+        .integer => |x| blk: {
+            if (x < 0 or x > std.math.maxInt(u32)) break :blk error.ParameterOutOfRange;
+            break :blk @as(u32, @intCast(x));
+        },
+        else => error.ParameterTypeMismatch,
+    };
+}
+
 fn run(eng: *Engine, alloc: std.mem.Allocator, text: []const u8) !void {
     var p = try sql.parse(alloc, text);
     defer p.deinit();
@@ -867,6 +901,66 @@ fn expectIds(eng: *Engine, alloc: std.mem.Allocator, g: i64, want: []const i64) 
     defer rows.deinit();
     try std.testing.expectEqual(want.len, rows.rows.len);
     for (rows.rows, want) |r, w| try std.testing.expectEqual(w, r[0].integer);
+}
+
+// `LIMIT ?` / `OFFSET ?` 参数绑定：占位符只记序号，取值推迟到执行时。
+// 这条用例同时钉住「同一份 AST 换参数反复执行」——若在 parse 阶段就把值固化，
+// 这里第二条 case 会拿到和第一条一样的结果。
+test "LIMIT/OFFSET 占位符：取值、顺序、错误、同 AST 复用" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const root = "test-engine-limit-param";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    var eng = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    defer eng.deinit();
+
+    try run(&eng, alloc, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)");
+    try run(&eng, alloc, "INSERT INTO t (id, v) VALUES (1,10),(2,20),(3,30),(4,40),(5,50)");
+
+    var p = try sql.parse(alloc, "SELECT id FROM t ORDER BY id LIMIT ? OFFSET ?");
+    defer p.deinit();
+
+    const cases = [_]struct { lim: i64, off: i64, want: []const i64 }{
+        .{ .lim = 2, .off = 0, .want = &.{ 1, 2 } },
+        .{ .lim = 2, .off = 2, .want = &.{ 3, 4 } },
+        .{ .lim = 10, .off = 3, .want = &.{ 4, 5 } },
+        .{ .lim = 0, .off = 0, .want = &.{} },
+    };
+    for (cases) |c| {
+        const params = [_]sql.Value{ .{ .integer = c.lim }, .{ .integer = c.off } };
+        const res = try eng.executeWithParams(p.stmt, &params, alloc);
+        var rows = res.rows;
+        defer rows.deinit();
+        try std.testing.expectEqual(c.want.len, rows.rows.len);
+        for (rows.rows, c.want) |r, w| try std.testing.expectEqual(w, r[0].integer);
+    }
+
+    // 参数个数不足 / 类型错 / 负数 / 超 u32：都必须报错，不能悄悄当 0 或截断
+    const one = [_]sql.Value{.{ .integer = 2 }};
+    try std.testing.expectError(error.MissingParameter, eng.executeWithParams(p.stmt, &one, alloc));
+    const bad_type = [_]sql.Value{ .{ .text = "2" }, .{ .integer = 0 } };
+    try std.testing.expectError(error.ParameterTypeMismatch, eng.executeWithParams(p.stmt, &bad_type, alloc));
+    const negative = [_]sql.Value{ .{ .integer = -1 }, .{ .integer = 0 } };
+    try std.testing.expectError(error.ParameterOutOfRange, eng.executeWithParams(p.stmt, &negative, alloc));
+    const too_big = [_]sql.Value{ .{ .integer = @as(i64, 1) << 40 }, .{ .integer = 0 } };
+    try std.testing.expectError(error.ParameterOutOfRange, eng.executeWithParams(p.stmt, &too_big, alloc));
+
+    // 不带参数的 `execute` 遇到占位符也必须报错（否则会静默返回全部行）
+    try std.testing.expectError(error.MissingParameter, eng.execute(p.stmt, alloc));
+
+    // 字面 LIMIT 不受影响
+    var p2 = try sql.parse(alloc, "SELECT id FROM t ORDER BY id LIMIT 3");
+    defer p2.deinit();
+    const res2 = try eng.execute(p2.stmt, alloc);
+    var rows2 = res2.rows;
+    defer rows2.deinit();
+    try std.testing.expectEqual(@as(usize, 3), rows2.rows.len);
 }
 
 fn keyArrLess(_: void, a: [16]u8, b: [16]u8) bool {
