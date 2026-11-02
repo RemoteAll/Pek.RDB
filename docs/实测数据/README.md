@@ -337,6 +337,8 @@ powershell -File tools\abba-verdict.ps1 -Tag <标签> -Date <日期>
 
 | 批次 | 内容 |
 |---|---|
+| `zig/sqlite-2026-11-02-p22` | **索引回填改造后的正式结论**（3 轮 ABBA）：`sql_index_build` **1.433×（3/3）**（p20 是 0.633×）、`sql_index_eq` 3.861×、索引落盘 15,125,000 B 未变；全批 **28 胜 / 0 负 / 1 未决**（`scan_refs` 1.174×，其中一轮 0.997×） |
+| `zig/sqlite-2026-11-02-p21` | 索引回填第一步（跳过 WAL/memtable + 投影解码）：`sql_index_build` 0.862×（1/3）→ 未决；全批 26 胜 / 0 负 / 3 未决 |
 | `zig/sqlite-2026-11-01-p20` | **二级索引首次实测**（3 轮 ABBA）：`sql_index_eq` **3.025×**（3/3）、索引落盘大 1.30×、**`sql_index_build` 0.633×（落后，如实列出）**；全批 26 胜 / 1 负 / 2 未决；digest `25,379,000` 三轮两侧全同、`readrows` 恒 0；中位 spread 1.106 / 1.143 |
 | `zig/sqlite-2026-11-01-p19` | **HAVING + top-N 首次实测**（3 轮 ABBA）：`sql_having_top10` 1.769×；全批 27 胜 / 0 负 / 0 未决；中位 spread 1.056（我方）/ 1.082（SQLite），比 p18 的 1.122/1.103 更稳 |
 | `zig/sqlite-2026-11-01-p18` | **SQL 聚合 / GROUP BY 首次实测**（3 轮 ABBA）：`sql_group_by` 1.547×、`sql_agg_full` 1.306×；全批 26 胜 / 0 负 / **0 未决**；两侧 digest 与单值校验项全部相等；落盘 33.76 vs 14.62 B/行（我方多 2.31×） |

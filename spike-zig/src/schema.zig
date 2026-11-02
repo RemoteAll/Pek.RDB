@@ -313,27 +313,42 @@ pub const Schema = struct {
     }
 };
 
+/// 把「8 字节定长」的值分量写进 `dst`（数值型：integer/bigint/datetime/real/double）。
+///
+/// 返回 `false` 表示不是数值型，调用方走通用路径（text/blob 是变长 + 转义）。
+/// **存在的意义是消除重复实现**：`appendValueComponent` 与索引回填的快路径都用它，
+/// 两处各写一份迟早会不一致，而不一致的后果是「索引键顺序与行键顺序不同」→ 查出来漏行。
+pub fn writeFixedComponent(dst: *[8]u8, v: sql.Value) bool {
+    switch (v) {
+        .integer => |x| {
+            codec.encodeI64Key(dst, x);
+            return true;
+        },
+        .real => |x| {
+            var bits: u64 = @bitCast(x);
+            bits = if ((bits >> 63) != 0) ~bits else bits | 0x8000_0000_0000_0000;
+            std.mem.writeInt(u64, dst, bits, .big);
+            return true;
+        },
+        else => return false,
+    }
+}
+
 /// 单个值分量编码：**顺序保持 + 自定界**（数值 8 字节定长；text/blob 转义后以 `0x00 0x01` 收尾）。
 ///
 /// 主键与二级索引键共用这一份 —— 两处各写一遍迟早会不一致，而不一致的后果是
 /// 「索引键的前缀比较与行键比较得出不同顺序」，查出来的结果就会漏行或乱序。
 fn appendValueComponent(out: *std.ArrayList(u8), alloc: std.mem.Allocator, v: sql.Value) !void {
+    var fixed: [8]u8 = undefined;
+    if (writeFixedComponent(&fixed, v)) {
+        try out.appendSlice(alloc, &fixed);
+        return;
+    }
     switch (v) {
         .null => return error.TypeMismatch,
-        .integer => |x| {
-            var b: [8]u8 = undefined;
-            codec.encodeI64Key(&b, x);
-            try out.appendSlice(alloc, &b);
-        },
-        .real => |x| {
-            var bits: u64 = @bitCast(x);
-            bits = if ((bits >> 63) != 0) ~bits else bits | 0x8000_0000_0000_0000;
-            var b: [8]u8 = undefined;
-            std.mem.writeInt(u64, &b, bits, .big);
-            try out.appendSlice(alloc, &b);
-        },
         .text => |s| try Schema.escapeComponent(out, alloc, s, true),
         .blob => |s| try Schema.escapeComponent(out, alloc, s, true),
+        else => unreachable, // 数值型已在上面处理
     }
 }
 

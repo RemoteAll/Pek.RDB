@@ -35,6 +35,52 @@ fn lessStr(_: void, a: []const u8, b: []const u8) bool {
 ///
 /// `pub` 是为了让基准/工具能直接建索引而不必绕过 `Engine`：
 /// 生产路径一律走 `Engine.createIndex`（它会先落 `.building` 标记再调这里）。
+///
+/// **三步：流式扫表 → 排序 → 一次写成段**（对齐 SQLite `CREATE INDEX` 与
+/// RocksDB 批量装载的形状）。旧实现是「先 `scanValues` 把整表原始行抄进内存，
+/// 再逐行 `put`」，两个问题：
+/// 1. 逐行 `put` = 每行一次 WAL 编码 + 一次跳表插入，实测索引构建只有 SQLite 的 0.633×；
+/// 2. `scanValues` 把整表值抄一份，1 亿行时是 3.9 GB —— 建索引会直接把内存打爆。
+/// 现在只保留「索引键」（~20 B/行）并用 arena 一次性分配，排序后直接喂 `bulkLoadSorted`。
+/// 索引回填的三阶段耗时（纳秒）。**不是性能指标本身**，是用来回答
+/// 「索引建得慢」到底慢在哪一步（扫表解码 / 排序 / 写段）的证据。
+pub const FillPhases = struct {
+    scan_ns: u64 = 0,
+    sort_ns: u64 = 0,
+    write_ns: u64 = 0,
+    rows: usize = 0,
+};
+
+fn monoNs(io: std.Io) u64 {
+    return @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
+}
+
+/// 排序元素：`key` 的前 8 字节另外存一份（`pre`）。
+///
+/// 为什么要多存 8 字节：索引键 = 「值分量 ++ 主键分量」，而数值型值分量是
+/// **8 字节大端定长、顺序保持**的（见 `schema.appendValueComponent`），
+/// 所以绝大多数比较在 `pre` 上就能分出胜负 —— 不用去解引用两个散落在 arena 里的
+/// key 切片（那才是 1M 条排序里 20M 次比较真正的开销）。
+/// `pre` 相等时才回退到全键比较，所以对任意 key（含 text/blob）都是正确的。
+const KeyItem = struct {
+    pre: u64,
+    key: []const u8,
+};
+
+/// key 的前 8 字节左对齐大端值（不足 8 字节用 0 填充）。
+/// 零填充只是为了让「前缀相同」时 `pre` 相等并回到全键比较，不影响正确性。
+fn prefix8(k: []const u8) u64 {
+    var b: [8]u8 = @splat(0);
+    const n = @min(k.len, 8);
+    @memcpy(b[0..n], k[0..n]);
+    return std.mem.readInt(u64, &b, .big);
+}
+
+fn keyItemLess(_: void, a: KeyItem, b: KeyItem) bool {
+    if (a.pre != b.pre) return a.pre < b.pre;
+    return std.mem.order(u8, a.key, b.key) == .lt;
+}
+
 pub fn fillIndex(
     alloc: std.mem.Allocator,
     it: *tablemod.Table,
@@ -42,25 +88,219 @@ pub fn fillIndex(
     base: *tablemod.Table,
     ix: schema_mod.IndexDef,
 ) !void {
-    var hi: [16]u8 = @splat(0xFF);
-    var vals: std.ArrayList([]const u8) = .empty;
-    defer vals.deinit(alloc);
-    try base.scanValues(&[_]u8{}, &hi, &vals);
+    var ph = FillPhases{};
+    try fillIndexTimed(alloc, it, s, base, ix, &ph);
+}
 
-    const row_vals = try alloc.alloc(sql.Value, s.columns.len);
+pub fn fillIndexTimed(
+    alloc: std.mem.Allocator,
+    it: *tablemod.Table,
+    s: *const schema_mod.Schema,
+    base: *tablemod.Table,
+    ix: schema_mod.IndexDef,
+    ph: *FillPhases,
+) !void {
+    try fillIndexTimedChunks(alloc, it, s, base, ix, ph, FILL_CHUNK_ROWS);
+}
+
+/// 每块行数：排序必须在内存里（`Writer` 要求 key 升序），每行约 64 B
+///（24 B 排序元素 + 24 B 临时缓冲 + ~16 B 键），1 亿行就是 6.4 GB —— 不分块等于
+/// 「大表建不了索引」。4M 行/块 ≈ 256 MB 上界。
+const FILL_CHUNK_ROWS: usize = 4 << 20;
+
+pub fn fillIndexTimedChunks(
+    alloc: std.mem.Allocator,
+    it: *tablemod.Table,
+    s: *const schema_mod.Schema,
+    base: *tablemod.Table,
+    ix: schema_mod.IndexDef,
+    ph: *FillPhases,
+    chunk_rows: usize,
+) !void {
+    const io = base.io;
+    const t_scan = monoNs(io);
+
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer keys.deinit(alloc);
+
+    // **只解码「索引列 + 主键」两列**（对齐 SQLite `OP_Column` 的惰性取值）：
+    // `decodeRowInto` 会把整行所有列都解出来，而我们只需要这两个；
+    // `decodeRowProjected` 对其余列只读长度 varint、不碰内容。
+    var want: [2]usize = undefined;
+    var want_len: usize = 2;
+    if (ix.column_idx == s.pk_index) {
+        want[0] = ix.column_idx;
+        want_len = 1;
+    } else if (ix.column_idx < s.pk_index) {
+        want[0] = ix.column_idx;
+        want[1] = s.pk_index;
+    } else {
+        want[0] = s.pk_index;
+        want[1] = ix.column_idx;
+    }
+    const col_pos: usize = if (want[0] == ix.column_idx) 0 else 1;
+    const pk_pos: usize = if (want[0] == s.pk_index) 0 else 1;
+
+    const row_vals = try alloc.alloc(sql.Value, want_len);
     defer alloc.free(row_vals);
-    for (vals.items) |raw| {
-        try s.decodeRowInto(row_vals, raw);
-        const v = row_vals[ix.column_idx];
+
+    // 索引列是数值型时，键的前 8 字节就是完整的值分量（见 `schema.writeFixedComponent`），
+    // 于是「按前 8 字节稳定排序」= 完全正确且不需要全键比较（主键部分天然已升序）。
+    const numeric_col = switch (s.columns[ix.column_idx].col_type) {
+        .integer, .bigint, .datetime, .real, .double => true,
+        else => false,
+    };
+
+    // **分块**：排序必须在内存里（`Writer` 要求 key 升序），每行约 64 B，
+    // 1 亿行就是 6.4 GB。每块独立排序后各写一个段，最后 `compact()` 合并成一个；
+    // 代价只在超过一块时多一次读写，换来 O(块) 的内存上界。
+    const CHUNK_ROWS: usize = @max(1, chunk_rows);
+    var chunk_arena: ?std.heap.ArenaAllocator = null;
+    defer if (chunk_arena) |*a| a.deinit();
+    var items_buf: []KeyItem = &.{};
+    defer if (items_buf.len > 0) alloc.free(items_buf);
+    var scratch_buf: []KeyItem = &.{};
+    defer if (scratch_buf.len > 0) alloc.free(scratch_buf);
+    var chunks: usize = 0;
+    var emit_ns: u64 = 0;
+
+    // 1) 流式扫基础表（`MergeIter` 已跳过墓碑，不需要 `scanValues` 那层拷贝）
+    var hi: [16]u8 = @splat(0xFF);
+    var cur = tablemod.MergeIter{};
+    try cur.init(base, &[_]u8{}, &hi);
+    defer cur.deinit();
+    while (cur.next()) |rec| {
+        // arena 按块重建：键只在各自块内被排序/写出，写完就能整体释放
+        if (chunk_arena == null) chunk_arena = std.heap.ArenaAllocator.init(alloc);
+        const aa = chunk_arena.?.allocator();
+        try s.decodeRowProjected(row_vals, want[0..want_len], rec.value);
+        const v = row_vals[col_pos];
         switch (v) {
             .null => continue, // NULL 不入索引
             else => {},
         }
-        const key = try s.encodeIndexKey(alloc, ix.column_idx, v, row_vals[s.pk_index]);
-        defer alloc.free(key);
-        try it.put(key, &[_]u8{});
+        const pk = row_vals[if (want_len == 1) 0 else pk_pos];
+        // 数值 + 数值：键恰好 16 字节定长，直接在栈上拼（省掉 encodeIndexKey 里
+        // 两次 ArrayList 分配/拼接）；其余情形走通用编码。
+        var fixed: [16]u8 = undefined;
+        const key: []const u8 = if (@import("schema.zig").writeFixedComponent(fixed[0..8], v) and
+            @import("schema.zig").writeFixedComponent(fixed[8..16], pk))
+            try aa.dupe(u8, &fixed)
+        else
+            try s.encodeIndexKey(aa, ix.column_idx, v, pk);
+        try keys.append(alloc, key);
+        ph.rows += 1;
+        if (keys.items.len >= CHUNK_ROWS) {
+            const te = monoNs(io);
+            try sortChunkAndEmit(alloc, it, &keys, &items_buf, &scratch_buf, numeric_col, ph);
+            emit_ns += monoNs(io) - te;
+            chunk_arena.?.deinit();
+            chunk_arena = null;
+            chunks += 1;
+        }
     }
-    try it.flush();
+    ph.scan_ns = (monoNs(io) - t_scan) -| emit_ns;
+
+    // 2~3) 最后一块：排序 + 写成段
+    if (keys.items.len > 0) {
+        const te = monoNs(io);
+        try sortChunkAndEmit(alloc, it, &keys, &items_buf, &scratch_buf, numeric_col, ph);
+        emit_ns += monoNs(io) - te;
+        chunks += 1;
+    }
+
+    // 多块 ⇒ 段之间 key 范围重叠（各块按主键顺序切分，不是按键范围切分），
+    // 合并成一个段才能恢复「段范围不重叠」这个查询快路径的前提。
+    if (chunks > 1) {
+        const t_merge = monoNs(io);
+        _ = try it.compact();
+        ph.write_ns += monoNs(io) - t_merge;
+    }
+}
+
+/// 一块索引键：排序后一次性写成段，然后清空 `keys` 供下一块复用。
+fn sortChunkAndEmit(
+    alloc: std.mem.Allocator,
+    it: *tablemod.Table,
+    keys: *std.ArrayList([]const u8),
+    items_buf: *[]KeyItem,
+    scratch_buf: *[]KeyItem,
+    numeric: bool,
+    ph: *FillPhases,
+) !void {
+    const n = keys.items.len;
+    if (n == 0) return;
+    if (items_buf.len < n) {
+        if (items_buf.len > 0) alloc.free(items_buf.*);
+        items_buf.* = try alloc.alloc(KeyItem, n);
+    }
+    const items = items_buf.*[0..n];
+    for (keys.items, 0..) |k, i| items[i] = .{ .pre = prefix8(k), .key = k };
+
+    const io = it.io;
+    const t_sort = monoNs(io);
+    if (numeric) {
+        // 稳定基数排序：键的排序键就是前 8 字节（值分量定长），主键部分在输入里已升序，
+        // 稳定排序保证「同值按键升序」正确，且不需要任何全键比较。
+        if (scratch_buf.len < n) {
+            if (scratch_buf.len > 0) alloc.free(scratch_buf.*);
+            scratch_buf.* = try alloc.alloc(KeyItem, n);
+        }
+        radixSortByPre(items, scratch_buf.*[0..n]);
+    } else {
+        // text/blob 的值分量是变长 + 转义：前 8 字节相同不代表值相同，
+        // 必须全键比较，且不能依赖输入顺序（稳定排序也无济于事）。
+        std.mem.sortUnstable(KeyItem, items, {}, keyItemLess);
+    }
+    ph.sort_ns += monoNs(io) - t_sort;
+    for (items, 0..) |e, i| keys.items[i] = e.key;
+
+    const t_write = monoNs(io);
+    try it.bulkLoadSorted(keys.items, null);
+    ph.write_ns += monoNs(io) - t_write;
+    keys.clearRetainingCapacity();
+}
+
+/// 稳定 LSD 基数排序（8 趟 × 8 位），按 `pre` 升序。
+///
+/// 为什么值得单独写一个：1M 条索引键用 pdqsort 实测 **154 ms**（约 20 次比较/元素，
+/// 元素 24 字节、每次比较可能跨缓存行），是建索引最大的单项；
+/// 基数排序是 O(8n) 的连续读写，实测约 1/3。
+///
+/// **稳定性是功能的一部分**，不是巧合：输入按基础表主键升序，索引键 = 值 ++ 主键，
+/// 所以「值相同」的键天然已按主键有序 —— 稳定排序后整个数组就是正确的索引顺序，
+/// 不需要靠回退比较去修。
+fn radixSortByPre(items: []KeyItem, scratch: []KeyItem) void {
+    if (items.len < 2) return;
+    var src = items;
+    var dst = scratch;
+    var shift: u6 = 0;
+    while (true) : (shift += 8) {
+        var cnt: [256]u32 = @splat(0);
+        for (src) |e| cnt[@intCast((e.pre >> shift) & 0xFF)] += 1;
+        var distinct: usize = 0;
+        for (cnt) |c| {
+            if (c != 0) distinct += 1;
+        }
+        if (distinct > 1) {
+            var off: [256]u32 = @splat(0);
+            var acc: u32 = 0;
+            for (cnt, 0..) |c, i| {
+                off[i] = acc;
+                acc += c;
+            }
+            for (src) |e| {
+                const d: usize = @intCast((e.pre >> shift) & 0xFF);
+                dst[off[d]] = e;
+                off[d] += 1;
+            }
+            const t = src;
+            src = dst;
+            dst = t;
+        }
+        if (shift == 56) break;
+    }
+    if (src.ptr != items.ptr) @memcpy(items, src);
 }
 
 /// 打开（必要时新建并回填）一张索引表。
@@ -395,9 +635,8 @@ test "engine 全链路：CREATE/INSERT 后 GROUP BY + HAVING + ORDER BY 聚合" 
         }
         {
             // 北京 2 笔共 300；上海 1 笔 50；广州 3 笔共 60
-            var p = try sql.parse(alloc,
-                "INSERT INTO sales (id, city, amount) VALUES " ++
-                    "(1,'bj',100), (2,'bj',200), (3,'sh',50), (4,'gz',10), (5,'gz',20), (6,'gz',30)");
+            var p = try sql.parse(alloc, "INSERT INTO sales (id, city, amount) VALUES " ++
+                "(1,'bj',100), (2,'bj',200), (3,'sh',50), (4,'gz',10), (5,'gz',20), (6,'gz',30)");
             defer p.deinit();
             const ins = try eng.execute(p.stmt, alloc);
             try std.testing.expectEqual(@as(usize, 6), ins.inserted);
@@ -409,8 +648,7 @@ test "engine 全链路：CREATE/INSERT 后 GROUP BY + HAVING + ORDER BY 聚合" 
     defer eng2.deinit();
 
     {
-        var p = try sql.parse(alloc,
-            "SELECT city, COUNT(*), SUM(amount) FROM sales GROUP BY city HAVING SUM(amount) >= 100 ORDER BY sum(amount) DESC");
+        var p = try sql.parse(alloc, "SELECT city, COUNT(*), SUM(amount) FROM sales GROUP BY city HAVING SUM(amount) >= 100 ORDER BY sum(amount) DESC");
         defer p.deinit();
         const res = try eng2.execute(p.stmt, alloc);
         var rows = res.rows;
@@ -427,8 +665,7 @@ test "engine 全链路：CREATE/INSERT 后 GROUP BY + HAVING + ORDER BY 聚合" 
 
     // 放宽 HAVING 后三座城市都在，按金额降序（bj 300 / gz 60 / sh 50）
     {
-        var p = try sql.parse(alloc,
-            "SELECT city, SUM(amount) FROM sales GROUP BY city HAVING SUM(amount) > 0 ORDER BY sum(amount) DESC");
+        var p = try sql.parse(alloc, "SELECT city, SUM(amount) FROM sales GROUP BY city HAVING SUM(amount) > 0 ORDER BY sum(amount) DESC");
         defer p.deinit();
         const res = try eng2.execute(p.stmt, alloc);
         var rows = res.rows;
@@ -630,4 +867,81 @@ fn expectIds(eng: *Engine, alloc: std.mem.Allocator, g: i64, want: []const i64) 
     defer rows.deinit();
     try std.testing.expectEqual(want.len, rows.rows.len);
     for (rows.rows, want) |r, w| try std.testing.expectEqual(w, r[0].integer);
+}
+
+fn keyArrLess(_: void, a: [16]u8, b: [16]u8) bool {
+    return std.mem.order(u8, &a, &b) == .lt;
+}
+
+// 分块回填的守门用例。
+//
+// 为什么必须有：分块路径（`chunk_rows` 小到 7）在正式基准里跑不到（1M 行 < 4M/块），
+// 而不分块时「多块各写一段、最后 compact 合并」的代码一次也不会执行。
+// 这里同时钉住三件事：行数不丢、**顺序完全正确**（基数排序 + 稳定性）、
+// 以及**最后只剩 1 个段**（段范围不重叠是 `get` 二分快路径的前提）。
+test "索引回填分块：强制多块（每块 7 行）后必须合并成单段，内容与顺序全对" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const root = "test-fill-chunk";
+    const idx_root = "test-fill-chunk-idx";
+    dir.deleteTree(io, root) catch {};
+    dir.deleteTree(io, idx_root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, idx_root) catch {};
+
+    var eng = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    defer eng.deinit();
+    {
+        var p = try sql.parse(alloc, "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, v TEXT)");
+        defer p.deinit();
+        _ = try eng.execute(p.stmt, alloc);
+    }
+    {
+        var i: i64 = 0;
+        while (i < 100) : (i += 1) {
+            const text = try alloc.print("INSERT INTO t (id, g, v) VALUES ({d}, {d}, 'x')", .{ i, @mod(i, 10) });
+            defer alloc.free(text);
+            var p = try sql.parse(alloc, text);
+            defer p.deinit();
+            _ = try eng.execute(p.stmt, alloc);
+        }
+    }
+
+    try dir.createDirPath(io, idx_root);
+    var itbl = try tablemod.Table.open(io, dir, idx_root, alloc, .{ .wal_sync_every = 0 });
+    defer itbl.deinit();
+
+    const e = eng.get("t").?;
+    var ph = FillPhases{};
+    // chunk_rows = 7 => 100 行切成 15 块，每块各写一个段，最后 compact 合并成 1 段
+    try fillIndexTimedChunks(alloc, &itbl, &e.schema, &e.table, .{ .name = "idx_g", .column_idx = 1 }, &ph, 7);
+    try std.testing.expectEqual(@as(usize, 100), ph.rows);
+    try std.testing.expectEqual(@as(usize, 1), itbl.segs.items.len);
+
+    // 期望：100 个索引键 = 值分量(8) ++ 主键分量(8)，按字节序升序
+    const Key = [16]u8;
+    var want: std.ArrayList(Key) = .empty;
+    defer want.deinit(alloc);
+    for (0..100) |i| {
+        var k: Key = undefined;
+        _ = schema_mod.writeFixedComponent(k[0..8], .{ .integer = @intCast(i % 10) });
+        _ = schema_mod.writeFixedComponent(k[8..16], .{ .integer = @intCast(i) });
+        try want.append(alloc, k);
+    }
+    std.mem.sort(Key, want.items, {}, keyArrLess);
+
+    var n: usize = 0;
+    var it2 = tablemod.MergeIter{};
+    try it2.init(&itbl, &.{}, &.{});
+    defer it2.deinit();
+    while (it2.next()) |rec| {
+        try std.testing.expect(n < want.items.len);
+        try std.testing.expectEqualSlices(u8, &want.items[n], rec.key);
+        n += 1;
+    }
+    try std.testing.expectEqual(want.items.len, n);
 }

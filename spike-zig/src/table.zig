@@ -743,6 +743,66 @@ pub const Table = struct {
         self.maybeAutoCompact();
     }
 
+    /// 把一批**已按 key 升序排好**的记录一次性写成一个新段：**不写 WAL、不经 memtable**。
+    ///
+    /// 为什么需要独立入口（对齐 RocksDB `SstFileWriter` 的批量装载思路）：
+    /// `CREATE INDEX` 回填若走 `put()`，每行都要「WAL 编码一次 + 跳表插入一次」，
+    /// 而 SQLite 的 `CREATE INDEX` 是「扫表 → 排序 → 顺序写页」—— 两边不是同一档工作量，
+    /// 实测（p20 批次）索引构建 0.633× 落后，差距就在这里。本入口直接喂 `Writer`
+    /// （它本来就是「按 key 升序顺序写」的），把 WAL 与 memtable 两步整段省掉。
+    ///
+    /// 调用方责任：
+    /// - key 必须**严格升序**（`Writer.push` 在 Debug/ReleaseSafe 下会断言，ReleaseFast 下不检查）；
+    /// - 这条路径**不写 WAL**，所以只能用于「崩了可以整段重建」的场景（索引回填、批量导入）。
+    ///   索引回填正是这样：`.ready` 标记在回填成功之后才写，崩了就整个重建。
+    /// - `values == null` 表示所有记录的值都是空串（索引表的形态）。
+    pub fn bulkLoadSorted(
+        self: *Table,
+        keys: []const []const u8,
+        values: ?[]const []const u8,
+    ) !void {
+        self.checkThread();
+        if (values) |vs| std.debug.assert(vs.len == keys.len);
+        if (keys.len == 0) return;
+        const id = self.next_seg;
+        const data_path = try self.alloc.print("{s}/seg/{d:0>6}.data", .{ self.base_path, id });
+        defer self.alloc.free(data_path);
+
+        // 整批算一次提交：与 `putBatch` 同语义，记录之间不需要各自的 seq
+        self.seq += 1;
+        const seq = self.seq;
+
+        const t_seg = self.nowNs();
+        var w = try segmod.Writer.create(self.io, self.dir, data_path, self.alloc, self.opts.bloom_bits, keys.len);
+        defer w.deinit();
+        if (values) |vs| {
+            for (keys, vs) |k, v| try w.push(k, seq, 0, v);
+        } else {
+            for (keys) |k| try w.push(k, seq, 0, &.{});
+        }
+        const fin = try w.finishBytes();
+        errdefer self.alloc.free(fin.bytes);
+        self.ns_seg_data += self.nowNs() - t_seg;
+        self.ns_seg_create += w.ns_create;
+        self.ns_seg_write += w.ns_write;
+        self.ns_seg_sync += w.ns_sync;
+        const t_idx = self.nowNs();
+        self.index_valid_len = try segmod.archiveAppend(self.io, self.dir, self.index_path, @intCast(id), fin.bytes, self.index_valid_len);
+        self.ns_idx += self.nowNs() - t_idx;
+
+        var seg = try segmod.Segment.fromBytes(self.io, self.dir, self.base_path, id, fin.bytes, self.alloc, true, self.opts.mmap_preheat);
+        seg.data_prefault_max = self.opts.data_prefault_max_bytes;
+        self.segs.append(self.alloc, seg) catch |e| {
+            var s = seg;
+            s.owns_idx = false;
+            s.close();
+            return e;
+        };
+        self.next_seg = id + 1;
+        self.visible = seq;
+        self.recomputeSegLayout();
+    }
+
     /// 自动 compaction 是否还能工作。到上限后就**不会**再自动合并（不会自动恢复），
     /// 上层应定期检查；排除原因（磁盘满 / OOM 等）后调 `resetAutoCompact()`。
     pub fn autoCompactHealthy(self: *const Table) bool {

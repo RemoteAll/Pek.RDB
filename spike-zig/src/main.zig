@@ -792,9 +792,14 @@ fn benchMain() !void {
                 // 建索引耗时（一次性指标，与 big_recover 同类）
                 {
                     const t0 = nowNs(io);
-                    try spike.engine.fillIndex(alloc, ip, &s5, &t5, s5.findIndex("idx_g").?);
+                    var ph = spike.engine.FillPhases{};
+                    try spike.engine.fillIndexTimed(alloc, ip, &s5, &t5, s5.findIndex("idx_g").?, &ph);
                     const ns = nowNs(io) - t0;
                     std.debug.print("sql_index_build,{d},{d}\n", .{ n, ns / 1_000_000 });
+                    // 三阶段拆分：官方指标仍是 `sql_index_build`，这几行只用来定位「慢在哪一步」
+                    std.debug.print("sql_index_build_scan_ms,{d},{d}\n", .{ ph.rows, ph.scan_ns / 1_000_000 });
+                    std.debug.print("sql_index_build_sort_ms,{d},{d}\n", .{ ph.rows, ph.sort_ns / 1_000_000 });
+                    std.debug.print("sql_index_build_write_ms,{d},{d}\n", .{ ph.rows, ph.write_ns / 1_000_000 });
                 }
                 // 索引落盘占用：证明「查得快」不是因为「建得小」
                 {
@@ -2164,7 +2169,7 @@ fn benchMain() !void {
                                 break :blk r;
                             },
                         };
-                        acc +%= @intFromEnum(o);
+                        acc +%= @backingInt(o);
                     }
                 }
                 const ns = nowNs(io) - t0;
@@ -2262,5 +2267,3 @@ fn concWriter(a: ConcArgs) void {
         a.failed.* = true;
     };
 }
-
-
