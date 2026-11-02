@@ -601,6 +601,140 @@ fn benchMain() !void {
             // 单位统一成 **微秒**（两岸同一字段名），p31 那批曾是「zig 侧纳秒 / SQLite 侧微秒」
             std.debug.print("sql_orderby_limit10_med_us,{d},{d:.1}\n", .{ reps, @as(f64, @floatFromInt(med)) / 1000.0 });
         }
+        // **阶段拆解**（只用于定位瓶颈，不进判定）：同一条查询再跑 200 次，打开
+        // `exec.timing_enabled` 累计各阶段，打印「每次查询各阶段平均 ns」。
+        //
+        // 依据：审计后这条查询真实是 ≈11 µs/次（见上面的 `_med_us`），但「哪一段贵」
+        // 不能猜 —— §九十二（索引构建）就是先拆阶段（94/240/127 ms）再逐段超车的。
+        {
+            var items_b = [_]spike.sql.SelectItem{.{ .star = {} }};
+            var ord_b = [_]spike.sql.OrderItem{.{ .column = "id", .desc = true }};
+            const sel_b = spike.sql.Select{
+                .items = &items_b,
+                .table = "bench_sql",
+                .order_by = &ord_b,
+                .limit = 10,
+            };
+            const reps: usize = 200;
+            spike.exec.timing = .{};
+            spike.exec.timing_enabled = true;
+            var r: usize = 0;
+            while (r < reps) : (r += 1) {
+                var rows_b = try spike.exec.selectRows(&t4, &s, sel_b, alloc);
+                rows_b.deinit();
+            }
+            spike.exec.timing_enabled = false;
+            const tm = spike.exec.timing;
+            const calls: u64 = @max(1, tm.calls);
+            std.debug.print("sql_orderby_limit10_breakdown_topk,{d},{d}\n", .{ tm.calls, tm.topk / calls });
+            std.debug.print("sql_orderby_limit10_breakdown_projection,{d},{d}\n", .{ tm.calls, tm.projection / calls });
+            std.debug.print("sql_orderby_limit10_breakdown_decode,{d},{d}\n", .{ tm.calls, tm.decode / calls });
+            std.debug.print("sql_orderby_limit10_breakdown_sort,{d},{d}\n", .{ tm.calls, tm.sort / calls });
+            std.debug.print("sql_orderby_limit10_breakdown_output,{d},{d}\n", .{ tm.calls, tm.output / calls });
+        }
+        // **两点测量**：把同一条查询的 LIMIT 从 10 换成 500，看 `topk` 增量 → 分离
+        // 「固定成本」与「每行成本」。这不是猜：k=10 与 k=500 的斜率差就是每行代价。
+        {
+            var items_b2 = [_]spike.sql.SelectItem{.{ .star = {} }};
+            var ord_b2 = [_]spike.sql.OrderItem{.{ .column = "id", .desc = true }};
+            const sel_b2 = spike.sql.Select{
+                .items = &items_b2,
+                .table = "bench_sql",
+                .order_by = &ord_b2,
+                .limit = 500,
+            };
+            const reps: usize = 200;
+            spike.exec.timing = .{};
+            spike.exec.timing_enabled = true;
+            var r: usize = 0;
+            while (r < reps) : (r += 1) {
+                var rows_b2 = try spike.exec.selectRows(&t4, &s, sel_b2, alloc);
+                rows_b2.deinit();
+            }
+            spike.exec.timing_enabled = false;
+            const tm2 = spike.exec.timing;
+            const calls2: u64 = @max(1, tm2.calls);
+            std.debug.print("sql_orderby_limit500_breakdown_topk,{d},{d}\n", .{ tm2.calls, tm2.topk / calls2 });
+            std.debug.print("sql_orderby_limit500_breakdown_decode,{d},{d}\n", .{ tm2.calls, tm2.decode / calls2 });
+            std.debug.print("sql_orderby_limit500_breakdown_sort,{d},{d}\n", .{ tm2.calls, tm2.sort / calls2 });
+        }
+        // **微探针 2**：复刻 `topKDesc` 快路径的循环体（倒扫 + keyCmp + 分组），但不 append，
+        // 用来判定「剩下的钱是花在 keyCmp/分组上，还是花在 out.append 的分配上」。
+        {
+            const reps: usize = 200;
+            inline for (.{ 10, 500 }) |steps| {
+                var prev_key: []const u8 = &.{};
+                var have = false;
+                var groups: usize = 0;
+                var sink: usize = 0;
+                const t1 = nowNs(io);
+                var r: usize = 0;
+                while (r < reps) : (r += 1) {
+                    var it2 = t4.mem.revIterator();
+                    var c2: usize = 0;
+                    have = false;
+                    while (it2.next()) |e| {
+                        if (have and spike.segment.keyCmp(e.key, prev_key) != .eq) {
+                            groups += 1;
+                            sink +%= e.value.len;
+                        }
+                        prev_key = e.key;
+                        have = true;
+                        c2 += 1;
+                        if (c2 >= steps) break;
+                    }
+                }
+                const ns1 = nowNs(io) - t1;
+                std.debug.print("probe_mem_revgroup{d},{d},{d}\n", .{ steps, reps, ns1 / reps });
+                // (c) 再加上 `out.append` —— 用来确认「剩下的成本是不是 append 本身」
+                var out2: std.ArrayList([]const u8) = .empty;
+                defer out2.deinit(alloc);
+                const t2 = nowNs(io);
+                r = 0;
+                while (r < reps) : (r += 1) {
+                    out2.clearRetainingCapacity();
+                    try out2.ensureTotalCapacity(alloc, steps);
+                    var it3 = t4.mem.revIterator();
+                    var c3: usize = 0;
+                    var prev3: []const u8 = &.{};
+                    var have3 = false;
+                    var best3: []const u8 = &.{};
+                    while (it3.next()) |e| {
+                        if (have3 and spike.segment.keyCmp(e.key, prev3) != .eq) {
+                            try out2.append(alloc, best3);
+                            if (out2.items.len >= steps) break;
+                        }
+                        prev3 = e.key;
+                        best3 = e.value;
+                        have3 = true;
+                        c3 += 1;
+                    }
+                }
+                const ns2 = nowNs(io) - t2;
+                std.debug.print("probe_mem_revpush{d},{d},{d}\n", .{ steps, reps, ns2 / reps });
+                if (groups == 0 and sink == 12345) std.debug.print("nohit,0,0\n", .{});
+            }
+        }
+        {
+            const reps: usize = 200;
+            inline for (.{ 10, 500 }) |steps| {
+                var acc: usize = 0;
+                const t0 = nowNs(io);
+                var r: usize = 0;
+                while (r < reps) : (r += 1) {
+                    var it = t4.mem.revIterator();
+                    var c: usize = 0;
+                    while (it.next()) |e| {
+                        acc +%= e.key.len +% e.value.len;
+                        c += 1;
+                        if (c >= steps) break;
+                    }
+                }
+                const ns = nowNs(io) - t0;
+                std.debug.print("probe_mem_rev{d},{d},{d}\n", .{ steps, reps, ns / reps });
+                if (acc == std.math.maxInt(usize)) std.debug.print("nohit,0,0\n", .{});
+            }
+        }
         // 投影扫描：同一张表、同样全表范围，只取 1 列（`SELECT id`）。
         //
         // 为什么单独一档：SQLite 的 `OP_Column` 是惰性的（不调 `sqlite3_column_*` 就

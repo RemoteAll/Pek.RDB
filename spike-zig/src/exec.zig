@@ -151,6 +151,35 @@ const SortCtx = struct {
     order: []const sql.OrderItem,
 };
 
+/// 查询阶段计时（**仅基准用**，生产路径保持 `false`）。
+///
+/// 为什么要它：审计后 `sql_orderby_limit10` 的真实成本是 ≈11 µs/查询，
+/// 但「里面哪一段贵」不能靠猜 —— §九十二（索引构建）就是靠先拆阶段
+/// （94/240/127 ms）才逐段超车的。纪律与 `segmod.timing` 一致：**非线程安全**，
+/// 只能单线程跑基准时开启。
+pub const QueryTiming = struct {
+    /// `Table.topKDesc`（段尾定位 + memtable 反向 + 候选归并归组）
+    topk: u64 = 0,
+    /// `buildProjection`（分配 + 列名匹配）
+    projection: u64 = 0,
+    /// `decodeAll`（buf/flat/hdrs 三块分配 + 逐行解码）
+    decode: u64 = 0,
+    /// 排序（有 ORDER BY 时对候选/结果集排序）
+    sort: u64 = 0,
+    /// `buildOutput`（输出行分配或所有权转移）
+    output: u64 = 0,
+    /// 进入 `finishFromValues` 的次数（用于把累计值折算成每次）
+    calls: u64 = 0,
+};
+pub var timing_enabled: bool = false;
+pub var timing: QueryTiming = .{};
+
+/// 计时点：未开启时**不读时钟**（`now` 在 Windows 上要约 20–40 ns，
+/// 8 个点就会吃掉 11 µs 的 2–3%）。
+inline fn stamp(io: std.Io) u64 {
+    return if (timing_enabled) segmod.tick(io) else 0;
+}
+
 /// `ORDER BY` 是否**恰好**就是主键那一列（单列、无次级键）。
 ///
 /// 返回 `null` = 不是主键排序；`false` = 主键升序；`true` = 主键降序。
@@ -597,7 +626,7 @@ pub fn selectRowsHost(
                             break :blk @as(usize, sel.offset orelse 0) + @as(usize, l);
                         } else null;
                         try indexCollect(h, t, s, ci, w.value, alloc, &owned, max);
-                        return finishFromValues(s, sel, alloc, owned.items);
+                        return finishFromValues(t.io, s, sel, alloc, owned.items);
                     }
                 }
             }
@@ -649,8 +678,11 @@ pub fn selectRowsHost(
         const k = @as(usize, sel.offset orelse 0) + @as(usize, sel.limit.?);
         var top: std.ArrayList([]const u8) = .empty;
         defer top.deinit(alloc);
-        if (k > 0 and try t.topKDesc(k, &top)) {
-            return finishFromValues(s, sel, alloc, top.items);
+        if (k > 0) {
+            const t_k = stamp(t.io);
+            const hit = try t.topKDesc(k, &top);
+            if (timing_enabled) timing.topk += stamp(t.io) - t_k;
+            if (hit) return finishFromValues(t.io, s, sel, alloc, top.items);
         }
     }
 
@@ -735,10 +767,10 @@ pub fn selectRowsHost(
             defer top.deinit(alloc);
             try keepTopN(s, sel, alloc, src, k, &top);
             src = top.items;
-            return finishFromValues(s, sel, alloc, src);
+            return finishFromValues(t.io, s, sel, alloc, src);
         }
     }
-    return finishFromValues(s, sel, alloc, src);
+    return finishFromValues(t.io, s, sel, alloc, src);
 }
 
 /// top-N 预筛的元素：`vals` 是解码后的值（text/blob 指向 `raw`，`raw` 指向段 mmap，
@@ -837,12 +869,19 @@ fn topIdxLess(_: void, a: TopItem, b: TopItem) bool {
 /// 全表扫描与索引扫描共用这一段 —— 两条路径若各写一份装配逻辑，迟早会出现
 /// 「走索引时 ORDER BY 不生效」这种只在一半场景里错的 bug。
 fn finishFromValues(
+    io: std.Io,
     s: *const schema_mod.Schema,
     sel: sql.Select,
     alloc: std.mem.Allocator,
     src: []const []const u8,
 ) !Rows {
+    var t0 = stamp(io);
     const proj = try buildProjection(alloc, s, sel.items);
+    if (timing_enabled) {
+        const t1 = stamp(io);
+        timing.projection += t1 - t0;
+        t0 = t1;
+    }
     errdefer {
         for (proj.columns) |c| alloc.free(c);
         alloc.free(proj.columns);
@@ -860,6 +899,11 @@ fn finishFromValues(
     const want: ?[]const usize = if (sel.order_by.len == 0 and ascending) proj.indices else null;
     var m = try decodeAll(alloc, s, src, want);
     defer m.deinit();
+    if (timing_enabled) {
+        const t1 = stamp(io);
+        timing.decode += t1 - t0;
+        t0 = t1;
+    }
 
     if (sel.order_by.len > 0) {
         const ctx = SortCtx{ .schema = s, .order = sel.order_by };
@@ -871,7 +915,15 @@ fn finishFromValues(
     var end: usize = m.hdrs.len;
     if (sel.limit) |l| end = @min(end, start + @as(usize, l));
 
-    return buildOutput(alloc, s, &m, proj, start, end);
+    if (timing_enabled) {
+        const t1 = stamp(io);
+        timing.sort += t1 - t0;
+        t0 = t1;
+        timing.calls += 1;
+    }
+    const out = try buildOutput(alloc, s, &m, proj, start, end);
+    if (timing_enabled) timing.output += stamp(io) - t0;
+    return out;
 }
 
 /// 流式查询：逐行解码到**复用的 scratch**，回调消费，**不物化结果集**。
