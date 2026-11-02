@@ -414,3 +414,37 @@ powershell -File tools\run-scale-abba.ps1 -Rows 100000000 -Tag f -Rounds 2 -Dura
 
 > 规模级批次里 `scale_wal_sync_ms` / `scale_put_ms` 是**写入耗时拆分**（fsync 占比），
 > 用于分辨「写入慢在落盘还是慢在内存结构」，不是性能指标本身。
+
+## 合并阻塞时长（2026-11-03 起，`zig-out/bin/spike-bench-ac`）
+
+```powershell
+cd spike-zig
+zig build -Doptimize=ReleaseFast
+foreach ($r in 1,2,3) { ./zig-out/bin/spike-bench-ac 2>&1 | Tee-Object -FilePath "..\docs\实测数据\合并阻塞-2026-11-03-run$r.csv" | Out-Null }
+```
+
+这组数据**只回答一个问题**：合并把写路径独占多久（= 要不要上后台线程）。
+写放大 `ac_wamp_*` 与阻塞时长无关（写放大 5 倍也可能每次只卡 3 ms），两者必须分开看。
+
+| 列 | 含义 |
+|---|---|
+| `ac_cmp_ms_avg_*` / `ac_cmp_ms_max_*` | **单轮**合并耗时（`compact` / `compactTier` 内部计时） |
+| `ac_flush_ms_max_*` | **一次写的最坏停顿**（`flush()` 含末尾自动合并）；`burst > 1` 时多轮会叠在这一个数里 |
+| `ac_cmp_bytes_per_*` | 每轮平均重写字节数（区分「合并大」还是「磁盘慢」） |
+| `ac_cmp_calls_*` / `ac_compacts_*` | 实际执行的合并轮数（`did == false` 的早退不计） |
+
+| 批次 | 内容 |
+|---|---|
+| `合并阻塞-2026-11-03-run{1..4}` | 50 万行（2 MB flush ≈25 段）与 200 万行（8 MB ≈25 段）两档；全量合并阈值 4/8/16 vs 分层合并 `compact_max_segs` 12/6；`auto_compact_burst` 1 vs 4 |
+
+**实测结论（4 轮取中位，`ac_flush_ms_max`）**：
+
+| 场景 | off | tier12 (burst=1) | tier12b4 (burst=4) | tier6 (burst=1) | big_tier12 (200 万行) |
+|---|---|---|---|---|---|
+| 单次写最坏停顿 | 8.4 ms | **45.4 ms** | 51.3 ms（批内跨 2.8×） | 55.6 ms（r1 732 ms 为环境抖动） | 240 ms（批内跨 3.3×，**不作结论**） |
+
+**单轮合并耗时**（`ac_cmp_ms_max`）反而分层更优且**不随数据量线性增长**：全量 50 万行 ≈ 107.8–122.2 ms → 200 万行 **438.4 ms**（线性）；分层 50 万行 **39.4 ms** → 200 万行 **97.5 ms**（4 轮中 1 轮 346.6 ms 为抖动）。
+
+> 纪律：这批 4 轮里 `big_tier12` 与 `tier6-r1` 出现 3–14× 的同场景抖动（磁盘/杀软），按
+> `docs/决策记录.md` §九十八 的规矩，**批内跨 2× 的那一档不下结论**，只用来确认方向。
+

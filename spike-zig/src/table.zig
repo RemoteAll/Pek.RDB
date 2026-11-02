@@ -88,6 +88,17 @@ pub const Options = struct {
     compact_max_segs: usize = 0,
     /// 分层合并每次合并几个段（`< 2` 视为关闭）。
     tiered_fanout: usize = 4,
+    /// **一次写（一次 `flush` 末尾）最多连做几轮分层合并**，默认 `1`。
+    ///
+    /// 这是「单次写停顿」的直接乘数：实测单轮 tier 合并 p-max ≈ 45 ms（50 万行）/
+    /// 96 ms（200 万行），写成 `4` 就意味着最坏一次写要独占 **4×** 那么久
+    /// （见 `docs/实测数据/合并阻塞-2026-11-03-run{1..3}.csv`）。
+    /// 取 `1`：每次写最多被一次合并挡住，段数由**后续每次写**各自推进一轮来收敛
+    /// （收敛慢一点，但 write 的 tail latency 不被放大）。
+    ///
+    /// 注意它只限制「一次写里连做几轮」，**不改变**单轮本身的耗时 ——
+    /// 真正的「后台合并不阻塞写」需要线程，见 `docs/架构设计.md` 的说明。
+    auto_compact_burst: usize = 1,
     /// `ORDER BY <pk> DESC LIMIT k` 快速路径（`Table.topKDesc`）允许的最大 k，
     /// `0` = 禁用该快速路径（审计项，2026-11-02）。
     ///
@@ -499,6 +510,14 @@ pub const Table = struct {
     ns_walrot: u64 = 0,
     /// 单次 WAL 轮换最长耗时（纳秒）。
     ns_walrot_max: u64 = 0,
+    /// 合并（`compact` / `compactTier`）累计纳秒，**含内部先落盘的 flushImpl**。
+    /// 这是判定「要不要把合并挪到后台线程」的唯一依据：它量的是**单次写路径被独占多久**，
+    /// 拿总吞吐或写放大都推不出来（写放大与阻塞无关）。
+    ns_compact: u64 = 0,
+    /// 单次合并最长耗时（纳秒）。
+    ns_compact_max: u64 = 0,
+    /// 合并实际执行次数（`did == true` 的那些，`did == false` 的早退不计）。
+    compact_calls: u64 = 0,
     /// 扫描/归并**实际产出**的行数（累计）。
     /// 确定性指标：用来证明「LIMIT 提前终止」真的没白读，而不是靠计时猜。
     scan_rows_read: u64 = 0,
@@ -1237,11 +1256,13 @@ pub const Table = struct {
         if (self.going_compact) return; // compact 内部的 flush 不得递归触发
         if (self.auto_compact_fails >= AUTO_COMPACT_MAX_FAILS) return;
 
-        // 分层合并优先：段数超过上限就合并最小的 N 个段，最多连着做 4 次
-        // （每次减少 fanout−1 段，4 次足够从 30 段收敛到 16 段以内）。
+        // 分层合并优先：段数超过上限就合并最小的 N 个段。
+        // 每轮减少 fanout−1 段；**一轮 = 一次写停顿**，所以「一次写连做几轮」由
+        // `auto_compact_burst` 控制（默认 1：单次写最多被一次合并挡住）。
         if (self.opts.compact_max_segs > 0 and self.opts.tiered_fanout >= 2) {
+            const burst = @max(@as(usize, 1), self.opts.auto_compact_burst);
             var guard: usize = 0;
-            while (self.segs.items.len > self.opts.compact_max_segs and guard < 4) : (guard += 1) {
+            while (self.segs.items.len > self.opts.compact_max_segs and guard < burst) : (guard += 1) {
                 const cr = self.compactTier(self.opts.tiered_fanout) catch |e| {
                     self.auto_compact_error = e;
                     self.auto_compact_fails +|= 1;
@@ -1432,6 +1453,12 @@ pub const Table = struct {
     /// 内存是流式的：不为全部结果分配缓冲（200 万行时那是 100MB+）。
     pub fn compact(self: *Table) !CompactResult {
         self.checkThread();
+        const t_cmp = self.nowNs();
+        defer {
+            const d = self.nowNs() - t_cmp;
+            self.ns_compact +|= d;
+            if (d > self.ns_compact_max) self.ns_compact_max = d;
+        }
         if (self.segs.items.len <= 1) {
             return .{ .before = self.segs.items.len, .after = self.segs.items.len, .rows = 0, .did = false };
         }
@@ -1529,6 +1556,7 @@ pub const Table = struct {
         self.auto_compact_error = null;
         self.auto_compact_fails = 0;
         self.compact_bytes_total += out_bytes;
+        self.compact_calls +|= 1;
 
         return .{ .before = before, .after = self.segs.items.len, .rows = rows, .bytes = out_bytes, .did = true };
     }
@@ -1581,6 +1609,12 @@ pub const Table = struct {
     /// 见 §16.1.7）。这是用点查换「合并可终止」，段数受 `compact_max_segs` 约束后代价有限。
     pub fn compactTier(self: *Table, fanout: usize) !CompactResult {
         self.checkThread();
+        const t_cmp = self.nowNs();
+        defer {
+            const d = self.nowNs() - t_cmp;
+            self.ns_compact +|= d;
+            if (d > self.ns_compact_max) self.ns_compact_max = d;
+        }
         const before = self.segs.items.len;
         if (fanout < 2 or before <= fanout) {
             return .{ .before = before, .after = before, .rows = 0, .did = false };
@@ -1712,6 +1746,7 @@ pub const Table = struct {
         self.auto_compact_error = null;
         self.auto_compact_fails = 0;
         self.compact_bytes_total += out_bytes;
+        self.compact_calls +|= 1;
 
         return .{ .before = before, .after = self.segs.items.len, .rows = rows, .bytes = out_bytes, .did = true };
     }
@@ -2941,6 +2976,61 @@ test "自动 compaction: 段数达到阈值后自动合并，数据一致" {
         try std.testing.expectEqualStrings("v4", (try t2.get("k4", &out)).?);
         try std.testing.expect((try t2.get("k2", &out)) == null);
     }
+}
+
+test "auto_compact_burst：一次写（一次 flush 末尾）最多连做 burst 轮合并，单次停顿不被放大" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-ac-burst";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+
+    // 先造 5 段（此时自动合并全部关闭，段就是 5 个）
+    var kbuf: [8]u8 = undefined;
+    for (0..5) |i| {
+        const k = try std.fmt.bufPrint(&kbuf, "k{d}", .{i});
+        try t.put(k, "v");
+        try t.flush();
+    }
+    try std.testing.expectEqual(@as(usize, 5), t.segs.items.len);
+    try std.testing.expectEqual(@as(u64, 0), t.auto_compact_count);
+
+    // 打开分层合并：上限 1 段 + fanout 2 ⇒ 每轮只减 1 段，6 段要 5 轮才收敛到 1 段
+    t.opts.compact_max_segs = 1;
+    t.opts.tiered_fanout = 2;
+    t.opts.auto_compact_burst = 1;
+
+    // 第 1 次写：burst=1 ⇒ 只做 1 轮（6 → 5），绝不是「一口气收敛到 1 段」
+    const c0 = t.auto_compact_count;
+    try t.put("k100", "v");
+    try t.flush();
+    try std.testing.expectEqual(@as(u64, 1), t.auto_compact_count - c0);
+    try std.testing.expectEqual(@as(usize, 5), t.segs.items.len);
+
+    // 第 2 次写：burst=3 ⇒ 连做 3 轮（5+1=6 → 5 → 4 → 3）
+    t.opts.auto_compact_burst = 3;
+    const c1 = t.auto_compact_count;
+    try t.put("k101", "v");
+    try t.flush();
+    try std.testing.expectEqual(@as(u64, 3), t.auto_compact_count - c1);
+    try std.testing.expectEqual(@as(usize, 3), t.segs.items.len);
+
+    // burst 只影响「一次写里做几轮」，不影响最终数据正确性
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    for (0..5) |i| {
+        const k = try std.fmt.bufPrint(&kbuf, "k{d}", .{i});
+        try std.testing.expectEqualStrings("v", (try t.get(k, &out)) orelse unreachable);
+    }
+    try std.testing.expectEqualStrings("v", (try t.get("k100", &out)) orelse unreachable);
+    try std.testing.expectEqualStrings("v", (try t.get("k101", &out)) orelse unreachable);
 }
 
 test "自动 compaction: compact_after_segs=0（默认）不触发" {

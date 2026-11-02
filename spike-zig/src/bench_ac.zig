@@ -45,21 +45,30 @@ pub fn main() !void {
     std.debug.print("metric,count,value\n", .{});
 
     // 主场景：50 万行 / 2MB flush → 约 25 段
-    try runCase(io, dir, alloc, &out, "off", 0, ROWS, FLUSH_BYTES, value);
-    // 阈值三档
+    try runCase(io, dir, alloc, &out, "off", 0, 0, 1, ROWS, FLUSH_BYTES, value);
+    // 阈值三档（全量合并）
     for ([_]usize{ 4, 8, 16 }) |th| {
         var tag_buf: [16]u8 = undefined;
         const tag = try std.fmt.bufPrint(&tag_buf, "on{d}", .{th});
-        try runCase(io, dir, alloc, &out, tag, th, ROWS, FLUSH_BYTES, value);
+        try runCase(io, dir, alloc, &out, tag, th, 0, 1, ROWS, FLUSH_BYTES, value);
     }
+    // **分层合并（生产推荐路径：compact_max_segs 优先，`compact_after_segs` 不管用）**。
+    // 两档段数上限：12（均衡）与 6（写少读多）；12 档再对比 burst=1 / burst=4。
+    for ([_]usize{ 12, 6 }) |ms| {
+        var tag_buf: [16]u8 = undefined;
+        const tag = try std.fmt.bufPrint(&tag_buf, "tier{d}", .{ms});
+        try runCase(io, dir, alloc, &out, tag, 0, ms, 1, ROWS, FLUSH_BYTES, value);
+    }
+    try runCase(io, dir, alloc, &out, "tier12b4", 0, 12, 4, ROWS, FLUSH_BYTES, value);
 
     // 数据量 ×4（同样约 25 段）：验证全量合并的两个关键局限——
     //   ① 写放大的**绝对值**随总数据量增长（比例取决于阈值，与总量无关）
     //   ② 单次合并的**阻塞时长**随总数据量线性增长（超大数据集不可接受）
     const big_rows: u64 = 2_000_000;
     const big_fb: usize = 8 << 20; // 同样 → 约 25 段
-    try runCase(io, dir, alloc, &out, "big_off", 0, big_rows, big_fb, value);
-    try runCase(io, dir, alloc, &out, "big_on8", 8, big_rows, big_fb, value);
+    try runCase(io, dir, alloc, &out, "big_off", 0, 0, 1, big_rows, big_fb, value);
+    try runCase(io, dir, alloc, &out, "big_on8", 8, 0, 1, big_rows, big_fb, value);
+    try runCase(io, dir, alloc, &out, "big_tier12", 0, 12, 1, big_rows, big_fb, value);
     std.debug.print("ac_bench_done,1,1\n", .{});
 }
 
@@ -70,6 +79,8 @@ fn runCase(
     out: *std.ArrayList(u8),
     tag: []const u8,
     thresh: usize,
+    max_segs: usize,
+    burst: usize,
     rows: u64,
     flush_bytes: usize,
     value: [32]u8,
@@ -83,6 +94,8 @@ fn runCase(
         .wal_sync_every = 10_000,
         .flush_bytes = flush_bytes,
         .compact_after_segs = thresh,
+        .compact_max_segs = max_segs,
+        .auto_compact_burst = burst,
     };
 
     var t = try tablemod.Table.open(io, dir, p, alloc, opts);
@@ -156,5 +169,25 @@ fn runCase(
         var t2 = try tablemod.Table.open(io, dir, p, alloc, opts);
         defer t2.deinit();
         std.debug.print("ac_recover_{s},{d},{d:.2}\n", .{ tag, rows, @as(f64, @floatFromInt(nowNs(io) - r0)) / 1e6 });
+    }
+
+    // **单次合并阻塞时长**（本轮新增的唯一目的）：判定「要不要把合并挪到后台线程」。
+    // 写放大（`ac_wamp_*`）与阻塞时长无关：写放大 5 倍也可能是每次只卡 3ms，
+    // 写放大 2 倍也可能每次卡 1s。只有这里量到的数才是「写路径被独占多久」。
+    {
+        const n = @max(@as(u64, 1), t.compact_calls);
+        const avg_ms = @as(f64, @floatFromInt(t.ns_compact)) / @as(f64, @floatFromInt(n)) / 1e6;
+        const max_ms = @as(f64, @floatFromInt(t.ns_compact_max)) / 1e6;
+        std.debug.print("ac_cmp_calls_{s},{d},{d}\n", .{ tag, rows, t.compact_calls });
+        std.debug.print("ac_cmp_ms_avg_{s},{d},{d:.3}\n", .{ tag, rows, avg_ms });
+        std.debug.print("ac_cmp_ms_max_{s},{d},{d:.3}\n", .{ tag, rows, max_ms });
+        // 每次合并平均重写多少字节（与耗时一起看才能区分「合并大」还是「磁盘慢」）
+        const per = if (t.compact_calls == 0) 0.0 else @as(f64, @floatFromInt(t.compact_bytes_total)) / @as(f64, @floatFromInt(t.compact_calls));
+        std.debug.print("ac_cmp_bytes_per_{s},{d},{d:.0}\n", .{ tag, rows, per });
+        // **一次写的最坏停顿**：`flush()` 内部末尾会跑自动合并，所以 `ns_flush_max`
+        // 就是「写路径被独占多久」的真实上界。`ac_cmp_ms_max_*` 只是**单轮合并**的耗时，
+        // burst>1 时一次写可以叠好几轮 —— 只有这个指标能体现出 burst 的差别。
+        std.debug.print("ac_flush_ms_max_{s},{d},{d:.3}\n", .{ tag, rows, @as(f64, @floatFromInt(t.ns_flush_max)) / 1e6 });
+        std.debug.print("ac_flush_calls_{s},{d},{d}\n", .{ tag, rows, t.flush_calls });
     }
 }
