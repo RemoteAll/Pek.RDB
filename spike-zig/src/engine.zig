@@ -509,6 +509,19 @@ pub const Engine = struct {
                 // **`params == null` 也要过一遍解析**：否则 `LIMIT ?` 会因 `limit == null`
                 // 而静默返回全部行（把「忘了绑参数」变成「翻页失效」这种难查的 bug）。
                 try applyLimitParams(&sel, params orelse &[_]sql.Value{});
+                if (sel.join) |jc| {
+                    // JOIN 走独立路径：两表各带自己的 IndexHost（右表 ON 列可走索引/主键）
+                    const el = self.tables.getPtr(sel.table) orelse return error.TableNotFound;
+                    const er = self.tables.getPtr(jc.table) orelse return error.TableNotFound;
+                    var host_l = exec.IndexHost{ .schema = &el.schema, .tables = &el.idx_tables };
+                    var host_r = exec.IndexHost{ .schema = &er.schema, .tables = &er.idx_tables };
+                    return .{ .rows = try exec.selectJoin(
+                        .{ .name = sel.table, .table = &el.table, .schema = &el.schema, .host = &host_l },
+                        .{ .name = jc.table, .table = &er.table, .schema = &er.schema, .host = &host_r },
+                        sel,
+                        alloc,
+                    ) };
+                }
                 const e = self.tables.getPtr(sel.table) orelse return error.TableNotFound;
                 var host = exec.IndexHost{ .schema = &e.schema, .tables = &e.idx_tables };
                 return .{ .rows = try exec.selectRowsHost(&e.table, &e.schema, sel, alloc, &host) };
@@ -961,6 +974,91 @@ test "LIMIT/OFFSET 占位符：取值、顺序、错误、同 AST 复用" {
     var rows2 = res2.rows;
     defer rows2.deinit();
     try std.testing.expectEqual(@as(usize, 3), rows2.rows.len);
+}
+
+// `JOIN`：只支持单条等值 ON；右表 ON 列按「主键点查 / 索引前缀扫描 / 全表扫」三档查找。
+// 用例重点不是「能查出来」，而是：ON 反向写结果一致、LEFT 补 NULL、限定名与裸名歧义、
+// 以及**索引路径与全扫路径结果一致**。
+test "JOIN：INNER/LEFT、ON 反向、索引路径、裸名歧义、不支持的形态" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const root = "test-engine-join";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    var eng = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    defer eng.deinit();
+
+    try run(&eng, alloc, "CREATE TABLE t (id INTEGER PRIMARY KEY, uid INTEGER NOT NULL, tag TEXT NOT NULL)");
+    try run(&eng, alloc, "CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT NOT NULL)");
+    try run(&eng, alloc, "INSERT INTO t (id, uid, tag) VALUES (1,10,'a'), (2,10,'b'), (3,20,'c'), (4,99,'d')");
+    try run(&eng, alloc, "INSERT INTO u (id, name) VALUES (10,'ten'), (20,'twenty'), (30,'thirty')");
+
+    // INNER：t.uid = u.id ⇒ 3 行（uid=99 无匹配被排除）；同一 uid 两行都要出现
+    {
+        var rows = try queryRows(&eng, alloc, "SELECT t.id, t.tag, u.name FROM t JOIN u ON t.uid = u.id ORDER BY t.id");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 3), rows.rows.len);
+        try std.testing.expectEqual(@as(i64, 1), rows.rows[0][0].integer);
+        try std.testing.expectEqualStrings("ten", rows.rows[0][2].text);
+        try std.testing.expectEqual(@as(i64, 3), rows.rows[2][0].integer);
+        try std.testing.expectEqualStrings("twenty", rows.rows[2][2].text);
+    }
+
+    // ON 反向写（右表列在左）：结果必须一样
+    {
+        var rows = try queryRows(&eng, alloc, "SELECT t.id FROM t JOIN u ON u.id = t.uid ORDER BY t.id");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 3), rows.rows.len);
+        try std.testing.expectEqual(@as(i64, 3), rows.rows[2][0].integer);
+    }
+
+    // LEFT：4 行，uid=99 那行右表列全 NULL
+    {
+        var rows = try queryRows(&eng, alloc, "SELECT t.id, u.name FROM t LEFT JOIN u ON t.uid = u.id ORDER BY t.id");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 4), rows.rows.len);
+        try std.testing.expect(rows.rows[3][1] == .null);
+    }
+
+    // WHERE + ORDER BY + LIMIT 与 JOIN 组合
+    {
+        var rows = try queryRows(&eng, alloc, "SELECT t.id FROM t JOIN u ON t.uid = u.id WHERE u.name = 'ten' ORDER BY t.id DESC LIMIT 1");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+        try std.testing.expectEqual(@as(i64, 2), rows.rows[0][0].integer);
+    }
+
+    // 裸名列两表唯一 ⇒ 可用；`id` 两表都有 ⇒ 必须报歧义，不能默默取第一个
+    {
+        var rows = try queryRows(&eng, alloc, "SELECT name FROM t JOIN u ON t.uid = u.id ORDER BY name LIMIT 1");
+        defer rows.deinit();
+        try std.testing.expectEqualStrings("ten", rows.rows[0][0].text);
+    }
+    try std.testing.expectError(error.AmbiguousColumn, queryRows(&eng, alloc, "SELECT id FROM t JOIN u ON t.uid = u.id"));
+
+    // ON 用右表的**索引列**（非主键）⇒ 走键前缀扫描；先给 u.name 建索引再插一行可匹配的 tag
+    try run(&eng, alloc, "CREATE INDEX idx_name ON u (name)");
+    try run(&eng, alloc, "INSERT INTO t (id, uid, tag) VALUES (5, 0, 'ten')");
+    {
+        // 确定性证据：右表 ON 列有索引时，右表主表**不该被全扫**。
+        // （若退回全扫，这里会变成「左行数 × 右行数」，结果一样但代价完全不同。）
+        eng.get("u").?.table.scan_rows_read = 0;
+        var rows = try queryRows(&eng, alloc, "SELECT t.id, u.id FROM t JOIN u ON t.tag = u.name ORDER BY t.id");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+        try std.testing.expectEqual(@as(i64, 5), rows.rows[0][0].integer);
+        try std.testing.expectEqual(@as(i64, 10), rows.rows[0][1].integer);
+        try std.testing.expectEqual(@as(u64, 0), eng.get("u").?.table.scan_rows_read);
+    }
+
+    // 不支持的形态：自连接（需要别名）与非等值 ON
+    try std.testing.expectError(error.UnsupportedStatement, queryRows(&eng, alloc, "SELECT t.id FROM t JOIN t ON t.id = t.uid"));
+    try std.testing.expectError(error.UnexpectedToken, queryRows(&eng, alloc, "SELECT t.id FROM t JOIN u ON t.uid > u.id"));
 }
 
 fn keyArrLess(_: void, a: [16]u8, b: [16]u8) bool {

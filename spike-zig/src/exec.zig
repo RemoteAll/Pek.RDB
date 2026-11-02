@@ -273,14 +273,14 @@ inline fn stamp(io: std.Io) u64 {
 /// 这正是 SQLite 用 rowid 索引把 `ORDER BY rowid DESC LIMIT 10` 做成常数级的同一条路。
 fn pkOrderOnly(s: *const schema_mod.Schema, order: []const sql.OrderItem) ?bool {
     if (order.len != 1) return null;
-    const idx = s.indexOf(order[0].column) orelse return null;
+    const idx = resolveColumn(s, order[0].column) catch return null;
     if (idx != s.pk_index) return null;
     return order[0].desc;
 }
 
 fn rowLess(ctx: SortCtx, a: []sql.Value, b: []sql.Value) bool {
     for (ctx.order) |o| {
-        const idx = ctx.schema.indexOf(o.column) orelse return false;
+        const idx = resolveColumn(ctx.schema, o.column) catch return false;
         const ord = schema_mod.valueCmp(a[idx], b[idx]);
         if (ord == .eq) continue;
         return if (o.desc) ord == .gt else ord == .lt;
@@ -422,6 +422,334 @@ fn buildOutput(
     return .{ .alloc = alloc, .columns = proj.columns, .rows = out_rows, .flat = pflat, .buf = buf };
 }
 
+/// 一张参与 JOIN 的表（`name` 用于合成 schema 的 `表.列` 列名）。
+pub const JoinedTable = struct {
+    name: []const u8,
+    table: *tablemod.Table,
+    schema: *const schema_mod.Schema,
+    host: ?*const IndexHost,
+};
+
+const JoinSide = struct { idx: usize, on_left: bool };
+
+/// 把 `ON` 一侧的 `表.列` 归一化成「哪一侧 + 列下标」。
+/// 不带表名的一律拒绝（两表有同名列时无法判断）——这是 parser 已经强制的，
+/// 这里再兜一次，防手写 AST 的调用方绕过。
+fn resolveJoinSide(
+    ref: []const u8,
+    lname: []const u8,
+    rname: []const u8,
+    sa: *const schema_mod.Schema,
+    sb: *const schema_mod.Schema,
+) !JoinSide {
+    const dot = std.mem.indexOfScalar(u8, ref, '.') orelse return error.UnsupportedStatement;
+    const tbl = ref[0..dot];
+    const col = ref[dot + 1 ..];
+    const on_left = std.ascii.eqlIgnoreCase(tbl, lname);
+    const on_right = std.ascii.eqlIgnoreCase(tbl, rname);
+    if (on_left and on_right) return error.UnsupportedStatement; // 自连接需要别名，暂不支持
+    if (!on_left and !on_right) return error.ColumnNotFound;
+    const s = if (on_left) sa else sb;
+    const idx = s.indexOf(col) orelse return error.ColumnNotFound;
+    return .{ .idx = idx, .on_left = on_left };
+}
+
+/// 合成 schema：列 = 左表列（名 `左表.列`）++ 右表列（名 `右表.列`）。
+///
+/// 用限定名而不是裸名，是为了让 `t.id` / `u.id` 能区分同名列；
+/// 裸名投影（`SELECT id`）由 `resolveColumn` 的「唯一匹配」兜住，重名报歧义。
+fn buildJoinSchema(
+    alloc: std.mem.Allocator,
+    lname: []const u8,
+    sa: *const schema_mod.Schema,
+    rname: []const u8,
+    sb: *const schema_mod.Schema,
+) !schema_mod.Schema {
+    const n = sa.columns.len + sb.columns.len;
+    const cols = try alloc.alloc(schema_mod.Column, n);
+    // `made` 计数而不是「无条件释放全部」：中途失败时右表那几列的 `name`
+    // 还是未初始化的垃圾，盲目 free 会 double free（第一版就这么崩的）。
+    var made: usize = 0;
+    defer {
+        for (cols[0..made]) |c| alloc.free(c.name);
+        alloc.free(cols);
+    }
+    for (sa.columns, 0..) |c, i| {
+        cols[i] = .{
+            .name = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ lname, c.name }),
+            .col_type = c.col_type,
+            // **合成 schema 只能有一个主键**（`Schema.init` 的硬约束）：
+            // 两张表各带一个主键，两个都保留会被 `init` 判 TooManyPrimaryKeys。
+            // JOIN 执行本身不用 `pk_index`，所以只留左表的即可。
+            .primary_key = c.primary_key,
+            .auto_increment = c.auto_increment,
+            .not_null = c.not_null,
+        };
+        made += 1;
+    }
+    for (sb.columns, 0..) |c, i| {
+        cols[sa.columns.len + i] = .{
+            .name = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ rname, c.name }),
+            .col_type = c.col_type,
+            .primary_key = false,
+            .auto_increment = c.auto_increment,
+            .not_null = c.not_null,
+        };
+        made += 1;
+    }
+    // `Schema.init` 会再 dupe 一遍列名（它自己的所有权契约），临时名由上面的 defer 释放
+    return schema_mod.Schema.init(alloc, "join", cols);
+}
+
+/// 在右表里找 `col = want` 的所有行，**每行都深拷进 `a`**（arena）。
+///
+/// 深浅拷贝在这里是硬要求：索引路径与点查路径的 `text`/`blob` 都指向
+/// 临时缓冲（`indexCollect` 的 owned 数组 / `t.get` 的复用缓冲），
+/// 出了本函数就失效。
+fn joinLookup(
+    rt: JoinedTable,
+    col_idx: usize,
+    want: sql.Value,
+    alloc: std.mem.Allocator,
+    a: std.mem.Allocator,
+    out: *std.ArrayList([]sql.Value),
+) !void {
+    if (isNullValue(want)) return; // `= NULL` 永远无匹配（与 WHERE 同口径）
+    const nb = rt.schema.columns.len;
+
+    // ① ON 列是右表主键 ⇒ 点查
+    if (col_idx == rt.schema.pk_index) {
+        const key = try rt.schema.encodeValueComponent(alloc, col_idx, want);
+        defer alloc.free(key);
+        var vbuf: std.ArrayList(u8) = .empty;
+        defer vbuf.deinit(alloc);
+        const raw = (try rt.table.get(key, &vbuf)) orelse return;
+        try appendDupRow(rt.schema, raw, alloc, a, out, nb);
+        return;
+    }
+
+    // ② ON 列有索引 ⇒ 键前缀扫描 + 回表复核
+    if (rt.host) |h| {
+        if (h.onColumn(col_idx) != null) {
+            var owned: std.ArrayList([]u8) = .empty;
+            defer {
+                for (owned.items) |x| alloc.free(x);
+                owned.deinit(alloc);
+            }
+            try indexCollect(h, rt.table, rt.schema, col_idx, want, alloc, &owned, null);
+            for (owned.items) |raw| try appendDupRow(rt.schema, raw, alloc, a, out, nb);
+            return;
+        }
+    }
+
+    // ③ 兜底：全表扫（O(右表行数)/次）。正确但慢 —— 大表必须给 ON 列建索引。
+    const rvals = try alloc.alloc(sql.Value, nb);
+    defer alloc.free(rvals);
+    var it = tablemod.MergeIter{};
+    try it.init(rt.table, &[_]u8{}, &[_]u8{});
+    defer it.deinit();
+    while (it.next()) |rec| {
+        try rt.schema.decodeRowInto(rvals, rec.value);
+        if (schema_mod.valueCmp(rvals[col_idx], want) != .eq) continue;
+        const row = try a.alloc(sql.Value, nb);
+        for (rvals, row) |v, *dst| dst.* = try dupValue(a, v);
+        try out.append(a, row);
+    }
+}
+
+fn dupValue(a: std.mem.Allocator, v: sql.Value) !sql.Value {
+    return switch (v) {
+        .text => |x| .{ .text = try a.dupe(u8, x) },
+        .blob => |x| .{ .blob = try a.dupe(u8, x) },
+        else => v,
+    };
+}
+
+fn appendDupRow(
+    s: *const schema_mod.Schema,
+    raw: []const u8,
+    alloc: std.mem.Allocator,
+    a: std.mem.Allocator,
+    out: *std.ArrayList([]sql.Value),
+    nb: usize,
+) !void {
+    const tmp = try alloc.alloc(sql.Value, nb);
+    defer alloc.free(tmp);
+    try s.decodeRowInto(tmp, raw);
+    const row = try a.alloc(sql.Value, nb);
+    for (tmp, row) |v, *dst| dst.* = try dupValue(a, v);
+    try out.append(a, row);
+}
+
+/// `[INNER|LEFT] JOIN` 执行：左表流式扫描 × 右表按键查找，物化成宽行后走统一装配。
+///
+/// **已知性能边界**：右表 ON 列既不是主键也没有索引时走全表扫描 ⇒ O(左行 × 右行)。
+/// 这是正确但慢的兜底，大表必须给 ON 列建索引。
+pub fn selectJoin(
+    left: JoinedTable,
+    right: JoinedTable,
+    sel: sql.Select,
+    alloc: std.mem.Allocator,
+) !Rows {
+    const jc = sel.join orelse return error.UnsupportedStatement;
+
+    const l = try resolveJoinSide(jc.left, left.name, right.name, left.schema, right.schema);
+    const r = try resolveJoinSide(jc.right, left.name, right.name, left.schema, right.schema);
+    if (l.on_left == r.on_left) return error.UnsupportedStatement; // 两侧同表（自连接）
+    const lcol = if (l.on_left) l.idx else r.idx;
+    const rcol = if (l.on_left) r.idx else l.idx;
+
+    var jschema = try buildJoinSchema(alloc, left.name, left.schema, right.name, right.schema);
+    defer jschema.deinit(alloc);
+
+    // 宽行全部从 arena 分配：`finishFromRows` 会把它们深拷进结果缓冲，
+    // 所以这里不需要逐行追踪所有权（也就不会漏 free）。
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const na = left.schema.columns.len;
+    const nb = right.schema.columns.len;
+    // WHERE 在**宽行**上过滤：单表路径在扫描阶段就过滤了，JOIN 没有那个阶段，
+    // 漏了这一步会让 `WHERE u.name = 'ten'` 静默失效（用例当场抓到过）。
+    const where_idx: ?usize = if (sel.where) |w| try resolveColumn(&jschema, w.column) else null;
+    var wide: std.ArrayList([]sql.Value) = .empty;
+    var matches: std.ArrayList([]sql.Value) = .empty;
+    const lvals = try alloc.alloc(sql.Value, na);
+    defer alloc.free(lvals);
+
+    var it = tablemod.MergeIter{};
+    try it.init(left.table, &[_]u8{}, &[_]u8{});
+    defer it.deinit();
+    while (it.next()) |rec| {
+        try left.schema.decodeRowInto(lvals, rec.value);
+        matches.clearRetainingCapacity();
+        try joinLookup(right, rcol, lvals[lcol], alloc, a, &matches);
+        if (matches.items.len == 0) {
+            if (jc.kind == .left) {
+                const row = try a.alloc(sql.Value, na + nb);
+                for (row[0..na], lvals) |*dst, v| dst.* = try dupValue(a, v);
+                for (row[na..]) |*dst| dst.* = .null;
+                try pushJoined(a, &wide, row, sel, where_idx);
+            }
+            continue;
+        }
+        for (matches.items) |rv| {
+            const row = try a.alloc(sql.Value, na + nb);
+            for (row[0..na], lvals) |*dst, v| dst.* = try dupValue(a, v);
+            @memcpy(row[na..], rv);
+            try pushJoined(a, &wide, row, sel, where_idx);
+        }
+    }
+
+    return try finishFromRows(left.table.io, &jschema, sel, alloc, wide.items);
+}
+
+/// 宽行入结果集前的过滤（`WHERE`）。NULL 参与比较时按 `valueCmp` 的语义走，
+/// 所以 `LEFT JOIN` 补出来的 NULL 行在 `WHERE u.x = 'v'` 下会被正确滤除。
+fn pushJoined(
+    a: std.mem.Allocator,
+    wide: *std.ArrayList([]sql.Value),
+    row: []sql.Value,
+    sel: sql.Select,
+    where_idx: ?usize,
+) !void {
+    if (sel.where) |w| {
+        if (!evalWhere(row[where_idx.?], w.op, w.value)) return;
+    }
+    try wide.append(a, row);
+}
+
+/// 把「已解码的宽行」装配成 `Rows`：投影 / 排序 / 输出三段与 `finishFromValues` 同一套逻辑，
+/// 区别只在输入已经是值（JOIN 产出），不需要再从行编码解码。
+fn finishFromRows(
+    io: std.Io,
+    s: *const schema_mod.Schema,
+    sel: sql.Select,
+    alloc: std.mem.Allocator,
+    rows: []const []sql.Value,
+) !Rows {
+    var t0 = stamp(io);
+    const proj = try buildProjection(alloc, s, sel.items);
+    if (timing_enabled) {
+        const t1 = stamp(io);
+        timing.projection += t1 - t0;
+        t0 = t1;
+    }
+    errdefer {
+        for (proj.columns) |c| alloc.free(c);
+        alloc.free(proj.columns);
+        alloc.free(proj.indices);
+    }
+
+    // 深拷贝 text/blob：它们指向 JOIN 的 arena，出函数就失效
+    var total: usize = 0;
+    for (rows) |r| {
+        for (r) |v| switch (v) {
+            .text => |x| total += x.len,
+            .blob => |x| total += x.len,
+            else => {},
+        };
+    }
+    const ncols = s.columns.len;
+    const buf = try alloc.alloc(u8, total);
+    errdefer alloc.free(buf);
+    const flat = try alloc.alloc(sql.Value, rows.len * ncols);
+    errdefer alloc.free(flat);
+    const hdrs = try alloc.alloc([]sql.Value, rows.len);
+    errdefer alloc.free(hdrs);
+
+    var off: usize = 0;
+    for (rows, 0..) |src, i| {
+        const dst = flat[i * ncols ..][0..ncols];
+        for (src, 0..) |v, c| {
+            dst[c] = switch (v) {
+                .text => |x| blk: {
+                    @memcpy(buf[off..][0..x.len], x);
+                    const sl = buf[off..][0..x.len];
+                    off += x.len;
+                    break :blk .{ .text = sl };
+                },
+                .blob => |x| blk: {
+                    @memcpy(buf[off..][0..x.len], x);
+                    const sl = buf[off..][0..x.len];
+                    off += x.len;
+                    break :blk .{ .blob = sl };
+                },
+                else => v,
+            };
+        }
+        hdrs[i] = dst;
+    }
+    var m = Materialized{ .alloc = alloc, .flat = flat, .hdrs = hdrs, .buf = buf, .ncols = ncols };
+    defer m.deinit();
+    if (timing_enabled) {
+        const t1 = stamp(io);
+        timing.decode += t1 - t0;
+        t0 = t1;
+    }
+
+    if (sel.order_by.len > 0) {
+        const ctx = SortCtx{ .schema = s, .order = sel.order_by };
+        std.mem.sort([]sql.Value, m.hdrs, ctx, rowLess);
+    }
+
+    var start: usize = 0;
+    if (sel.offset) |o| start = @min(@as(usize, o), m.hdrs.len);
+    var end: usize = m.hdrs.len;
+    if (sel.limit) |l| end = @min(end, start + @as(usize, l));
+
+    if (timing_enabled) {
+        const t1 = stamp(io);
+        timing.sort += t1 - t0;
+        t0 = t1;
+        timing.calls += 1;
+    }
+    const out = try buildOutput(alloc, s, &m, proj, start, end);
+    if (timing_enabled) timing.output += stamp(io) - t0;
+    return out;
+}
+
 pub fn insertRows(
     t: *tablemod.Table,
     s: *const schema_mod.Schema,
@@ -473,6 +801,24 @@ const Projection = struct {
     columns: [][]const u8,
 };
 
+/// 列名解析：**完整名优先**，再退化成「裸名唯一匹配」。
+///
+/// 为什么需要后者：JOIN 的合成 schema 列名是 `表.列`（`t.id`、`u.id`），
+/// 而 `SELECT id` 这种写法在 SQL 里仍然要能工作——此时只能靠「裸名在两表里唯一」
+/// 来定位；两表都有就叫歧义，必须报错而不是默默取第一个。
+pub fn resolveColumn(s: *const schema_mod.Schema, name: []const u8) !usize {
+    if (s.indexOf(name)) |i| return i;
+    if (std.mem.indexOfScalar(u8, name, '.') != null) return error.ColumnNotFound;
+    var found: ?usize = null;
+    for (s.columns, 0..) |c, i| {
+        const dot = std.mem.lastIndexOfScalar(u8, c.name, '.') orelse continue;
+        if (!std.ascii.eqlIgnoreCase(c.name[dot + 1 ..], name)) continue;
+        if (found != null) return error.AmbiguousColumn;
+        found = i;
+    }
+    return found orelse error.ColumnNotFound;
+}
+
 fn buildProjection(alloc: std.mem.Allocator, s: *const schema_mod.Schema, items: []const sql.SelectItem) !Projection {
     var indices: std.ArrayList(usize) = .empty;
     var columns: std.ArrayList([]const u8) = .empty;
@@ -492,7 +838,7 @@ fn buildProjection(alloc: std.mem.Allocator, s: *const schema_mod.Schema, items:
                 }
             },
             .column => |name| {
-                const idx = s.indexOf(name) orelse return error.ColumnNotFound;
+                const idx = try resolveColumn(s, name);
                 try indices.append(alloc, idx);
                 const cn = try alloc.dupe(u8, s.columns[idx].name);
                 errdefer alloc.free(cn);

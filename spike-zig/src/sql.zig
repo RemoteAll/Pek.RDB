@@ -32,6 +32,8 @@ pub const TokenTag = enum {
     plus,
     /// `?` —— 无编号占位符，**按出现顺序** 1-based 编号（与 SQLite 对裸 `?` 的语义一致）
     question,
+    /// `.` —— 只用于列名限定 `表.列`（数字里的小数点由 `lexNumber` 自己吃）
+    dot,
 };
 
 pub const Token = struct {
@@ -124,6 +126,10 @@ pub const Lexer = struct {
             '?' => {
                 self.pos += 1;
                 return .{ .tag = .question, .text = "?" };
+            },
+            '.' => {
+                self.pos += 1;
+                return .{ .tag = .dot, .text = "." };
             },
             else => {},
         }
@@ -292,6 +298,21 @@ pub const Having = struct {
     value: Value,
 };
 
+pub const JoinKind = enum { inner, left };
+
+/// `[INNER|LEFT [OUTER]] JOIN <表> ON <列> = <列>`。
+///
+/// **只支持单条等值连接条件**（`ON a.x = b.y`）。非等值/多条件/多表链式 JOIN 报
+/// `UnsupportedStatement`，而不是静默降级成笛卡尔积——静默会让结果集尺寸爆掉且看不出原因。
+pub const JoinClause = struct {
+    kind: JoinKind,
+    /// 右表名
+    table: []const u8,
+    /// ON 两侧，**都写成 `表.列` 形式**（parser 强制要求带表名，否则无法判断属于哪侧）
+    left: []const u8,
+    right: []const u8,
+};
+
 pub const Select = struct {
     items: []SelectItem,
     table: []const u8,
@@ -309,6 +330,8 @@ pub const Select = struct {
     /// `.limit = 10` 构造点。
     limit_param: u8 = 0,
     offset_param: u8 = 0,
+    /// 非空表示这是一条 JOIN 查询（右表在 `join.?.table`）。
+    join: ?JoinClause = null,
 };
 
 pub const Assign = struct {
@@ -410,6 +433,18 @@ const Parser = struct {
     fn parseIdent(self: *Parser) Error![]const u8 {
         const t = try self.expectTag(.ident);
         return self.arena.dupe(u8, t.text);
+    }
+
+    /// `列` 或 `表.列`。后者拼成 `"表.列"`（JOIN 时必须用它消除同名歧义）。
+    ///
+    /// 不把 `.` 合进 `lexIdent`：数字字面量的小数点由 `lexNumber` 处理，
+    /// 混在一起会让 `LIMIT 1.5` 之类的分词变得依赖上下文。
+    fn parseColumnRef(self: *Parser) Error![]const u8 {
+        const first = try self.parseIdent();
+        if (self.tok.tag != .dot) return first;
+        try self.advance();
+        const second = try self.parseIdent();
+        return try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ first, second });
     }
 
     fn parseType(text: []const u8) Error!ColumnType {
@@ -592,7 +627,7 @@ const Parser = struct {
     }
 
     fn parseExpr(self: *Parser) Error!Expr {
-        const column = try self.parseIdent();
+        const column = try self.parseColumnRef();
         const op: CmpOp = switch (self.tok.tag) {
             .eq => .eq,
             .ne => .ne,
@@ -617,6 +652,12 @@ const Parser = struct {
             return .star;
         }
         const name = try self.parseIdent();
+        // `表.列`（JOIN 用）：函数名不可能带限定名，所以这里先判 `.`
+        if (self.tok.tag == .dot) {
+            try self.advance();
+            const col = try self.parseIdent();
+            return .{ .column = try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ name, col }) };
+        }
         if (self.tok.tag != .lparen) return .{ .column = name };
 
         const func = aggFuncFromName(name) orelse return error.UnsupportedStatement;
@@ -639,6 +680,11 @@ const Parser = struct {
     /// 这样 `selectGrouped` 排序时只需按列名匹配，不必再写一套表达式比较。
     fn parseOrderTarget(self: *Parser) Error![]const u8 {
         const name = try self.parseIdent();
+        if (self.tok.tag == .dot) {
+            try self.advance();
+            const col = try self.parseIdent();
+            return try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ name, col });
+        }
         if (self.tok.tag != .lparen) return name;
 
         const func = aggFuncFromName(name) orelse return error.UnsupportedStatement;
@@ -704,6 +750,32 @@ const Parser = struct {
         };
         items.deinit(self.arena);
 
+        // `[INNER|LEFT [OUTER]] JOIN <表> ON <列> = <列>`
+        //
+        // `ON` 两侧**必须带表名**：不带的活无法判断属于哪侧（两表有同名列时就是歧义），
+        // 报 `UnexpectedToken` 而不是猜。
+        {
+            var kind: ?JoinKind = null;
+            if (try self.acceptKw("join")) {
+                kind = .inner;
+            } else if (try self.acceptKw("inner")) {
+                try self.expectKw("join");
+                kind = .inner;
+            } else if (try self.acceptKw("left")) {
+                _ = try self.acceptKw("outer");
+                try self.expectKw("join");
+                kind = .left;
+            }
+            if (kind) |k| {
+                const rtab = try self.parseIdent();
+                try self.expectKw("on");
+                const lhs = try self.parseColumnRef();
+                _ = try self.expectTag(.eq);
+                const rhs = try self.parseColumnRef();
+                sel.join = .{ .kind = k, .table = rtab, .left = lhs, .right = rhs };
+            }
+        }
+
         if (try self.acceptKw("where")) {
             sel.where = try self.parseExpr();
         }
@@ -712,7 +784,7 @@ const Parser = struct {
             try self.expectKw("by");
             var gb: std.ArrayList([]const u8) = .empty;
             while (true) {
-                try gb.append(self.arena, try self.parseIdent());
+                try gb.append(self.arena, try self.parseColumnRef());
                 if (self.tok.tag == .comma) {
                     try self.advance();
                     continue;
@@ -1069,8 +1141,7 @@ test "parse HAVING 聚合比较" {
 }
 
 test "parse group by with aggregates" {
-    var p = try parse(std.testing.allocator,
-        "SELECT g, COUNT(*), SUM(x), AVG(x), MIN(x), MAX(x) FROM t GROUP BY g ORDER BY g DESC LIMIT 3");
+    var p = try parse(std.testing.allocator, "SELECT g, COUNT(*), SUM(x), AVG(x), MIN(x), MAX(x) FROM t GROUP BY g ORDER BY g DESC LIMIT 3");
     defer p.deinit();
     const s = p.stmt.select;
     try std.testing.expectEqual(@as(usize, 6), s.items.len);
