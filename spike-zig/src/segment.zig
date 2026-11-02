@@ -704,6 +704,22 @@ pub const Segment = struct {
         return self.idx[e.key_off..][0..e.key_len];
     }
 
+    /// 段内「尾部 want_rows 行」的起点 key（供 `ORDER BY pk DESC LIMIT k` 的反向快速路径）。
+    ///
+    /// 段的 key 递增，所以「段内最大的若干行」不需要反向解码器：把起点定在**倒数第几个
+    /// 稀疏索引项**（每 `INDEX_STRIDE`=64 行一项）上，用现成的正向游标从头扫一小段即可。
+    /// 多给一块余量（`+1`），保证「同 key 的多个版本跨过块边界」时也能被覆盖到。
+    ///
+    /// 返回的切片指向 `self.idx`（mmap / 自有内存），在段存活期间稳定。
+    pub fn tailStartKey(self: *Segment, want_rows: usize) ![]const u8 {
+        try self.ensureParsed();
+        const n = self.entries.items.len;
+        if (n == 0) return &.{};
+        const blocks = want_rows / INDEX_STRIDE + 1;
+        const j = if (n > blocks) n - blocks else 0;
+        return self.entryKey(j);
+    }
+
     /// 段内最大 key（头部就有）。**空段**返回 null。
     /// 与 `firstKey()` 配合就能判定「两段 key 范围是否重叠」（顺序拼接的前提），
     /// 也能判定「整段是否落在查询起点之前」（反向段裁剪）。

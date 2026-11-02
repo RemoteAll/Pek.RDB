@@ -547,6 +547,23 @@ fn main() -> rusqlite::Result<()> {
             let secs = t0.elapsed().as_secs_f64();
             println!("sql_full,{},{}", n, n as f64 / secs);
         }
+        // 排序 + 分页（top-N）：与 Zig 侧 `sql_orderby_limit10` 同一条语句、同一张 100 万行表。
+        //
+        // SQLite 自己也有 sorter 的 top-N 优化（只要前 N 名就不保留全部），
+        // 所以这一档是「两边都有 top-N 优化」的对等比较，而不是拿我们的全量排序比它。
+        {
+            let t0 = Instant::now();
+            let mut n: usize = 0;
+            {
+                let mut stmt = c3.prepare("SELECT * FROM t ORDER BY id DESC LIMIT 10")?;
+                let mut rows = stmt.query([])?;
+                while rows.next()?.is_some() {
+                    n += 1;
+                }
+            }
+            let secs = t0.elapsed().as_secs_f64();
+            println!("sql_orderby_limit10,{},{}", n, n as f64 / secs);
+        }
         // 上面的 sql_full 只推进游标、**不取列值**。SQLite 的 `OP_Column` 是惰性的：
         // 不调用 `column_*` 就根本不解码，所以那个数字只代表「游标推进」。
         // 这一档把两列都真读出来（都用零拷贝，不 malloc）：

@@ -742,8 +742,168 @@ pub const Table = struct {
         return out.items;
     }
 
-    /// 重算「段 key 范围是否严格递增不重叠」这个布局标记（O(段数)，只在段集合变化时调）。
+    /// 「最大的 k 个可见行」——`ORDER BY <pk> DESC LIMIT k` 的快速路径。
     ///
+    /// **为什么必须有这条路径**：SQLite 对 `ORDER BY rowid DESC LIMIT 10` 是「沿 rowid 索引
+    /// 倒着走、走够 10 行就停」，代价 O(k)。我们原来只有「全表扫描 + top-N 堆」，是 O(n) ——
+    /// 100 万行实测 **76 行/s vs SQLite 125,313 行/s（0.0006×）**，
+    /// 差的是「能不能用顺序性提前停」，不是常数项（见 docs/决策记录.md §九十四）。
+    ///
+    /// **做法**：
+    /// 1. 每段用 `tailStartKey()` 定位到尾部块，正向游标只扫 `k+64` 行左右
+    ///    （段的 key 递增 ⇒ 「段内最大的若干行」就在尾部，不需要反向解码器）；
+    ///    memtable 用 `revIterator`（`Skiplist` 尾查找 + 前驱）取最大 `k+64` 条。
+    /// 2. 全部候选按 `(key asc, seq desc)` 排序 ⇒ 同 key 的第一条就是**最新可见版本**，
+    ///    再按 key 归组：最新那条是墓碑就整组丢掉，否则整组取第一条。
+    /// 3. 从大往小取 k 组。
+    ///
+    /// **「窗口边界组」必须丢弃**：每个来源的最小 key 组可能被窗口截断（只拿到旧版本），
+    /// 用它就会返回陈旧值。标记成 `edge` 整组跳过，`+64` 的余量足够补上。
+    ///
+    /// 返回 `false` ⇒ 候选凑不够 k 组（表太小 / 尾部全是墓碑），调用方回退全量路径。
+    /// 正确性不依赖快速路径够不够用。
+    ///
+    /// `out` 里的切片指向段 mmap / memtable arena，查询期间有效（与 `scanValues` 同口径）。
+    pub fn topKDesc(self: *Table, k: usize, out: *std.ArrayList([]const u8)) !bool {
+        self.checkThread();
+        out.clearRetainingCapacity();
+        if (k == 0) return true;
+        const alloc = self.alloc;
+        const window = k + segmod.INDEX_STRIDE;
+
+        const Cand = TopCand;
+        var kbuf: std.ArrayList(u8) = .empty; // 稳定 key 区（段游标的 key 指向双缓冲）
+        defer kbuf.deinit(alloc);
+        var cand: std.ArrayList(Cand) = .empty;
+        defer cand.deinit(alloc);
+
+        // ---- 1) 段：从后往前；不重叠且已凑够 window 就停 ----
+        // 不重叠递增时最大的 k 个 key 必然在最后一段里，7 段就是 7 个游标减到 1 个。
+        // 重叠时（分层合并之后）不能停：合并段带着旧数据排在末尾，「段序 = 新旧序」不成立。
+        var si = self.segs.items.len;
+        while (si > 0) {
+            si -= 1;
+            const sg = &self.segs.items[si];
+            if (sg.rows == 0) continue;
+            const start = try sg.tailStartKey(window);
+            // 只有「从段的第一个 key 开始」时才不存在头部截断；否则窗口最小的那一组
+            // 可能只拿到旧版本（同 key 的版本链跨块边界）⇒ 整组标记不可信。
+            const head_trunc = if (sg.firstKey()) |fk| segmod.keyCmp(start, fk) != .eq else false;
+            var c = try sg.cursor(start, &.{}, self.visible);
+            defer c.deinit();
+            var first = head_trunc;
+            while (c.next()) |rec| {
+                const off = kbuf.items.len;
+                try kbuf.appendSlice(alloc, rec.key);
+                try cand.append(alloc, .{
+                    .key_off = off,
+                    .key_len = rec.key.len,
+                    .seq = rec.seq,
+                    .flags = rec.flags,
+                    .value = rec.value,
+                    .edge = first, // 该段最小的那一组：可能被窗口截断
+                });
+                first = false;
+            }
+            if (self.segs_disjoint_asc and cand.items.len >= window) break;
+        }
+        // ---- 2) memtable：反向迭代（最大值在前），窗口尾部可能截断 ⇒ 标记最后一组 ----
+        if (self.mem.len() > 0) {
+            const base = cand.items.len;
+            var it = self.mem.revIterator();
+            var n: usize = 0;
+            var stopped_early = false;
+            while (it.next()) |e| {
+                if (n >= window) {
+                    stopped_early = true;
+                    break;
+                }
+                // 段游标内部会按 snapshot 过滤，memtable 的反向迭代器不会 —— 这里必须自己过
+                if (e.seq > self.visible) continue;
+                n += 1;
+                const off = kbuf.items.len;
+                try kbuf.appendSlice(alloc, e.key);
+                try cand.append(alloc, .{
+                    .key_off = off,
+                    .key_len = e.key.len,
+                    .seq = e.seq,
+                    .flags = e.flags,
+                    .value = e.value,
+                    .edge = false,
+                });
+            }
+            if (stopped_early and cand.items.len > base) {
+                const ctx = KbufCtx{ .buf = kbuf.items };
+                const last_key = ctx.key(cand.items[cand.items.len - 1]);
+                var i = cand.items.len;
+                while (i > base) {
+                    i -= 1;
+                    if (segmod.keyCmp(ctx.key(cand.items[i]), last_key) != .eq) break;
+                    cand.items[i].edge = true;
+                }
+            }
+        }
+        if (cand.items.len == 0) return false;
+
+        // ---- 3) 排序 → 按 key 归组取最新版本 → 从大往小取 k 组 ----
+        const ctx = KbufCtx{ .buf = kbuf.items };
+        std.mem.sort(Cand, cand.items, ctx, candLess);
+
+        var picked: std.ArrayList([]const u8) = .empty; // key 升序
+        defer picked.deinit(alloc);
+        var i: usize = 0;
+        while (i < cand.items.len) {
+            var j = i + 1;
+            while (j < cand.items.len and segmod.keyCmp(ctx.key(cand.items[i]), ctx.key(cand.items[j])) == .eq) : (j += 1) {}
+            var suspect = false;
+            for (cand.items[i..j]) |c| {
+                if (c.edge) {
+                    suspect = true;
+                    break;
+                }
+            }
+            if (!suspect and cand.items[i].flags == 0) try picked.append(alloc, cand.items[i].value);
+            i = j;
+        }
+        if (picked.items.len < k) return false; // 凑不够 ⇒ 让调用方走全量路径
+        var idx = picked.items.len;
+        const stop = picked.items.len - k;
+        while (idx > stop) {
+            idx -= 1;
+            try out.append(alloc, picked.items[idx]); // 大 → 小
+        }
+        return true;
+    }
+
+    /// `topKDesc` 的候选记录（段尾部 / memtable 尾部的一行）。
+    const TopCand = struct {
+        key_off: usize,
+        key_len: usize,
+        seq: u64,
+        flags: u8,
+        value: []const u8,
+        /// 属于某个来源的「窗口边界 key 组」⇒ 版本链可能被截断，不可信
+        edge: bool,
+    };
+
+    /// 候选 key 的比较上下文：key 都存在 `kbuf` 里，用 `{off,len}` 定位。
+    const KbufCtx = struct {
+        buf: []const u8,
+
+        inline fn key(self: KbufCtx, c: TopCand) []const u8 {
+            return self.buf[c.key_off..][0..c.key_len];
+        }
+    };
+
+    fn candLess(ctx: KbufCtx, a: TopCand, b: TopCand) bool {
+        return switch (segmod.keyCmp(ctx.key(a), ctx.key(b))) {
+            .lt => true,
+            .gt => false,
+            .eq => a.seq > b.seq, // 同 key：新版本在前
+        };
+    }
+
+    /// 重算「段 key 范围是否严格递增不重叠」这个布局标记（O(段数)，只在段集合变化时调）。    ///
     /// 为什么需要标记而不是每次现算：`get` 是热路径，每次查都 O(n) 就本末倒置了。
     /// 为什么可以只算一次：段不可变，只有 flush / 合并才会改变段集合。
     fn recomputeSegLayout(self: *Table) void {
@@ -3206,6 +3366,97 @@ test "索引归档上限可配：index_max_bytes=0 不限，设小了明确报 F
 
 fn tKey(buf: []u8, n: usize) []const u8 {
     return std.fmt.bufPrint(buf, "k{d:0>6}", .{n}) catch unreachable;
+}
+
+test "topKDesc：跨段 + 旧版本 + 墓碑，取最大的 k 个可见行（降序）" {
+    // 这条快速路径是 `ORDER BY pk DESC LIMIT k` 的全部依据，一旦取错版本/漏掉墓碑，
+    // 用户看到的就是「最新 10 条里混着旧值或已删除的行」。所以三件事都要钉住：
+    //   ① 跨多段（含重叠段，段序≠新旧序）；② 同 key 的旧版本不得压住新版本；
+    //   ③ 墓碑必须整行消失（不能返回已删除的 key）。
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-topkdesc";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    const batch = 100;
+    const batches = 6;
+    const total = batch * batches; // 600
+
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0, .flush_bytes = 4096 });
+    defer t.deinit();
+
+    var kb: [batch][16]u8 = undefined;
+    var vb: [batch][16]u8 = undefined;
+    var keys: [batch][]const u8 = undefined;
+    var vals: [batch][]const u8 = undefined;
+
+    // 6 段，每段 100 行
+    var b: usize = 0;
+    while (b < batches) : (b += 1) {
+        for (0..batch) |i| {
+            const n = b * batch + i;
+            keys[i] = tKey(&kb[i], n);
+            vals[i] = tVal(&vb[i], 'v', n);
+        }
+        try t.putBatch(keys[0..batch], vals[0..batch]);
+    }
+    // 100..199 更新成 'u'：最新版本落在**最后**一段（其它段里是旧值）
+    for (0..batch) |i| {
+        keys[i] = tKey(&kb[i], 100 + i);
+        vals[i] = tVal(&vb[i], 'u', 100 + i);
+    }
+    try t.putBatch(keys[0..batch], vals[0..batch]);
+    // 590..599 删除（墓碑在最新段里，段里还有更旧的非墓碑版本）
+    for (590..600) |n| try t.delete(tKey(&kb[0], n));
+    try t.flush();
+
+    // 「段序 ≠ 新旧序」是这条路径最容易读错版本的情形：更新批（100..199）落在**新的**
+    // 一段里，与原来那段 key 范围重叠 ⇒ `get` 必须走「按 seq 取最新版本」的重叠路径。
+    // 顺手试一次分层合并（段小的时候可能不满足同一量级，不强制它成功）。
+    try std.testing.expect(!t.segs_disjoint_asc);
+    _ = try t.compactTier(3);
+
+    var out: std.ArrayList([]const u8) = .empty;
+    defer out.deinit(alloc);
+
+    // ① 前 10 名：590..599 已删除 ⇒ 应为 589..580，且都是 'v' 版本
+    try std.testing.expect(try t.topKDesc(10, &out));
+    try std.testing.expectEqual(@as(usize, 10), out.items.len);
+    for (out.items, 0..) |got, i| {
+        const n = 589 - i;
+        var wb: [16]u8 = undefined;
+        try std.testing.expectEqualStrings(tVal(&wb, 'v', n), got);
+    }
+
+    // ② 覆盖更新段：取 205..196（跨过 100..199 的更新区边界）⇒ 一律是 'u'
+    try std.testing.expect(try t.topKDesc(10, &out));
+    var out2: std.ArrayList([]const u8) = .empty;
+    defer out2.deinit(alloc);
+    // 先取 200..209（未更新，'v'），再从第一名往回数到 196
+    try std.testing.expect(try t.topKDesc(400, &out2));
+    try std.testing.expectEqual(@as(usize, 400), out2.items.len);
+    // out2[0] 应对应 589；out2[389] 对应 200；再往后是 199..196 的更新值
+    try std.testing.expectEqual(@as(usize, 400), out2.items.len);
+    {
+        var i: usize = 0;
+        while (i < 400) : (i += 1) {
+            const n = 589 - i;
+            const prefix: u8 = if (n >= 100 and n < 200) 'u' else 'v';
+            var wb: [16]u8 = undefined;
+            try std.testing.expectEqualStrings(tVal(&wb, prefix, n), out2.items[i]);
+        }
+    }
+
+    // ③ k 超过实际行数 ⇒ 返回 false（调用方回退全量路径），而不是给半截结果
+    try std.testing.expect(!try t.topKDesc(total + 10, &out));
+    // ④ 恰好等于行数（590 行有效）⇒ true，且 590 个
+    try std.testing.expect(try t.topKDesc(total - 10, &out));
+    try std.testing.expectEqual(@as(usize, total - 10), out.items.len);
 }
 
 fn tVal(buf: []u8, prefix: u8, n: usize) []const u8 {

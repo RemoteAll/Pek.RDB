@@ -559,6 +559,28 @@ fn benchMain() !void {
             std.debug.print("sql_full,{d},{d:.0}\n", .{ rows.rows.len, opsPerSec(@intCast(rows.rows.len), ns) });
             std.debug.print("sql_full_readrows,{d},0\n", .{t4.scan_rows_read});
         }
+        // 排序 + 分页（top-N）：`ORDER BY id DESC LIMIT 10`，100 万行里只要前 10 名。
+        //
+        // 改之前：全量解码（100 万行 ≈ 96 MB）+ 全量排序，全为了丢掉 99.999%。
+        // 现在扫描时只维护一个 k=10 的堆（`exec.keepTopN`），排序只排 10 行。
+        // 与 SQLite 的 `ORDER BY ... LIMIT` sorter top-N 优化同口径（同一条语句）。
+        {
+            var items_o = [_]spike.sql.SelectItem{.{ .star = {} }};
+            var ord_o = [_]spike.sql.OrderItem{.{ .column = "id", .desc = true }};
+            const sel_o = spike.sql.Select{
+                .items = &items_o,
+                .table = "bench_sql",
+                .order_by = &ord_o,
+                .limit = 10,
+            };
+            t4.scan_rows_read = 0;
+            const t0 = nowNs(io);
+            var rows_o = try spike.exec.selectRows(&t4, &s, sel_o, alloc);
+            const ns = nowNs(io) - t0;
+            defer rows_o.deinit();
+            std.debug.print("sql_orderby_limit10,{d},{d:.0}\n", .{ rows_o.rows.len, opsPerSec(@intCast(rows_o.rows.len), ns) });
+            std.debug.print("sql_orderby_limit10_readrows,{d},0\n", .{t4.scan_rows_read});
+        }
         // 投影扫描：同一张表、同样全表范围，只取 1 列（`SELECT id`）。
         //
         // 为什么单独一档：SQLite 的 `OP_Column` 是惰性的（不调 `sqlite3_column_*` 就

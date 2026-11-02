@@ -21,6 +21,10 @@ pub const Node = struct {
     flags: u8,
     height: u8,
     next: [MAX_HEIGHT]u32,
+    /// **0 层前驱**（双向链）。只为反向迭代器存在：`ORDER BY pk DESC LIMIT k` 要
+    /// 从最大节点往前走 k 步，没有前驱链每步都得 `find()` 一次（O(log n)），
+    /// 实测那 74 步要 ~20 µs，占了整个查询的一大半。代价是每条记录 +4 B。
+    prev0: u32 = NIL,
 };
 
 fn keyCmp(a: []const u8, b: []const u8) std.math.Order {
@@ -183,6 +187,7 @@ pub const Skiplist = struct {
             .flags = flags,
             .height = h,
             .next = @splat(NIL),
+            .prev0 = pred[0],
         };
 
         var lvl: usize = 0;
@@ -196,6 +201,8 @@ pub const Skiplist = struct {
                 self.nodes.items[p].next[lvl] = idx;
             }
         }
+        // 0 层双向：后继（如果有）的前驱改成新节点
+        if (succ[0] != NIL) self.nodes.items[succ[0]].prev0 = idx;
         try self.nodes.append(self.alloc, node);
         if (h > self.height) self.height = h;
         // 只有「插到了链尾」才记录快路径状态；否则作废（否则前驱会指向已过时的位置）。
@@ -260,6 +267,51 @@ pub const Skiplist = struct {
         var succ: [MAX_HEIGHT]u32 = @splat(NIL);
         self.find(start, std.math.maxInt(u64), &pred, &succ);
         return .{ .list = self, .cur = succ[0] };
+    }
+
+    /// 最后一个节点（最大值）。标准 skiplist 尾查找：每层从上层停下的节点继续，总代价 O(log n)。
+    fn lastNode(self: *const Skiplist) u32 {
+        var cur: u32 = NIL;
+        var lvl: usize = self.height;
+        while (lvl > 0) {
+            lvl -= 1;
+            var c: u32 = if (cur == NIL) self.head[lvl] else self.nodes.items[cur].next[lvl];
+            while (c != NIL) {
+                cur = c;
+                c = self.nodes.items[c].next[lvl];
+            }
+        }
+        return cur;
+    }
+
+    /// **反向迭代器**：从最大节点往小走（`ORDER BY pk DESC LIMIT k` 的物理基础，
+    /// 对齐 RocksDB 的 `Prev()` / sled 的 `DoubleEndedIterator`）。
+    ///
+    /// 每步用 `find()` 求前驱（O(log n)），而不是给每个节点加 `prev[]`：节点结构里
+    /// 已经有一个 22×4B 的 `next[]`，再加一份 `prev[]` 会让 memtable 每条记录多 88B
+    /// （40B/行的现状会翻倍）。k 通常是 10~1000，O(k log n) 完全够；真要全表倒序扫
+    /// 再考虑加链。
+    pub const RevIter = struct {
+        list: *const Skiplist,
+        cur: u32,
+
+        pub fn next(self: *RevIter) ?Entry {
+            if (self.cur == NIL) return null;
+            const n = &self.list.nodes.items[self.cur];
+            const e = Entry{
+                .key = self.list.keyOf(n),
+                .seq = n.seq,
+                .flags = n.flags,
+                .value = self.list.valueOf(n),
+            };
+            self.cur = n.prev0; // 0 层前驱链，O(1)
+            return e;
+        }
+    };
+
+    /// 反向迭代：从最大值开始。
+    pub fn revIterator(self: *const Skiplist) RevIter {
+        return .{ .list = self, .cur = self.lastNode() };
     }
 
     pub fn reset(self: *Skiplist) void {
@@ -345,4 +397,80 @@ test "顺序追加快路径：升序 / 回退 / 再升序都必须保持严格�
         n += 1;
     }
     try std.testing.expectEqual(@as(usize, 401), n);
+}
+
+test "反向迭代器：与正向遍历互为逆序（含同 key 多版本）" {
+    var sk = Skiplist.init(std.testing.allocator);
+    defer sk.deinit();
+
+    // 乱序灌入，并给 "k0005" 两个版本 —— 反向时 (key, seq) 也必须严格递减
+    const keys = [_][]const u8{ "k0003", "k0000", "k0005", "k0001", "k0004", "k0002" };
+    for (keys) |k| try sk.insert(k, 1, 0, "v1");
+    try sk.insert("k0005", 2, 0, "v2");
+
+    // 正序收集
+    var fwd: std.ArrayList([]const u8) = .empty;
+    defer fwd.deinit(std.testing.allocator);
+    var it = sk.iterator();
+    while (it.next()) |e| try fwd.append(std.testing.allocator, e.key);
+
+    // 反序收集：必须正好是 fwd 的逆序，且 key 严格递减
+    var rev = sk.revIterator();
+    var i: usize = fwd.items.len;
+    var prev_key: ?[]const u8 = null;
+    var first_key: []const u8 = &.{};
+    var first_seq: u64 = 0;
+    var n: usize = 0;
+    while (rev.next()) |e| {
+        i -= 1;
+        try std.testing.expectEqualStrings(fwd.items[i], e.key);
+        if (prev_key) |p| try std.testing.expect(keyCmp(p, e.key) != .lt);
+        if (n == 0) {
+            first_key = e.key;
+            first_seq = e.seq;
+        }
+        prev_key = e.key;
+        n += 1;
+    }
+    try std.testing.expectEqual(fwd.items.len, n);
+    try std.testing.expectEqual(@as(usize, 0), i);
+    // 反向的第一个必须是最小 key 那一端之前的**最大值** (k0005, seq1)：
+    // 全序是 (key ASC, seq DESC)，所以它的最大元恰好是同 key 的**最旧**版本。
+    // 这条语义对 `Table.topKDesc` 无影响（那里只取 key，再用 `get()` 拿精确新版本），
+    // 但写成断言避免将来误以为「反向第一个就是最新版本」。
+    try std.testing.expectEqualStrings("k0005", first_key);
+    try std.testing.expectEqual(@as(u64, 1), first_seq);
+    // 反向的最后一个是最小值
+    try std.testing.expectEqualStrings("k0000", prev_key.?);
+}
+
+test "反向迭代器：空表 / 单元素 / 提前停止" {
+    var sk = Skiplist.init(std.testing.allocator);
+    defer sk.deinit();
+    var empty = sk.revIterator();
+    try std.testing.expect(empty.next() == null);
+
+    try sk.insert("only", 1, 0, "v");
+    var r1 = sk.revIterator();
+    try std.testing.expectEqualStrings("only", r1.next().?.key);
+    try std.testing.expect(r1.next() == null);
+
+    for (0..50) |i| {
+        var kb: [16]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kb, "x{d:0>3}", .{i});
+        try sk.insert(k, 1, 0, "v");
+    }
+    // 只要最大的 3 个（top-N 反向取尾部的用法）
+    var r2 = sk.revIterator();
+    var got: usize = 0;
+    while (r2.next()) |e| {
+        got += 1;
+        if (got == 1) try std.testing.expectEqualStrings("x049", e.key);
+        if (got == 2) try std.testing.expectEqualStrings("x048", e.key);
+        if (got == 3) {
+            try std.testing.expectEqualStrings("x047", e.key);
+            break;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), got);
 }

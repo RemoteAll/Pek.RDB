@@ -53,6 +53,10 @@ $pairs = @(
     @('sql_each', 'sql_full_touch', $true),
     # LIMIT early exit: both run `SELECT * FROM t LIMIT 10`; we stop after 10 rows.
     @('sql_limit10', 'sql_limit10', $true),
+    # ORDER BY + LIMIT (top-N): both run `SELECT * FROM t ORDER BY id DESC LIMIT 10` on the same
+    # 1M-row table. Both sides keep only the top N (our exec.keepTopN heap vs SQLite's sorter
+    # top-N), so this compares the same work -- neither side materialises/sorts all 1M rows.
+    @('sql_orderby_limit10', 'sql_orderby_limit10', $true),
     # Aggregate: same logical table on both sides (1M rows, id / g=id%100000 / x=id%1000), same SQL,
     # and both pull the whole result set to compute a digest (consistency is asserted separately).
     @('sql_group_by', 'sql_group_by', $true),

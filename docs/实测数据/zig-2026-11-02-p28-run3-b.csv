@@ -1,0 +1,15 @@
+metric,count,value
+bare_write_mbps,64,347.8
+progress_put,0,0
+progress_put,100000,26
+progress_put,200000,55
+progress_put,300000,82
+progress_put,400000,108
+progress_put,500000,130
+progress_put,600000,160
+progress_put,700000,186
+progress_put,800000,205
+progress_put,900000,241
+put,1000000,2477933
+t_sec,after_put,0.60
+flush,1000000,5361764

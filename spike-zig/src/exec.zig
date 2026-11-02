@@ -151,6 +151,21 @@ const SortCtx = struct {
     order: []const sql.OrderItem,
 };
 
+/// `ORDER BY` 是否**恰好**就是主键那一列（单列、无次级键）。
+///
+/// 返回 `null` = 不是主键排序；`false` = 主键升序；`true` = 主键降序。
+///
+/// 为什么值得单独识别：存储层扫描输出本来就是主键升序，所以
+/// - 升序：可以走「凑够 offset+limit 就停」的提前终止，k 行排序可忽略；
+/// - 降序：可以走 `Table.topKDesc`（段尾定位 + 反向迭代），O(k) 而不是 O(n)。
+/// 这正是 SQLite 用 rowid 索引把 `ORDER BY rowid DESC LIMIT 10` 做成常数级的同一条路。
+fn pkOrderOnly(s: *const schema_mod.Schema, order: []const sql.OrderItem) ?bool {
+    if (order.len != 1) return null;
+    const idx = s.indexOf(order[0].column) orelse return null;
+    if (idx != s.pk_index) return null;
+    return order[0].desc;
+}
+
 fn rowLess(ctx: SortCtx, a: []sql.Value, b: []sql.Value) bool {
     for (ctx.order) |o| {
         const idx = ctx.schema.indexOf(o.column) orelse return false;
@@ -610,10 +625,34 @@ pub fn selectRowsHost(
     // `SELECT * FROM t LIMIT 10` 也要扫完 100 万行、解码 100 万个值再丢掉 99.999%，
     // 属于「白做的工作」，不是靠调优能弥补的量级差。
     // ------------------------------------------------------------------
-    const need: ?usize = if (sel.order_by.len == 0 and sel.limit != null)
+    //
+    // **`ORDER BY <pk> ASC` 也算「天然有序」**：扫描输出本来就是主键升序，
+    // 只排 k 行就能得到最终结果，没有任何理由全扫。`ORDER BY <pk> DESC` 走下面的
+    // 反向快速路径（`Table.topKDesc`）。
+    const pk_order = pkOrderOnly(s, sel.order_by); // null = 排序键不是主键
+    const early_ok = sel.order_by.len == 0 or pk_order == false;
+    const need: ?usize = if (early_ok and sel.limit != null)
         @as(usize, sel.offset orelse 0) + @as(usize, sel.limit.?)
     else
         null;
+
+    // ------------------------------------------------------------------
+    // `ORDER BY <pk> DESC LIMIT k`：SQLite 是「沿 rowid 索引倒着走，走够 k 行就停」，
+    // 代价 O(k)。我们原来只有「全表扫描 + top-N 堆」= O(n)，100 万行实测差 1600 倍
+    // （0.0006×）。这里改用 `Table.topKDesc`：段尾块定位 + memtable 反向迭代取候选 key，
+    // 再逐 key `get()` 拿精确新版本 —— 同样是 O(k log n) 量级。
+    //
+    // 只在**无 WHERE** 时用：`topKDesc` 不做条件过滤，有 WHERE 时交给全量路径，
+    // 免得「先取 k 行再过滤」把结果过滤空了。凑不够 k 行（表太小/尾部全是墓碑）也回退。
+    // ------------------------------------------------------------------
+    if (pk_order == true and sel.where == null and sel.limit != null) {
+        const k = @as(usize, sel.offset orelse 0) + @as(usize, sel.limit.?);
+        var top: std.ArrayList([]const u8) = .empty;
+        defer top.deinit(alloc);
+        if (k > 0 and try t.topKDesc(k, &top)) {
+            return finishFromValues(s, sel, alloc, top.items);
+        }
+    }
 
     // `src` 指向 all_vals 或 keep（两者都在函数作用域内，defer 到函数末尾才释放）
     var src: []const []const u8 = &.{};
@@ -682,7 +721,112 @@ pub fn selectRowsHost(
     //
     // 另外 `decodeRowProjected` 是「一趟顺序扫描时顺手跳过未投影列」，要求 want **严格升序**；
     // 而 `SELECT v, id` 会给出 [1,0]、`SELECT id, id` 会给出重复下标 —— 这些都得退回全列解码。
+    //
+    // **但在交给 `finishFromValues` 之前先做一次 top-N 预筛**：`ORDER BY ... LIMIT k`
+    // 只需要前 k 名，而 `finishFromValues` 会把所有候选解码进 `flat/hdrs`（100 万行约 96 MB）
+    // 再整体排序 —— 那 99.999% 的工作是白做的（同 §16.1.8 的 LIMIT 提前终止一类）。
+    if (sel.order_by.len > 0 and sel.limit != null) {
+        const k = @as(usize, sel.offset orelse 0) + @as(usize, sel.limit.?);
+        if (src.len > k) {
+            var top: std.ArrayList([]const u8) = .empty;
+            defer top.deinit(alloc);
+            try keepTopN(s, sel, alloc, src, k, &top);
+            src = top.items;
+            return finishFromValues(s, sel, alloc, src);
+        }
+    }
     return finishFromValues(s, sel, alloc, src);
+}
+
+/// top-N 预筛的元素：`vals` 是解码后的值（text/blob 指向 `raw`，`raw` 指向段 mmap，
+/// 两者在查询期间都稳定），`idx` 是扫描序号（并列时的次级键，保证与「稳定排序后切片」一致）。
+const TopItem = struct { vals: []sql.Value, raw: []const u8, idx: usize };
+
+/// `a` 是否比 `b` **差**（即应该优先被淘汰）。堆顶永远是当前最差的那个。
+fn topWorse(ctx: SortCtx, a: TopItem, b: TopItem) bool {
+    if (rowLess(ctx, a.vals, b.vals)) return false; // a 更好
+    if (rowLess(ctx, b.vals, a.vals)) return true; // b 更好 ⇒ a 更差
+    return a.idx > b.idx; // 完全并列：后来者更差（保持稳定序）
+}
+
+/// `ORDER BY ... LIMIT` 的 top-N 预筛：只保留最好的 k 行（大小顶堆）。
+///
+/// 只保留**集合**，顺序交给 `finishFromValues`（k 行排序是 O(k log k)，可忽略）——
+/// 这样投影 / 偏移 / 输出全部沿用同一条路径，不会出现「top-N 与普通路径行为不一致」。
+///
+/// 复杂度：每个候选一次解码（本来也要解）+ 只有「比当前第 k 名更好」时才做一次
+/// O(log k) 的堆调整。随机数据下替换次数约 k·ln(n)，几乎可以忽略。
+fn keepTopN(
+    s: *const schema_mod.Schema,
+    sel: sql.Select,
+    alloc: std.mem.Allocator,
+    src: []const []const u8,
+    k: usize,
+    out: *std.ArrayList([]const u8),
+) !void {
+    if (k == 0 or src.len <= k) {
+        try out.appendSlice(alloc, src);
+        return;
+    }
+    const ctx = SortCtx{ .schema = s, .order = sel.order_by };
+    const ncols = s.columns.len;
+    const scratch = try alloc.alloc(sql.Value, ncols);
+    defer alloc.free(scratch);
+    var heap: std.ArrayList(TopItem) = .empty;
+    defer {
+        for (heap.items) |h| alloc.free(h.vals);
+        heap.deinit(alloc);
+    }
+    try heap.ensureTotalCapacity(alloc, k);
+    try out.ensureTotalCapacity(alloc, k);
+
+    for (src, 0..) |raw, i| {
+        try s.decodeRowInto(scratch, raw);
+        const cand = TopItem{ .vals = scratch, .raw = raw, .idx = i };
+        if (heap.items.len < k) {
+            // 堆没满：值数组必须复制（`scratch` 下一行就被覆写）
+            const copy = try alloc.alloc(sql.Value, ncols);
+            errdefer alloc.free(copy);
+            @memcpy(copy, scratch);
+            try heap.append(alloc, .{ .vals = copy, .raw = raw, .idx = i });
+            // 上浮：**子比父更差**就交换，把更差的顶上去（堆顶＝最差）
+            var c = heap.items.len - 1;
+            while (c > 0) {
+                const p = (c - 1) / 2;
+                if (!topWorse(ctx, heap.items[c], heap.items[p])) break;
+                std.mem.swap(TopItem, &heap.items[p], &heap.items[c]);
+                c = p;
+            }
+        } else if (topWorse(ctx, heap.items[0], cand)) {
+            // 比堆顶（当前第 k 名）更好 ⇒ 顶掉它。
+            // **先分配再释放旧值**：反过来写的话，分配失败时堆顶留着野指针，
+            // 上面的 defer 会二次释放（OOM 路径上的 double free）。
+            const copy = try alloc.alloc(sql.Value, ncols);
+            @memcpy(copy, scratch);
+            alloc.free(heap.items[0].vals);
+            heap.items[0] = .{ .vals = copy, .raw = raw, .idx = i };
+            // 下沉：换到**更差的那个孩子**上（`worst` 里放三者中最差的）
+            var p: usize = 0;
+            while (true) {
+                const l = p * 2 + 1;
+                const r = l + 1;
+                var worst = p;
+                if (l < heap.items.len and topWorse(ctx, heap.items[l], heap.items[worst])) worst = l;
+                if (r < heap.items.len and topWorse(ctx, heap.items[r], heap.items[worst])) worst = r;
+                if (worst == p) break; // 父已经比孩子都差，堆序恢复
+                std.mem.swap(TopItem, &heap.items[p], &heap.items[worst]);
+                p = worst;
+            }
+        }
+    }
+    // 按**扫描顺序**交回（而不是堆序）：后续 `finishFromValues` 用的是稳定排序，
+    // 顺序恢复成扫描序后，「并列行」的最终次序与「稳定排序再切片」逐行一致。
+    std.mem.sort(TopItem, heap.items, {}, topIdxLess);
+    for (heap.items) |h| try out.append(alloc, h.raw);
+}
+
+fn topIdxLess(_: void, a: TopItem, b: TopItem) bool {
+    return a.idx < b.idx;
 }
 
 /// 把「已定位到的一组行值」装配成 `Rows`：投影 → 解码 → 排序 → LIMIT → 输出。
@@ -1517,7 +1661,6 @@ test "update + delete" {
     }
 }
 
-
 test "select LIMIT 提前终止：只读 offset+limit 行，不扫全表" {
     const alloc = std.testing.allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
@@ -1577,6 +1720,108 @@ test "select LIMIT 提前终止：只读 offset+limit 行，不扫全表" {
     }
 }
 
+test "ORDER BY + LIMIT：top-N 预筛与全量排序结果逐行一致（含并列）" {
+    // 预筛把「全量物化 + 全量排序」降成「只留前 k 行」，最容易走样的是**并列行**的次序：
+    // 老路径是「稳定排序后切片」，新路径是「堆里替换」。这里用对照组验证两者逐行相同。
+    //
+    // 对照组故意写 `LIMIT 300`（= 行数），使 `src.len > k` 不成立 ⇒ 走全量排序老路径。
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-exec-topn";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    const cols = [_]schema_mod.Column{
+        .{ .name = "id", .col_type = .integer, .primary_key = true },
+        .{ .name = "n", .col_type = .integer },
+        .{ .name = "g", .col_type = .integer },
+    };
+    var s = try schema_mod.Schema.init(alloc, "t", &cols);
+    defer s.deinit(alloc);
+    var t = try tablemod.Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+
+    // 300 行；n 只有 7 个取值（大量并列），g 只有 3 个取值
+    {
+        var i: i64 = 0;
+        while (i < 300) : (i += 1) {
+            var vals = [_]sql.Value{
+                .{ .integer = i },
+                .{ .integer = @mod(i * 13, 7) },
+                .{ .integer = @mod(i, 3) },
+            };
+            var row = [_][]sql.Value{&vals};
+            _ = try insertRows(&t, &s, .{ .table = "t", .columns = &.{ "id", "n", "g" }, .rows = &row }, alloc);
+        }
+    }
+
+    var star = [_]sql.SelectItem{.{ .star = {} }};
+    var proj = [_]sql.SelectItem{ .{ .column = "id" }, .{ .column = "n" } };
+    var ord_n_desc = [_]sql.OrderItem{.{ .column = "n", .desc = true }};
+    var ord_n_asc = [_]sql.OrderItem{.{ .column = "n" }};
+    var ord_two = [_]sql.OrderItem{ .{ .column = "n", .desc = true }, .{ .column = "id", .desc = true } };
+    var ord_g = [_]sql.OrderItem{.{ .column = "g" }};
+    // 主键排序：走 `Table.topKDesc`（降序）/ 提前终止（升序）两条快速路径
+    var ord_pk_desc = [_]sql.OrderItem{.{ .column = "id", .desc = true }};
+    var ord_pk_asc = [_]sql.OrderItem{.{ .column = "id" }};
+
+    const cases = [_]struct {
+        items: []sql.SelectItem,
+        order: []sql.OrderItem,
+        offset: ?u32,
+        limit: u32,
+    }{
+        .{ .items = &star, .order = &ord_n_desc, .offset = null, .limit = 10 },
+        .{ .items = &proj, .order = &ord_n_asc, .offset = 5, .limit = 10 },
+        .{ .items = &star, .order = &ord_two, .offset = null, .limit = 7 },
+        .{ .items = &proj, .order = &ord_g, .offset = 0, .limit = 4 },
+        .{ .items = &star, .order = &ord_n_desc, .offset = null, .limit = 1 },
+        // offset+limit 刚好 290（< 300 ⇒ 触发预筛），且落在并列最多的尾部
+        .{ .items = &star, .order = &ord_g, .offset = 250, .limit = 40 },
+        // 主键降序（`Table.topKDesc` 快速路径）与主键升序（提前终止路径）
+        .{ .items = &star, .order = &ord_pk_desc, .offset = null, .limit = 10 },
+        .{ .items = &proj, .order = &ord_pk_desc, .offset = 7, .limit = 10 },
+        .{ .items = &star, .order = &ord_pk_desc, .offset = null, .limit = 1 },
+        .{ .items = &star, .order = &ord_pk_asc, .offset = 3, .limit = 10 },
+    };
+
+    for (cases, 0..) |c, ci| {
+        const off: usize = c.offset orelse 0;
+        var full = try selectRows(&t, &s, .{
+            .items = c.items,
+            .table = "t",
+            .order_by = c.order,
+            .limit = 300,
+        }, alloc);
+        defer full.deinit();
+        var got = try selectRows(&t, &s, .{
+            .items = c.items,
+            .table = "t",
+            .order_by = c.order,
+            .offset = c.offset,
+            .limit = c.limit,
+        }, alloc);
+        defer got.deinit();
+        if (got.rows.len != c.limit) {
+            std.debug.print("case {d}: 行数 {d} != {d}\n", .{ ci, got.rows.len, c.limit });
+            return error.RowCountMismatch;
+        }
+        for (got.rows, 0..) |row, ri| {
+            const want = full.rows[off + ri];
+            if (want.len != row.len) return error.ColCountMismatch;
+            for (want, row) |w, g| {
+                if (schema_mod.valueCmp(w, g) != .eq) {
+                    std.debug.print("case {d}: 第 {d} 行值不一致\n  want={any}\n  got ={any}\n", .{ ci, ri, want, row });
+                    return error.ValueMismatch;
+                }
+            }
+        }
+    }
+}
 
 const Collect = struct {
     rows: std.ArrayList([]sql.Value) = .empty,
@@ -1724,16 +1969,14 @@ test "GROUP BY：COUNT/SUM/AVG/MIN/MAX 与手算逐一对照" {
 
     {
         // g=1 两行全有值；g=2 三行里有一行 x/t 为 NULL（COUNT(col) 与 COUNT(*) 才会分叉）
-        var p = try sql.parse(alloc,
-            "INSERT INTO agg (id, g, x, t) VALUES (1, 1, 10, 'a'), (2, 1, 20, 'b'), " ++
-                "(3, 2, 5, 'c'), (4, 2, NULL, NULL), (5, 2, 7, 'e')");
+        var p = try sql.parse(alloc, "INSERT INTO agg (id, g, x, t) VALUES (1, 1, 10, 'a'), (2, 1, 20, 'b'), " ++
+            "(3, 2, 5, 'c'), (4, 2, NULL, NULL), (5, 2, 7, 'e')");
         defer p.deinit();
         _ = try insertRows(&t, &s, p.stmt.insert, alloc);
     }
 
     {
-        var p = try sql.parse(alloc,
-            "SELECT g, COUNT(*), COUNT(x), SUM(x), AVG(x), MIN(x), MAX(x) FROM agg GROUP BY g ORDER BY g");
+        var p = try sql.parse(alloc, "SELECT g, COUNT(*), COUNT(x), SUM(x), AVG(x), MIN(x), MAX(x) FROM agg GROUP BY g ORDER BY g");
         defer p.deinit();
         var rows = try selectRows(&t, &s, p.stmt.select, alloc);
         defer rows.deinit();
@@ -1765,8 +2008,7 @@ test "GROUP BY：COUNT/SUM/AVG/MIN/MAX 与手算逐一对照" {
 
     // 文本分组键 + MIN/MAX 文本 + ORDER BY 聚合列 DESC + LIMIT
     {
-        var p = try sql.parse(alloc,
-            "SELECT t, COUNT(*), MIN(id), MAX(id) FROM agg GROUP BY t ORDER BY count(*) DESC LIMIT 2");
+        var p = try sql.parse(alloc, "SELECT t, COUNT(*), MIN(id), MAX(id) FROM agg GROUP BY t ORDER BY count(*) DESC LIMIT 2");
         defer p.deinit();
         var rows = try selectRows(&t, &s, p.stmt.select, alloc);
         defer rows.deinit();
@@ -1994,8 +2236,7 @@ test "HAVING：按聚合结果过滤组，NULL 聚合被排除" {
 
     {
         // g=1: 10,20 / g=2: 5 / g=3: NULL / g=4: 1,2,3
-        var p = try sql.parse(alloc,
-            "INSERT INTO h (id, g, x) VALUES (1,1,10), (2,1,20), (3,2,5), (4,3,NULL), (5,4,1), (6,4,2), (7,4,3)");
+        var p = try sql.parse(alloc, "INSERT INTO h (id, g, x) VALUES (1,1,10), (2,1,20), (3,2,5), (4,3,NULL), (5,4,1), (6,4,2), (7,4,3)");
         defer p.deinit();
         _ = try insertRows(&t, &s, p.stmt.insert, alloc);
     }
@@ -2050,8 +2291,7 @@ test "HAVING：按聚合结果过滤组，NULL 聚合被排除" {
 
     // HAVING + ORDER BY 聚合 + LIMIT（top-N 形状）
     {
-        var p = try sql.parse(alloc,
-            "SELECT g, SUM(x) FROM h GROUP BY g HAVING SUM(x) > 0 ORDER BY sum(x) DESC LIMIT 2");
+        var p = try sql.parse(alloc, "SELECT g, SUM(x) FROM h GROUP BY g HAVING SUM(x) > 0 ORDER BY sum(x) DESC LIMIT 2");
         defer p.deinit();
         var rows = try selectRows(&t, &s, p.stmt.select, alloc);
         defer rows.deinit();
@@ -2086,9 +2326,8 @@ test "HAVING 与 WHERE 组合：WHERE 先过滤行，HAVING 后过滤组" {
 
     {
         // g=1: x=1,2,3 / g=2: x=10,20 / g=3: x=100
-        var p = try sql.parse(alloc,
-            "INSERT INTO wh (id, g, x, s) VALUES (1,1,1,'b'), (2,1,2,'a'), (3,1,3,'c'), " ++
-                "(4,2,10,'z'), (5,2,20,'y'), (6,3,100,'m')");
+        var p = try sql.parse(alloc, "INSERT INTO wh (id, g, x, s) VALUES (1,1,1,'b'), (2,1,2,'a'), (3,1,3,'c'), " ++
+            "(4,2,10,'z'), (5,2,20,'y'), (6,3,100,'m')");
         defer p.deinit();
         _ = try insertRows(&t, &s, p.stmt.insert, alloc);
     }
@@ -2097,8 +2336,7 @@ test "HAVING 与 WHERE 组合：WHERE 先过滤行，HAVING 后过滤组" {
     // 再 HAVING COUNT(*) >= 2 → 只剩 g=1（3 行）；g=2 只有 1 行被淘汰。
     // 若把两个过滤顺序弄反（先 HAVING 再 WHERE），g=2 会被保留 → 结果不同。
     {
-        var p = try sql.parse(alloc,
-            "SELECT g, COUNT(*), SUM(x) FROM wh WHERE x < 10 GROUP BY g HAVING COUNT(*) >= 2 ORDER BY g");
+        var p = try sql.parse(alloc, "SELECT g, COUNT(*), SUM(x) FROM wh WHERE x < 10 GROUP BY g HAVING COUNT(*) >= 2 ORDER BY g");
         defer p.deinit();
         var rows = try selectRows(&t, &s, p.stmt.select, alloc);
         defer rows.deinit();
@@ -2158,8 +2396,7 @@ test "ORDER BY 可引用未选中的分组键 / 聚合（隐藏列）" {
 
     {
         // g=1: 10,20(2 行) / g=2: 5(1) / g=3: NULL(1) / g=4: 1,2,3(3)
-        var p = try sql.parse(alloc,
-            "INSERT INTO ho (id, g, x) VALUES (1,1,10), (2,1,20), (3,2,5), (4,3,NULL), (5,4,1), (6,4,2), (7,4,3)");
+        var p = try sql.parse(alloc, "INSERT INTO ho (id, g, x) VALUES (1,1,10), (2,1,20), (3,2,5), (4,3,NULL), (5,4,1), (6,4,2), (7,4,3)");
         defer p.deinit();
         _ = try insertRows(&t, &s, p.stmt.insert, alloc);
     }
@@ -2247,8 +2484,7 @@ test "ORDER BY 匹配顺序：名字长得像聚合的输出列不能被当成�
 
     // 分组键就是那个「像聚合」的列；ORDER BY 引用它 → 必须走输出列路径，不能报错
     {
-        var p = try sql.parse(alloc,
-            "SELECT [sum(x)], COUNT(*) FROM aggish GROUP BY [sum(x)] ORDER BY [sum(x)]");
+        var p = try sql.parse(alloc, "SELECT [sum(x)], COUNT(*) FROM aggish GROUP BY [sum(x)] ORDER BY [sum(x)]");
         defer p.deinit();
         var rows = try selectRows(&t, &s, p.stmt.select, alloc);
         defer rows.deinit();
@@ -2261,8 +2497,7 @@ test "ORDER BY 匹配顺序：名字长得像聚合的输出列不能被当成�
 
     // 对照：真正的聚合排序仍然要能工作（`ORDER BY sum(id)` 而 sum(id) 未输出）
     {
-        var p = try sql.parse(alloc,
-            "SELECT [sum(x)] FROM aggish GROUP BY [sum(x)] ORDER BY SUM(id) DESC");
+        var p = try sql.parse(alloc, "SELECT [sum(x)] FROM aggish GROUP BY [sum(x)] ORDER BY SUM(id) DESC");
         defer p.deinit();
         var rows = try selectRows(&t, &s, p.stmt.select, alloc);
         defer rows.deinit();
