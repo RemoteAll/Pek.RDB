@@ -40,6 +40,16 @@ pub const Skiplist = struct {
     nodes: std.ArrayList(Node) = .empty,
     head: [MAX_HEIGHT]u32 = @splat(NIL),
     height: u8 = 1,
+    /// 「顺序追加」快路径的状态（对齐 RocksDB `InlineSkipList::prev_` 与 SQLite 升序 rowid 快路）。
+    ///
+    /// `prev_node` = 最后一次插入且**落在链尾**的节点；`prev[lvl]` = 它在各层的前驱。
+    /// 因为 `prev_node.next[0] == NIL`（它是最大值），各层 `prev[lvl]` 也就是该层的最大节点，
+    /// 所以新 key 比它大时前驱必然还是这些节点 —— 插入可以完全跳过 `find()` 的逐层搜索。
+    ///
+    /// 收益：升序灌数据（PK 自增、时序、日志）从 O(log n) 降到 O(1)；
+    /// 乱序写入第一个不满足的点就回退 `find()`，正确性不受影响。
+    prev: [MAX_HEIGHT]u32 = @splat(NIL),
+    prev_node: u32 = NIL,
     rng: u64 = 0x9E3779B97F4A7C15,
     count: usize = 0,
     bytes: usize = 0,
@@ -124,7 +134,24 @@ pub const Skiplist = struct {
     pub fn insert(self: *Skiplist, key: []const u8, seq: u64, flags: u8, value: []const u8) !void {
         var pred: [MAX_HEIGHT]u32 = @splat(NIL);
         var succ: [MAX_HEIGHT]u32 = @splat(NIL);
-        self.find(key, seq, &pred, &succ);
+        // 快路径：上一个节点落在链尾且新 key 比它大 ⇒ 各层前驱已知，不必搜索。
+        // **必须要求 `next[0] == NIL`**：否则中间可能夹着别的节点（例如 10、20 之后插 15，
+        // 再插 25 时若沿用 15 的前驱就会漏掉 20），那是会造出乱序链的静默错误。
+        var fast = false;
+        if (self.prev_node != NIL) {
+            const pn = &self.nodes.items[self.prev_node];
+            if (pn.next[0] == NIL and before(self.keyOf(pn), pn.seq, key, seq)) {
+                var lvl: usize = 0;
+                while (lvl < self.height) : (lvl += 1) {
+                    // 层数低于 prev_node 高度的层，前驱就是 prev_node 本身
+                    const p: u32 = if (lvl < pn.height) self.prev_node else self.prev[lvl];
+                    pred[lvl] = p;
+                    succ[lvl] = if (p == NIL) self.head[lvl] else self.nodes.items[p].next[lvl];
+                }
+                fast = true;
+            }
+        }
+        if (!fast) self.find(key, seq, &pred, &succ);
 
         // 幂等重放：同 key + 同 seq 覆盖值
         if (succ[0] != NIL) {
@@ -171,6 +198,14 @@ pub const Skiplist = struct {
         }
         try self.nodes.append(self.alloc, node);
         if (h > self.height) self.height = h;
+        // 只有「插到了链尾」才记录快路径状态；否则作废（否则前驱会指向已过时的位置）。
+        if (succ[0] == NIL) {
+            var l2: usize = 0;
+            while (l2 < self.height) : (l2 += 1) self.prev[l2] = pred[l2];
+            self.prev_node = idx;
+        } else {
+            self.prev_node = NIL;
+        }
         self.count += 1;
         self.bytes += 64 + key.len + value.len;
     }
@@ -234,6 +269,9 @@ pub const Skiplist = struct {
         self.height = 1;
         self.count = 0;
         self.bytes = 0;
+        // 节点数组清空后旧索引全部失效，快路径状态必须一起作废
+        self.prev = @splat(NIL);
+        self.prev_node = NIL;
     }
 };
 
@@ -272,4 +310,39 @@ test "skiplist tombstone visible by snapshot" {
     try sk.insert("k", 2, 1, ""); // 删除
     try std.testing.expectEqualStrings("v", sk.get("k", 1).?.value);
     try std.testing.expectEqual(@as(u8, 1), sk.get("k", 2).?.flags);
+}
+
+test "顺序追加快路径：升序 / 回退 / 再升序都必须保持严格有序" {
+    var sk = Skiplist.init(std.testing.allocator);
+    defer sk.deinit();
+
+    // 1) 纯升序（走链尾追加快路径）
+    for (0..200) |i| {
+        var kb: [16]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kb, "k{d:0>4}", .{i});
+        try sk.insert(k, 1, 0, "v");
+    }
+    // 2) 插入一个夹在中间的 key：快路径必须判定失效并回退到 find()
+    //    （这正是「10、20 之后插 15，再插 25 会漏掉 20」那个静默错误的场景）
+    try sk.insert("k0000a", 1, 0, "mid");
+    // 3) 继续更大 key：新的链尾重新建立快路径
+    for (200..400) |i| {
+        var kb: [16]u8 = undefined;
+        const k = try std.fmt.bufPrint(&kb, "k{d:0>4}", .{i});
+        try sk.insert(k, 1, 0, "v");
+    }
+
+    // 全表遍历必须严格升序，且 mid 落在 k0000 与 k0001 之间
+    var prev: ?[]const u8 = null;
+    var n: usize = 0;
+    var it = sk.iterator();
+    while (it.next()) |e| {
+        if (prev) |p| try std.testing.expect(keyCmp(p, e.key) == .lt);
+        if (std.mem.eql(u8, e.key, "k0000a")) {
+            try std.testing.expectEqualStrings("k0000", prev.?);
+        }
+        prev = e.key;
+        n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 401), n);
 }

@@ -92,6 +92,16 @@ pub const Wal = struct {
         try self.file.sync(self.io);
     }
 
+    /// 只把用户态缓冲写进 OS、**不** `fsync`：与 SQLite `synchronous=NORMAL` 的等价档。
+    /// 语义：进程被杀不丢（内核还持有），**掉电**可能丢最后一段。
+    ///
+    /// 为什么要这个口：跨引擎比写入吞吐必须同一持久化档 ——
+    /// SQLite NORMAL 每笔提交只 `pwrite` 不 `fsync`（`sqlite3.c:63192`），
+    /// 而我们每批 `fsync` 就等于拿更严的档去比，比值没有意义。
+    pub fn flushToOs(self: *Wal) !void {
+        try self.flushBuf();
+    }
+
     /// **原地清空**并复用同一个文件句柄：`setLength(0)` + 复位追加点。
     ///
     /// 语义与「close + deleteFile + createFile」完全等价（flush 成功后这一点 WAL 内容已作废），

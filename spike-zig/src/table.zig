@@ -45,6 +45,12 @@ pub const Options = struct {
     wal_sync_every: usize = 10_000,
     /// 打开段时是否把整个数据文件读进页缓存（默认关：冷重开只加载索引，数据按需缺页）。
     mmap_preheat: bool = false,
+    /// 数据段 mmap 允许预缺页的最大字节数；**`0` = 从不预取（默认）**。
+    ///
+    /// 注意 `mmap_preheat` 与它不同：前者是「打开时主动整段 read」的显式行为，
+    /// 后者控制 Zig `MemoryMap` 的 `populate`（**默认 true**，Windows 会预取整段）。
+    /// 想把旧行为（随机点查也整段预取）拿回来做 A/B，传 `1 << 62` 即可。
+    data_prefault_max_bytes: u64 = 0,
     /// 索引归档（`seg/index.bin`）允许映射的最大字节数；**0 = 不限制**（默认，64 位目标）。
     ///
     /// 这不是磁盘格式限制，只是「明确想拒绝打开超大库」时的防御性上界。
@@ -101,6 +107,15 @@ pub const Options = struct {
     ///
     /// 跨引擎比吞吐前必须先对齐这一条，否则比的不是同一个持久化级别。
     wal_buf_bytes: usize = 256 * 1024,
+    /// 提交返回前是否 `fsync`（**默认 true = 最强档：提交返回即落盘**）。
+    ///
+    /// - `true`：每批 `fsync` 后才返回。进程被杀、机器掉电都不丢已返回成功的写。
+    /// - `false`：只把数据写进 OS 页缓存就返回（**SQLite `synchronous=NORMAL` 的等价档**）。
+    ///
+    /// 为什么要这个开关：跨引擎比较写入吞吐时，SQLite NORMAL 每笔提交**不** `fsync`
+    /// （`sqlite3.c:63192` 原文），而我们默认每批都 `fsync` —— 拿更严的档去比，
+    /// 写吞吐比值就没有意义。基准必须显式选同一档，并在表里写明是哪一档。
+    durable_commit: bool = true,
 };
 
 /// 自动 compaction 连续失败上限：到顶就停手，避免每次 flush 都白跑一遍合并。
@@ -156,7 +171,8 @@ fn canConcat(table: *Table) bool {
     return true;
 }
 
-const MemCursor = struct {    it: Skiplist.Iterator,
+const MemCursor = struct {
+    it: Skiplist.Iterator,
     end: []const u8,
     snapshot: u64,
 
@@ -230,6 +246,7 @@ fn openSegmentsFromArchive(
     buf: []const u8,
     alloc: std.mem.Allocator,
     preheat: bool,
+    data_prefault_max: u64,
     segs: *std.ArrayList(segmod.Segment),
 ) !OpenSegmentsResult {
     var it = segmod.ArchiveIter{ .buf = buf };
@@ -237,7 +254,8 @@ fn openSegmentsFromArchive(
     while (it.next()) |rec| {
         var ta: u64 = 0;
         if (segmod.timing_enabled) ta = segmod.tick(io);
-        const seg = try segmod.Segment.fromBytes(io, dir, base_path, rec.id, rec.payload, alloc, false, preheat);
+        var seg = try segmod.Segment.fromBytes(io, dir, base_path, rec.id, rec.payload, alloc, false, preheat);
+        seg.data_prefault_max = data_prefault_max;
         if (segmod.timing_enabled) {
             const tb = segmod.tick(io);
             segmod.timing.mkseg += tb - ta;
@@ -465,7 +483,7 @@ pub const Table = struct {
         // 不能传调用方的 `path` —— 调用方往往在 open 返回后立刻释放（`Engine` 拼的
         // `{root}/{table}`、索引的 `{table}/idx/{name}` 都走 defer free），段就会带着
         // 悬空指针活下来，等到第一次 `cursor()` 才以 `FileNotFound` 的形式爆出来。
-        const opened = try openSegmentsFromArchive(io, dir, base_path, arch, alloc, opts.mmap_preheat, &segs);
+        const opened = try openSegmentsFromArchive(io, dir, base_path, arch, alloc, opts.mmap_preheat, opts.data_prefault_max_bytes, &segs);
         const id: u64 = opened.max_id + 1;
         for (segs.items) |s| seq = @max(seq, s.max_seq);
 
@@ -619,7 +637,15 @@ pub const Table = struct {
             try self.mem.insert(k, seq, 0, v);
         }
         self.visible = seq;
-        try self.wal.sync();
+        // 持久化档由调用方选（见 `Options.durable_commit`）。耗时必须计入 `ns_wal_sync`：
+        // 否则「写入慢」到底慢在 `fsync` 还是慢在内存结构，没有任何证据可看。
+        const t_sync = self.nowNs();
+        if (self.opts.durable_commit) {
+            try self.wal.sync();
+        } else {
+            try self.wal.flushToOs();
+        }
+        self.ns_wal_sync += self.nowNs() - t_sync;
         // **必须和 `put` 一样按 `flush_bytes` 回落**：漏了这一句的后果是「批量导入时 memtable
         // 无界增长」——1 亿行 × 39 B ≈ 3.9 GB 全留在内存里，最后一次性 flush 要 71 s，
         // 而且只产出一个巨型段（段数=1 会让点查/合并的实测结果失去意义）。
@@ -786,7 +812,8 @@ pub const Table = struct {
         self.index_valid_len = try segmod.archiveAppend(self.io, self.dir, self.index_path, @intCast(id), fin.bytes, self.index_valid_len);
         self.ns_idx += self.nowNs() - t_idx;
 
-        const seg = try segmod.Segment.fromBytes(self.io, self.dir, self.base_path, id, fin.bytes, self.alloc, true, self.opts.mmap_preheat);
+        var seg = try segmod.Segment.fromBytes(self.io, self.dir, self.base_path, id, fin.bytes, self.alloc, true, self.opts.mmap_preheat);
+        seg.data_prefault_max = self.opts.data_prefault_max_bytes;
         self.segs.append(self.alloc, seg) catch |e| {
             // 别在这里 free(fin.bytes)：交给上面的 errdefer，否则 double free
             var s = seg;
@@ -969,6 +996,7 @@ pub const Table = struct {
         // 关键次序：**先在内存里建好新段**（验证索引可解析），再改磁盘，最后才清理旧段。
         // 若反过来（先清旧段再建新段），中途失败会让 Table 变成空表，而磁盘上归档已指向新段。
         var new_seg = try segmod.Segment.fromBytes(self.io, self.dir, self.base_path, id, fin.bytes, self.alloc, true, self.opts.mmap_preheat);
+        new_seg.data_prefault_max = self.opts.data_prefault_max_bytes;
         // errdefer 必须在 ensureParsed **之前**注册：校验失败时段的 `entries` 已经分配，
         // 而 `fromBytes` 内部的 errdefer 只覆盖它自己那一段，管不到这里。
         errdefer {
@@ -1177,7 +1205,6 @@ pub const MergeIter = struct {
         self.compares += 1;
         return refLess({}, self.cur[self.heap[a]].?, self.cur[self.heap[b]].?);
     }
-
 
     /// 顺序拼接：段间 key 范围不重叠时，同一时刻只需 1 个活跃游标，
     /// 走与单游标完全相同的逻辑（无比较、无堆维护）。
@@ -1617,7 +1644,8 @@ test "table put/get/flush/reopen" {
     var set = try t2.scanRange("a", "z");
     defer set.deinit();
     try std.testing.expectEqual(@as(usize, 1), set.records.len);
-    try std.testing.expectEqualStrings("b", set.records[0].key);}
+    try std.testing.expectEqualStrings("b", set.records[0].key);
+}
 
 test "table reopen: 懒加载 / 预热 / 并行 三种打开方式结果一致" {
     const alloc = std.testing.allocator;
@@ -2389,8 +2417,6 @@ test "table scanRefs merges multiple segments" {
     try std.testing.expectEqualStrings("c", refs.items[2].key);
 }
 
-
-
 test "MergeIter 堆化：多段 key 交错时顺序正确，且部分游标先耗尽不影响结果" {
     // 堆化（O(log k) 替代每行线性扫全部游标）是纯新增逻辑，靠 compaction/scan 的
     // 间接用例覆盖不够 —— 这里直接构造「key 交错 + 各段长度不等」的最刁钻形态：
@@ -2714,7 +2740,8 @@ test "get 按段范围定位：不重叠时二分只碰一个段，出现重叠�
     }
 }
 
-test "归档丢失保护：有段数据但没有 index.bin 时拒开，不能当成空表（否则下一次 flush 会覆盖 000001.data）" {    const alloc = std.testing.allocator;
+test "归档丢失保护：有段数据但没有 index.bin 时拒开，不能当成空表（否则下一次 flush 会覆盖 000001.data）" {
+    const alloc = std.testing.allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
     defer threaded.deinit();
     const io = threaded.io();

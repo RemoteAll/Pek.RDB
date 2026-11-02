@@ -30,6 +30,23 @@ fn putLine(comptime fmt: []const u8, args: anytype) void {
     std.debug.print(fmt ++ "\n", args);
 }
 
+/// 最近秩分位（数组已排序）。用 `len * p` 向下取整，20k 样本时 p99 = 第 19800 个。
+fn pctl(sorted: []const u64, p: f64) u64 {
+    if (sorted.len == 0) return 0;
+    const raw: usize = @intFromFloat(@as(f64, @floatFromInt(sorted.len)) * p);
+    return sorted[@min(sorted.len - 1, raw)];
+}
+
+/// 抖动必须看分位，不能只看平均：平均值会把「 1% 的 5ms 卡顿」稀释成很小的一坨。
+/// 统一用**纳秒**输出（Windows QPC 分辨率约 100ns，用 us 打印会丢分辨率）。
+fn reportLat(name: []const u8, samples: []u64) void {
+    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+    putLine("scale_{s}_p50,{d},{d}", .{ name, samples.len, pctl(samples, 0.50) });
+    putLine("scale_{s}_p99,{d},{d}", .{ name, samples.len, pctl(samples, 0.99) });
+    putLine("scale_{s}_p999,{d},{d}", .{ name, samples.len, pctl(samples, 0.999) });
+    putLine("scale_{s}_max,{d},{d}", .{ name, samples.len, samples[samples.len - 1] });
+}
+
 /// 文件字节数（不存在按 0 计，不让统计本身把基准搞挂）。
 fn fileSize(io: std.Io, dir: std.Io.Dir, path: []const u8) u64 {
     if (dir.openFile(io, path, .{})) |f| {
@@ -65,6 +82,8 @@ pub fn main() !void {
     var t = try tablemod.Table.open(io, dir, root, alloc, .{
         .wal_sync_every = 0,
         .flush_bytes = @intCast(build_options.flush_bytes),
+        .data_prefault_max_bytes = build_options.data_prefault,
+        .durable_commit = build_options.durable,
     });
     var t_live = true;
     defer if (t_live) t.deinit();
@@ -88,6 +107,9 @@ pub fn main() !void {
     }
     const ns_put = nowNs(io) - t_put;
     putLine("scale_put,{d},{d:.0}", .{ rows, perSec(rows, ns_put) });
+    // fsync 占总写入时间的比例：写入慢到底是慢在「落盘」还是「内存结构」，靠这一行分辨。
+    putLine("scale_wal_sync_ms,{d},{d}", .{ rows, t.ns_wal_sync / 1_000_000 });
+    putLine("scale_put_ms,{d},{d}", .{ rows, ns_put / 1_000_000 });
 
     // ---------------- flush（落段 + 归档） ----------------
     const t_flush = nowNs(io);
@@ -116,12 +138,18 @@ pub fn main() !void {
         });
     }
 
-    // ---------------- 热态点查（命中 / 未命中） ----------------
+    // ---------------- 点查（命中 / 未命中）：吞吐 + 抖动分位 ----------------
     {
         var vbuf: std.ArrayList(u8) = .empty;
         defer vbuf.deinit(alloc);
         const probes: u64 = 20_000;
+        const samples = try alloc.alloc(u64, probes);
+        defer alloc.free(samples);
         var x: u64 = 88172645463325252;
+
+        // 第一遍是「冷随机读」：3.9 GB 段上随机 2 万次。
+        // **只有这一遍必须插桩**：冷命中的状态无法重现（第二遍页就热了）。
+        // 20 µs 量级上两次时钟读约 2%，可接受；miss 那种 60 ns 量级则会被打平（见下）。
         var hits: u64 = 0;
         const t0 = nowNs(io);
         var i: u64 = 0;
@@ -131,12 +159,14 @@ pub fn main() !void {
             x ^= x << 17;
             var kb: [8]u8 = undefined;
             spike.codec.encodeI64Key(&kb, @intCast(x % rows));
+            const ta = nowNs(io);
             if (try t.get(&kb, &vbuf)) |_| hits += 1;
+            samples[i] = nowNs(io) - ta;
         }
         putLine("scale_get_hit,{d},{d:.0}", .{ hits, perSec(probes, nowNs(io) - t0) });
+        reportLat("get_hit", samples);
 
-        // 第二遍：数据页已经热了。与主基准（1M 行、页已热）同口径的「CPU 侧」点查。
-        // 第一遍实际上是「冷随机读」——3.9 GB 段上随机 2 万次几乎每次都缺页，数字会很低。
+        // 第二遍（吞吐，**不插桩**）：数据页已经热了，与主基准同口径的「CPU 侧」点查。
         var hits2: u64 = 0;
         const t2 = nowNs(io);
         i = 0;
@@ -149,6 +179,8 @@ pub fn main() !void {
             if (try t.get(&kb, &vbuf)) |_| hits2 += 1;
         }
         putLine("scale_get_hit_warm,{d},{d:.0}", .{ hits2, perSec(probes, nowNs(io) - t2) });
+
+        // 未命中（吞吐，不插桩）
         var found_but_should_not: u64 = 0;
         const t1 = nowNs(io);
         i = 0;
@@ -162,6 +194,37 @@ pub fn main() !void {
             if (try t.get(&kb, &vbuf)) |_| found_but_should_not += 1;
         }
         putLine("scale_get_miss,{d},{d:.0}", .{ probes - found_but_should_not, perSec(probes, nowNs(io) - t1) });
+
+        // 分位单独再跑一遍（插桩）：热命中
+        x = 88172645463325252;
+        i = 0;
+        while (i < probes) : (i += 1) {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            var kb: [8]u8 = undefined;
+            spike.codec.encodeI64Key(&kb, @intCast(x % rows));
+            const ta = nowNs(io);
+            _ = try t.get(&kb, &vbuf);
+            samples[i] = nowNs(io) - ta;
+        }
+        reportLat("get_hit_warm", samples);
+
+        // 分位：未命中。**这里的绝对值受时钟分位限制**（60 ns 级、QPC 分辨率约 100 ns），
+        // 只用来看「有没有离群」，横向对比请用吞吐。
+        x = 88172645463325252;
+        i = 0;
+        while (i < probes) : (i += 1) {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            var kb: [8]u8 = undefined;
+            spike.codec.encodeI64Key(&kb, @intCast(rows + (x % rows) + 1));
+            const ta = nowNs(io);
+            _ = try t.get(&kb, &vbuf);
+            samples[i] = nowNs(io) - ta;
+        }
+        reportLat("get_miss", samples);
     }
 
     // ---------------- 全表扫描（流式，不收集） ----------------
@@ -195,6 +258,7 @@ pub fn main() !void {
         var tr = try tablemod.Table.open(io, dir, root, alloc, .{
             .wal_sync_every = 0,
             .index_prefault_max_bytes = p.max,
+            .data_prefault_max_bytes = build_options.data_prefault,
         });
         // 用**微秒**：2M 行时重开不到 1ms，按 ms 打印全是 0，看不出差别。
         const us = (nowNs(io) - t0) / 1000;

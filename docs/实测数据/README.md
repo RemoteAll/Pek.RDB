@@ -367,3 +367,35 @@ powershell -File tools\abba-verdict.ps1 -Tag <标签> -Date <日期>
    得到的是「索引写放大」。**报数字前先确认这个数字代表什么**。
 6. **改了基准也要在 Debug 下跑一次 `zig test`**：曾出现 UAF（`finishBytes()` 之后读 `w.buf`），
    ReleaseFast 下数字全对、退出码 0，只有 Debug 测试崩（退出码 3）。
+
+## 规模级对照（2026-11-02 起，`tools/run-scale-abba.ps1`）
+
+主基准固定 100 万行（页全在缓存里）；容量线要回答的是「数据量 ×100 之后还成不成立」，
+所以另有一条**规模级**跑法：两边都灌 1 亿行（3.9 GB，`id INTEGER PRIMARY KEY` + 32 B BLOB，
+每 1024 行一个事务），同会话交替取配对比值。
+
+```powershell
+# 对齐档（Zig 提交不 fsync <-> SQLite synchronous=NORMAL）：正式结论用这一档
+powershell -File tools\run-scale-abba.ps1 -Rows 100000000 -Tag d -Rounds 2
+
+# 严格档（Zig 提交即 fsync <-> SQLite synchronous=FULL）：两侧同档，证明没拿弱档占便宜
+powershell -File tools\run-scale-abba.ps1 -Rows 100000000 -Tag f -Rounds 2 -Durable -SqliteSync FULL
+```
+
+**两条硬性纪律**（本轮真踩过）：
+
+1. **跨批次对照会骗人**：同一份 SQLite 代码，隔一天冷点查 90,390 → 39,855（文件缓存状态变了）。
+   跨引擎数字只能同会话交替取。
+2. **持久化档必须两侧对齐**：`putBatch` 每批 `fsync` 而 SQLite NORMAL 不 `fsync`，
+   比值毫无意义（实测同一份代码 929,428 vs 2,765,727 行/s，差 3 倍）。
+
+| 批次 | 内容 |
+|---|---|
+| `规模-2026-11-02-d-{z1,z2}` + `sqlite-规模-2026-11-02-d-{s1,s2}` | **对齐档正式结论**：写入 1.94×、扫描 2.04×、冷点查 1.85×、热点查 2.92×、未命中 90×；抖动 p50/p99 全面更低 |
+| `规模-2026-11-02-f-{z1,z2}` + `sqlite-规模-2026-11-02-f-{s1,s2}` | **严格档结论**：写入 1.46×、扫描 2.08×、冷点查 1.98×、热点查 2.99×（fsync 占写入时间 63%） |
+| `规模-2026-11-02-1e8-prefault-{A1,B1,B2,A2}` | **数据 mmap 预取 A/B**（同数据只改 `-Dscale-data-prefault`）：冷命中 3.6×、扫描/热查无差异 |
+| `规模-2026-11-02-1e8-seg4883` | 段数单变量实验（155 段 vs 4883 段）：扫描 0.89×、热查 0.52×、冷重开 15× |
+| `规模-2026-11-02-1e8-noprefault` | 首个「不预取」整轮样本（含 p50/p99/p999），已被 d 批取代，仅留档 |
+
+> 规模级批次里 `scale_wal_sync_ms` / `scale_put_ms` 是**写入耗时拆分**（fsync 占比），
+> 用于分辨「写入慢在落盘还是慢在内存结构」，不是性能指标本身。

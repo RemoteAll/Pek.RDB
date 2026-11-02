@@ -78,10 +78,17 @@ pub fn build(b: *std.Build) void {
     const scale_dir = b.option([]const u8, "scale-dir", "run-scale: data directory") orelse "scale-data";
     // 段数单变量实验用：同样行数、只改 flush_bytes 造出不同段数。
     const scale_flush = b.option(u64, "scale-flush-bytes", "run-scale: flush_bytes (smaller = more segments)") orelse (64 << 20);
+    // 数据段 mmap 预缺页上限（0 = 不预取，默认）。旧行为（populate 默认 true）用大值恢复：
+    //   -Dscale-data-prefault=4611686018427387904
+    const scale_data_prefault = b.option(u64, "scale-data-prefault", "run-scale: prefault data mmap when file <= N bytes (0 = never)") orelse 0;
+    // 持久化档：true = 每批 fsync（最强）；false = 只写进 OS 缓存（与 SQLite synchronous=NORMAL 对齐）。
+    const scale_durable = b.option(bool, "scale-durable", "run-scale: fsync before commit returns (false = SQLite NORMAL equivalent)") orelse true;
     const scale_opts = b.addOptions();
     scale_opts.addOption(u64, "rows", scale_rows);
     scale_opts.addOption([]const u8, "dir", scale_dir);
     scale_opts.addOption(u64, "flush_bytes", scale_flush);
+    scale_opts.addOption(u64, "data_prefault", scale_data_prefault);
+    scale_opts.addOption(bool, "durable", scale_durable);
     const scale_exe = b.addExecutable(.{
         .name = "spike-scale",
         .root_module = b.createModule(.{

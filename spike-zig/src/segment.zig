@@ -613,6 +613,14 @@ pub const Segment = struct {
     base_path: []const u8 = &.{},
     id: u64 = 0,
     preheat: bool = false,
+    /// 数据段 mmap **允许预缺页**的最大字节数；`0` = 从不预取（默认）。
+    ///
+    /// 为什么默认不预取：Zig 0.17 的 `MemoryMap.CreateOptions.populate` **默认是 true**，
+    /// Windows 实现会立刻对整段调 `NtSetInformationVirtualMemory(Prefetch)`。
+    /// 点查是随机访问：25 MB 的段整段预取 = 每「换一次段」读 25 MB 只为一行，
+    /// 这是冷点查只有 SQLite 0.51× 与 p99 抖动的主要嫌疑（实测见决策记录九十一）。
+    /// 顺序扫描不需要它 —— 缺页时内核自带顺序预读。
+    data_prefault_max: u64 = 0,
     mapped: bool = false,
     data: []const u8 = &.{},
     mm: ?std.Io.File.MemoryMap = null,
@@ -872,6 +880,9 @@ pub const Segment = struct {
             var mm = try std.Io.File.MemoryMap.create(self.io, f, .{
                 .len = @intCast(self.file_size),
                 .protection = .{ .read = true, .write = false },
+                // **必须显式给 `populate`**：默认 true 会在映射建立时预取整段，
+                // 对随机点查是纯浪费（见 `data_prefault_max` 的注释）。
+                .populate = self.data_prefault_max != 0 and self.file_size <= self.data_prefault_max,
             });
             errdefer mm.destroy(self.io);
             if (self.preheat) try mm.read(self.io);
