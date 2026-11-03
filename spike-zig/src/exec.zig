@@ -1221,6 +1221,10 @@ fn finishFromRows(
 
 /// 主体：把 `rows` 深拷成 `Materialized` 后交给 `assembleMaterialized`。
 /// `pg` 的释放由调用方的 `defer` 负责；本函数只在交给 `buildOutput` 时 `release()`。
+///
+/// **只服务「有 `ORDER BY`」的路径**：排序要按未投影的列比较，所以只能全宽拷贝；
+/// 无 `ORDER BY` 的 JOIN 走 `JoinSink` 直写（那里能提前投影、全链只搬一次），
+/// 不再经过这里 —— 两个分支都留着的话，窄分支就再没有用例走过了（死代码）。
 fn finishFromRowsCopy(
     io: std.Io,
     s: *const schema_mod.Schema,
@@ -1231,31 +1235,15 @@ fn finishFromRowsCopy(
     t0_in: u64,
 ) !Rows {
     var t0 = t0_in;
-    const proj = pg.proj;
-
+    const ncols = s.columns.len;
     // 深拷贝 text/blob：它们指向 JOIN 的 arena，出函数就失效。
-    //
-    // **无 `ORDER BY` 时只拷投影列**（`narrow`）：排序要按未投影的列比较，所以只有这一档能提前投影。
-    // 这一点直接决定 `buildOutput` 走哪条路 —— 窄 `flat` 会命中它的
-    // 「`m.ncols == 投影列数`」分支（所有权转移，零额外拷贝），
-    // 而全宽 `flat` 只会落到「另分配 pflat 再逐行挑列」那条老路（实测 10,000 行多花 ~400 µs）。
-    const narrow = sel.order_by.len == 0;
-    const ncols = if (narrow) proj.indices.len else s.columns.len;
     var total: usize = 0;
     for (rows) |r| {
-        if (narrow) {
-            for (proj.indices) |ci| switch (r[ci]) {
-                .text => |x| total += x.len,
-                .blob => |x| total += x.len,
-                else => {},
-            };
-        } else {
-            for (r) |v| switch (v) {
-                .text => |x| total += x.len,
-                .blob => |x| total += x.len,
-                else => {},
-            };
-        }
+        for (r) |v| switch (v) {
+            .text => |x| total += x.len,
+            .blob => |x| total += x.len,
+            else => {},
+        };
     }
     const buf = try alloc.alloc(u8, total);
     errdefer alloc.free(buf);
@@ -1267,11 +1255,7 @@ fn finishFromRowsCopy(
     var off: usize = 0;
     for (rows, 0..) |src, i| {
         const dst = flat[i * ncols ..][0..ncols];
-        if (narrow) {
-            for (proj.indices, 0..) |ci, k| dst[k] = copyValue(buf, &off, src[ci]);
-        } else {
-            for (src, 0..) |v, c| dst[c] = copyValue(buf, &off, v);
-        }
+        for (src, 0..) |v, c| dst[c] = copyValue(buf, &off, v);
         hdrs[i] = dst;
     }
     var m = Materialized{ .alloc = alloc, .flat = flat, .hdrs = hdrs, .buf = buf, .ncols = ncols };
@@ -1470,7 +1454,12 @@ fn selectByPk(t: *tablemod.Table, s: *const schema_mod.Schema, sel: sql.Select, 
 
     const raw = (try t.get(key, &vbuf)) orelse {
         const empty = try alloc.alloc([]sql.Value, 0);
-        return .{ .alloc = alloc, .columns = pg.release().columns, .rows = empty };
+        // **未命中也要收拾 `indices`**：`Rows` 只持有 `columns`，而 `indices` 是
+        // `buildProjection` 另分配的。这条分支以前直接 `return` ⇒ 每次「主键查不到」
+        // 都漏一个 `[]usize`（用例 `主键点查未命中：返回 0 行且不泄漏` 当场抓出 2 处）。
+        const got = pg.release();
+        alloc.free(got.indices);
+        return .{ .alloc = alloc, .columns = got.columns, .rows = empty };
     };
 
     const one = [_][]const u8{raw};

@@ -1104,6 +1104,47 @@ test "JOIN：INNER/LEFT、ON 反向、索引路径、裸名歧义、不支持的
     try std.testing.expectError(error.UnexpectedToken, queryRows(&eng, alloc, "SELECT t.id FROM t JOIN u ON t.uid > u.id"));
 }
 
+// PRIMARY KEY 点查**未命中**时的空结果分支：必须释放投影下标，且不能把
+// 「没找到」错当成别的东西。这条路径此前没有任何用例覆盖 —— `proj.indices`
+// 在这条分支上没人释放（`Rows` 不持有它），是 `dc00be3` 审计后第二轮才发现的泄漏。
+test "主键点查未命中：返回 0 行且不泄漏" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const root = "test-engine-pk-miss";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    var eng = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    defer eng.deinit();
+
+    try run(&eng, alloc, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)");
+    try run(&eng, alloc, "INSERT INTO t (id, name) VALUES (1,'a'), (2,'b')");
+
+    // 命中：走点查，正常装配
+    {
+        var rows = try queryRows(&eng, alloc, "SELECT id, name FROM t WHERE id = 2");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+        try std.testing.expectEqualStrings("b", rows.rows[0][1].text);
+    }
+    // 未命中：必须 0 行（泄漏由 `std.testing.allocator` 兜底）
+    {
+        var rows = try queryRows(&eng, alloc, "SELECT id, name FROM t WHERE id = 999");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 0), rows.rows.len);
+    }
+    // 投影只取部分列时同样要覆盖（`buildProjection` 的分配形状不同）
+    {
+        var rows = try queryRows(&eng, alloc, "SELECT name FROM t WHERE id = 999");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 0), rows.rows.len);
+    }
+}
+
 // **`JOIN` 的两条装配路径**：有 `ORDER BY` 走「arena 宽行 → 深拷」老路，
 // 无 `ORDER BY` 走 `JoinSink` 直写最终布局。两者必须给出**同一组行、同一顺序**。
 //
