@@ -422,6 +422,35 @@ fn rebuildArchive(
     return n_segs;
 }
 
+/// 统计「磁盘上有 `.data`、但段号大于归档见过的最大段号」的段数。
+///
+/// 只用于截断检测（见 `openSegmentsFromArchive`）：归档是权威，磁盘上多出来的段
+/// 要么是「还没发布的新段」（追加崩溃），要么是「归档丢了尾巴」；前者最多 1 个。
+fn countUnpublishedSegments(
+    io: std.Io,
+    dir: std.Io.Dir,
+    alloc: std.mem.Allocator,
+    base_path: []const u8,
+    max_id: u64,
+) !usize {
+    const seg_dir_path = try alloc.print("{s}/seg", .{base_path});
+    defer alloc.free(seg_dir_path);
+    var d = dir.openDir(io, seg_dir_path, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound => return 0,
+        else => return e,
+    };
+    defer d.close(io);
+    var it = d.iterate();
+    var n: usize = 0;
+    while (try it.next(io)) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".data")) continue;
+        const stem = entry.name[0 .. entry.name.len - ".data".len];
+        const id = std.fmt.parseInt(u64, stem, 10) catch continue;
+        if (id > max_id) n += 1;
+    }
+    return n;
+}
+
 fn openSegmentsFromArchive(
     io: std.Io,
     dir: std.Io.Dir,
@@ -464,6 +493,24 @@ fn openSegmentsFromArchive(
         if (!dup) try live.append(alloc, rec);
     }
     const valid_end = it.validEnd();
+
+    // **归档被截断检测**
+    //
+    // `ArchiveIter` 遇到不完整记录就停 —— 这是「追加途中断电」的正常语义（该段尚未发布，
+    // 数据一行都没丢）。但「归档被截断」留下的残尾与它**完全同形**，光看文件内容区分
+    // 不了，于是被截断的归档会把后面所有段当成不存在 ⇒ **静默少行**
+    // （2026-11-03 段注入实测：`index.bin` 截断到一半，10 行只剩 4 行，一声不响）。
+    //
+    // 判据不用看文件内容，用**段文件的个数**：一次 flush 只追加**一个**段记录，
+    // 所以「追加崩溃」最多留下一个「磁盘上有 `.data`、归档里却没记录」的段；
+    // 这样的段有 ≥ 2 个就不可能是一次追加崩溃，只可能是归档被截断（磁盘损坏 / 还原旧备份）
+    // 或被人为删改 —— 必须报出来，不能静默返回一个更小的结果集。
+    //
+    // 边界（有意为之）：恰好 1 个未发布段 = 追加崩溃，按设计容忍（见用例
+    // 「崩溃：段文件存在但归档无记录时被忽略且不报错（归档是权威）」）。
+    if (try countUnpublishedSegments(io, dir, alloc, base_path, max_id) >= 2) {
+        return error.ArchiveTruncated;
+    }
 
     for (live.items) |rec| {
         var ta: u64 = 0;

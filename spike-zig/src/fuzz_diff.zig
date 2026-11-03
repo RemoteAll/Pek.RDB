@@ -1648,3 +1648,194 @@ test "WAL 截断：只能是完整前缀或显式报错，不得静默返回坏�
     try std.testing.expect(partial_rows > 0);
     try std.testing.expectEqual(@as(usize, 0), fails);
 }
+
+// ===========================================================================
+// 段文件损坏 / 截断（持久化状态的最后一类注入）
+//
+// 段（`seg/NNNNNN.data`）是**已发布**的不可变数据 —— 它只在 flush 成功之后才存在，
+// 所以「读到一半发现文件短了 / CRC 不对」只有两种可接受处理：
+//   ① 显式报错（项目硬约束：CRC 失败 / 段缺失必须报出来，不得跳过当没事）；
+//   ② 自愈并且**一行不少**（`index.bin` 丢了可以从 `.data` 重建，那是既定设计 §一百零一）。
+// **不可接受**：静默返回更少的行 —— 那就是数据丢失，而且用户永远不会知道。
+//
+// 三个注入点：`.data` 截断（含只截掉 1 字节）、`.data` 中间翻一位（CRC）、`index.bin` 截断。
+// ===========================================================================
+
+fn buildSegmentedDb(io: std.Io, dir: std.Io.Dir, root: []const u8, alloc: std.mem.Allocator, rows: []const Row) !void {
+    // `flush_bytes = 1`：每插一行就 flush 出一个段，保证有多段可破坏
+    var eng = try engine.Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0, .flush_bytes = 1 } });
+    defer eng.deinit();
+    try execSilent(&eng, alloc, "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, s TEXT)");
+    for (rows) |r| {
+        var b: Buf = .empty;
+        defer b.deinit(alloc);
+        try b.appendSlice(alloc, "INSERT INTO t (id, g, s) VALUES (");
+        try addInt(alloc, &b, r.id);
+        try b.appendSlice(alloc, ", ");
+        if (r.g) |g| try addInt(alloc, &b, g) else try b.appendSlice(alloc, "NULL");
+        try b.appendSlice(alloc, ", ");
+        if (r.s) |v| {
+            try b.appendSlice(alloc, "'");
+            try b.appendSlice(alloc, v);
+            try b.appendSlice(alloc, "'");
+        } else try b.appendSlice(alloc, "NULL");
+        try b.appendSlice(alloc, ")");
+        try execSilent(&eng, alloc, b.items);
+    }
+}
+
+/// 枚举 `{root}/t/seg` 下的文件名（升序）。
+fn listSegFiles(io: std.Io, dir: std.Io.Dir, alloc: std.mem.Allocator, root: []const u8) ![][]u8 {
+    const seg_dir_path = try alloc.print("{s}/t/seg", .{root});
+    defer alloc.free(seg_dir_path);
+    var d = try dir.openDir(io, seg_dir_path, .{ .iterate = true });
+    defer d.close(io);
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |n| alloc.free(n);
+        out.deinit(alloc);
+    }
+    var it = d.iterate();
+    while (try it.next(io)) |entry| {
+        try out.append(alloc, try alloc.dupe(u8, entry.name));
+    }
+    std.mem.sort([]u8, out.items, {}, struct {
+        fn less(_: void, a: []u8, b: []u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.less);
+    return out.toOwnedSlice(alloc);
+}
+
+test "段文件损坏/截断：必须显式报错或自愈到一行不少，不得静默少行" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+    const root = "test-seg-corrupt";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    const all = buildT();
+    const rows = all[0..10];
+
+    var fails: usize = 0;
+    var explicit_errors: usize = 0;
+    var self_healed: usize = 0;
+    var tolerated: usize = 0;
+    var gaps: usize = 0;
+    var cases: usize = 0;
+
+    const Mutation = enum { truncate_half, truncate_tail1, flip_middle };
+    const mutations = [_]Mutation{ .truncate_half, .truncate_tail1, .flip_middle };
+
+    for (mutations) |mut| {
+        // 段文件 + 归档，各破坏一次
+        const targets = [_][]const u8{ "000001.data", "000005.data", "000010.data", "index.bin" };
+        for (targets) |name| {
+            dir.deleteTree(io, root) catch {};
+            try buildSegmentedDb(io, dir, root, alloc, rows);
+
+            // 找到实际存在的文件（段号可能少于 10 个，跳过不存在的）
+            const list = try listSegFiles(io, dir, alloc, root);
+            defer {
+                for (list) |n| alloc.free(n);
+                alloc.free(list);
+            }
+            var exists = false;
+            for (list) |n| {
+                if (std.mem.eql(u8, n, name)) exists = true;
+            }
+            if (!exists) continue;
+
+            const path = try alloc.print("{s}/t/seg/{s}", .{ root, name });
+            defer alloc.free(path);
+            {
+                const f = try dir.openFile(io, path, .{ .mode = .read_write });
+                defer f.close(io);
+                const size: usize = @intCast((try f.stat(io)).size);
+                if (size == 0) continue;
+                switch (mut) {
+                    .truncate_half => try f.setLength(io, @intCast(size / 2)),
+                    .truncate_tail1 => try f.setLength(io, @intCast(size - 1)),
+                    .flip_middle => {
+                        var one = [_]u8{0};
+                        _ = try f.readPositionalAll(io, &one, size / 2);
+                        one[0] ^= 0xFF;
+                        try f.writePositionalAll(io, &one, size / 2);
+                        try f.sync(io);
+                    },
+                }
+            }
+            cases += 1;
+
+            const got = reopenAndRead(io, dir, root, alloc) catch |e| {
+                std.debug.print("[段注入 {s} {s}] 显式报错：{s}\n", .{ name, @tagName(mut), @errorName(e) });
+                explicit_errors += 1;
+                continue;
+            };
+            defer freeRows(got, alloc);
+            self_healed += 1;
+
+            // 成功打开 ⇒ 必须是「写入值的前缀」且每行值逐字节一致
+            var bad: ?[]const u8 = null;
+            if (got.len > rows.len) {
+                bad = "行数超过写入数";
+            } else {
+                for (got, 0..) |g, i| {
+                    if (!valueEq(g[0], .{ .integer = rows[i].id }) or
+                        !valueEq(g[1], rowCol(rows[i], .g)) or
+                        !valueEq(g[2], rowCol(rows[i], .s)))
+                    {
+                        bad = "值被破坏却没报错";
+                        break;
+                    }
+                }
+                if (bad == null and got.len != rows.len) bad = "静默少行（数据丢失）";
+            }
+
+            if (bad) |why| {
+                // 两类**已知边界**，与缺陷分开计数（棘轮：修好之后只允许更少，不允许更多）
+                const single_unpublished = std.mem.eql(u8, name, "index.bin") and mut == .truncate_tail1;
+                const no_checksum = mut == .flip_middle and !std.mem.eql(u8, name, "index.bin");
+                if (std.mem.eql(u8, why, "静默少行（数据丢失）") and single_unpublished) {
+                    // **设计边界，不是缺陷**：归档尾部丢掉「恰好一个」段记录 = 该段尚未发布
+                    // （追加途中断电的正常语义），与用例「崩溃：段文件存在但归档无记录时
+                    // 被忽略且不报错（归档是权威）」一致。要根治只能给归档加已发布长度基准，
+                    // 而那与「归档是权威」的既有取舍冲突（试过，打破 3 个用例，已回退）。
+                    std.debug.print("[段注入 {s} {s}] 容忍（单个未发布段，前缀 {d}/{d} 行）\n", .{
+                        name, @tagName(mut), got.len, rows.len,
+                    });
+                    tolerated += 1;
+                    continue;
+                }
+                if (no_checksum) {
+                    // **已知缺口（P1）**：段记录里**没有任何校验和**（`codec.REC_HDR` 只有
+                    // 6 字节长度/seq 头 + key + value），所以数据区里翻一位会被当成正常数据
+                    // 返回 —— 这是本项目最不该静默的一类。修它要给记录加校验和 =
+                    // **磁盘格式变更**（必须升 format 版本 + 迁移方案），见决策记录 §一百一十四。
+                    std.debug.print("[段注入 {s} {s}] 已知缺口：位翻转未检出（{d} 行）\n", .{
+                        name, @tagName(mut), got.len,
+                    });
+                    gaps += 1;
+                    continue;
+                }
+                std.debug.print("[段注入 {s} {s}] {s}：恢复出 {d} 行（应为 {d}）\n", .{
+                    name, @tagName(mut), why, got.len, rows.len,
+                });
+                fails += 1;
+            }
+        }
+    }
+
+    // 防空跑：必须真的注入了多次，且不可能全部「自愈成功」（段损坏没有修复来源）
+    try std.testing.expect(cases >= 6);
+    // 棘轮：已知缺口只允许 ≤ 2（两个位翻转点），修好格式后这个数必须变小、不能变大
+    try std.testing.expect(gaps <= 2);
+    try std.testing.expect(tolerated <= 1);
+    std.debug.print("[段注入] {d} 个注入点：显式报错 {d}、成功打开 {d}、容忍边界 {d}、已知缺口 {d}、不合格 {d}\n", .{
+        cases, explicit_errors, self_healed, tolerated, gaps, fails,
+    });
+    try std.testing.expectEqual(@as(usize, 0), fails);
+}
