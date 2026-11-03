@@ -18,5 +18,5 @@ pub const m0_diag = @import("m0_diag.zig");
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("m0_diag_test.zig");
+    _ = @import("fuzz_diff.zig");
 }
-

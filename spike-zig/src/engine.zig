@@ -373,10 +373,17 @@ pub const Engine = struct {
             var it = tables.iterator();
             while (it.next()) |e| {
                 var ie = e.value_ptr.idx_tables.iterator();
-                while (ie.next()) |x| x.value_ptr.deinit();
+                while (ie.next()) |x| {
+                    x.value_ptr.deinit();
+                    // **map 的键也是自己 dupe 的，必须一并释放**：
+                    // 只释放 value 的话，开库中途失败会漏掉每个表名/索引名
+                    // （2026-11-03 由「开库/恢复」生命周期守卫抓到，len: 7 = "idx_a_g"）。
+                    alloc.free(x.key_ptr.*);
+                }
                 e.value_ptr.idx_tables.deinit();
                 e.value_ptr.table.deinit();
                 e.value_ptr.schema.deinit(alloc);
+                alloc.free(e.key_ptr.*);
             }
             tables.deinit();
         }
@@ -396,7 +403,10 @@ pub const Engine = struct {
             var idx_tables = std.StringHashMap(tablemod.Table).init(alloc);
             errdefer {
                 var ie = idx_tables.iterator();
-                while (ie.next()) |x| x.value_ptr.deinit();
+                while (ie.next()) |x| {
+                    x.value_ptr.deinit();
+                    alloc.free(x.key_ptr.*); // 同 `deinit` 口径：键由本函数 dupe
+                }
                 idx_tables.deinit();
             }
             for (sch.indexes) |ix| {
@@ -2148,4 +2158,103 @@ const oom_queries = [_][]const u8{
 
 test "任意分配失败：查询装配全路径不泄漏、不重复释放" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, oomProbeFn, .{ "test-oom-query", &oom_setup, &oom_queries });
+}
+
+// ---------------------------------------------------------------------------
+// **全生命周期**守卫：开库 → DDL → DML → 关库 → **重新开库（恢复路径）** → 查询
+//
+// 上一版守卫只把「一次查询/一条写语句」的 allocator 换成注入式，`Engine.open` 里
+// 那条最长的失败链（载 catalog → 逐表载 schema → 开表 → 逐个开/建索引表 → 塞进 map）
+// 以及**重开时的恢复路径**（catalog 解析、段索引重建、WAL 重放）从来没有被注入过。
+// 这两处恰恰是「每轮审计都能翻出新漏点」的高发区：它们只在启动/恢复时才跑，日常用例
+// 撞不到。
+//
+// 口径与上一个守卫一致：**建 IO 用稳定分配器**（`std.Io.Threaded` 会开线程），
+// 只把「引擎侧分配」换成注入式；判定仍是 `allocated_bytes != freed_bytes`。
+// ---------------------------------------------------------------------------
+
+fn runInj(eng: *Engine, parse_alloc: std.mem.Allocator, exec_alloc: std.mem.Allocator, text: []const u8) !void {
+    // 解析用稳定分配器、执行用注入分配器：注入点集中在**引擎侧**，
+    // 不把解析器的失败路径也算进来（那会让每个分配点再乘一遍，纯浪费时间）。
+    var p = try sql.parse(parse_alloc, text);
+    defer p.deinit();
+    var res = try eng.execute(p.stmt, exec_alloc);
+    switch (res) {
+        .rows => |*r| r.deinit(),
+        else => {},
+    }
+}
+
+fn oomLifecycleFn(inject: std.mem.Allocator, root: []const u8, stmts: []const []const u8) anyerror!void {
+    const stable = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(stable, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    // ① 首次开库（空目录）+ 全部 DDL/DML：`Engine.open` 的短路径
+    {
+        var eng = try Engine.open(io, dir, root, inject, .{ .table = .{ .wal_sync_every = 0 } });
+        defer eng.deinit();
+        for (stmts) |st| try runInj(&eng, stable, inject, st);
+    }
+    // ② 重新开库：载 catalog → 逐表载 schema → 开段 → **开/建索引表** → 查询
+    //    （`dir.deleteTree` 只在最外层，所以这里读到的是上一次落盘的状态）
+    {
+        var eng = try Engine.open(io, dir, root, inject, .{ .table = .{ .wal_sync_every = 0 } });
+        defer eng.deinit();
+        try runInj(&eng, stable, inject, "SELECT id, s FROM a WHERE g = 10");
+        try runInj(&eng, stable, inject, "SELECT g, COUNT(*) FROM a GROUP BY g");
+    }
+}
+
+const oom_lifecycle = [_][]const u8{
+    "CREATE TABLE a (id INTEGER PRIMARY KEY, g INTEGER NOT NULL, s TEXT NOT NULL)",
+    "INSERT INTO a (id, g, s) VALUES (1,10,'x'), (2,10,'y'), (3,20,'z'), (4,99,'w')",
+    "CREATE INDEX idx_a_g ON a (g)",
+    "UPDATE a SET g = 11 WHERE id = 2",
+    "DELETE FROM a WHERE id = 4",
+};
+
+test "任意分配失败：开库/恢复/重开全生命周期不泄漏" {
+    // **不用 `checkAllAllocationFailures`**：它要求「每次运行分配序列完全一致」，
+    // 而文件系统代码里 `ArrayList` 的增长可能这一次 `resize` 就地成功、下一次拿不到
+    // 尾部空间只能 `alloc`+`free` ⇒ 计数差一个就报 `NondeterministicMemoryUsage`
+    // （实测：首轮 199 次、后续 198 次）。那是堆布局的噪声，不是被测代码的缺陷。
+    //
+    // 改成自驱扫描，判定只看两条**与计数无关**的事实：
+    //   ① 本次运行分配/释放记账必须平衡（`allocated_bytes != freed_bytes` = 泄漏/错配）
+    //   ② 不能被吞掉的 OOM、不能把 OOM 转成别的错误
+    const alloc = std.testing.allocator;
+    var probe = std.testing.FailingAllocator.init(alloc, .{});
+    try oomLifecycleFn(probe.allocator(), "test-oom-life", &oom_lifecycle);
+    const total = probe.alloc_index;
+    try std.testing.expect(total > 20); // 跑得太少说明场景没覆盖到，别让守卫空转
+
+    var fails: usize = 0;
+    for (0..total) |i| {
+        var fa = std.testing.FailingAllocator.init(alloc, .{ .fail_index = i });
+        const r = oomLifecycleFn(fa.allocator(), "test-oom-life", &oom_lifecycle);
+        if (r) |_| {
+            if (fa.has_induced_failure) {
+                std.debug.print("[life] fail_index={d} 吞掉了 OOM（返回成功）\n", .{i});
+                fails += 1;
+            }
+        } else |e| {
+            if (e != error.OutOfMemory) {
+                std.debug.print("[life] fail_index={d} OOM 被转成 {s}\n", .{ i, @errorName(e) });
+                fails += 1;
+            }
+        }
+        if (fa.allocated_bytes != fa.freed_bytes) {
+            std.debug.print("[life] fail_index={d} 记账不平：alloc={d} free={d}\n", .{
+                i, fa.allocated_bytes, fa.freed_bytes,
+            });
+            fails += 1;
+        }
+    }
+    std.debug.print("[生命周期守卫] 扫描 {d} 个注入点，失败 {d}\n", .{ total, fails });
+    try std.testing.expectEqual(@as(usize, 0), fails);
 }

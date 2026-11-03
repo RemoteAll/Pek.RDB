@@ -457,6 +457,14 @@ const Materialized = struct {
     /// `flat` 每行实际解码的列数。等于 `schema.columns.len` 时是全列解码；
     /// 小于它说明已按投影解码（`flat` 就是最终布局，`buildOutput` 无需再挑列）。
     ncols: usize = 0,
+    /// **`flat` 是否已经是「投影顺序」的最终布局**。
+    ///
+    /// 不能用 `ncols == 投影列数` 去推断：全列解码（`ncols == 列数`）+ 「全列但乱序」的投影
+    /// （`SELECT s, id, g`）两个条件同时成立时，长度相等而布局是**表顺序**，
+    /// 于是 `buildOutput` 会认为「已经是最终布局」直接转移所有权 ⇒
+    /// **列名是投影顺序、值是表顺序**。2026-11-03 由差分随机测试抓到（此前所有用例
+    /// 都是 `id, g` 这种表序投影，从未踩到）。
+    pushed: bool = false,
 
     fn deinit(self: *Materialized) void {
         self.alloc.free(self.flat);
@@ -493,7 +501,7 @@ fn decodeAll(
         if (want) |w| try s.decodeRowProjected(vals, w, raw) else try s.decodeRowInto(vals, raw);
         hdrs[i] = vals;
     }
-    return .{ .alloc = alloc, .buf = buf, .flat = flat, .hdrs = hdrs, .ncols = ncols };
+    return .{ .alloc = alloc, .buf = buf, .flat = flat, .hdrs = hdrs, .ncols = ncols, .pushed = want != null };
 }
 
 /// 结果装配：按投影产出 Rows；恒等投影直接复用扁平数组（零拷贝）。
@@ -541,10 +549,10 @@ fn buildOutput(
         return .{ .alloc = alloc, .columns = proj.columns, .rows = out, .flat = flat, .buf = buf };
     }
 
-    // `decodeAll` 已按投影解码（`m.ncols == 投影列数`）：`flat` 就是最终布局，
-    // 不用再从全列里挑。这是 `SELECT id` 比 `SELECT *` 还慢 16% 的根因修法 ——
-    // 旧路径会另分配一份 `pflat` 再逐行拷 Value（100 万行 16MB）。
-    if (m.ncols == proj.indices.len) {
+    // `decodeAll` 已按投影解码（`m.pushed`）：`flat` 就是最终布局，不用再从全列里挑。
+    // 这是 `SELECT id` 比 `SELECT *` 还慢 16% 的根因修法 —— 旧路径会另分配一份
+    // `pflat` 再逐行拷 Value（100 万行 16MB）。
+    if (m.pushed) {
         if (start == 0 and end == m.hdrs.len) {
             const out = m.hdrs;
             const flat = m.flat;
@@ -991,7 +999,8 @@ const JoinSink = struct {
         const hdrs = try self.alloc.alloc([]sql.Value, nrows);
         errdefer self.alloc.free(hdrs);
         for (0..nrows) |i| hdrs[i] = flat[i * self.ncols ..][0..self.ncols];
-        return .{ .alloc = self.alloc, .flat = flat, .hdrs = hdrs, .buf = buf, .ncols = self.ncols };
+        // `emit` 写入的就是**投影列、投影顺序**，所以这里布局已经是最终布局
+        return .{ .alloc = self.alloc, .flat = flat, .hdrs = hdrs, .buf = buf, .ncols = self.ncols, .pushed = true };
     }
 };
 

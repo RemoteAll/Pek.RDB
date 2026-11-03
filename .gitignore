@@ -15,6 +15,12 @@ spike-zig/bench.err
 spike-zig/bench-data*/
 spike-zig/test-*-tmp/
 spike-zig/test-*-db/
+# 差分 / 生命周期守卫跑测试时建的临时库目录：正常由 `defer deleteTree` 清掉，
+# 但测试崩溃（panic / 断言失败）会留下来 —— 一律不入库。
+# 注意用通配而不是逐个列举：新用例换个名字就会漏（2026-11-03 就因为只挡了
+# `test-*-db/`，把 `test-temp-upd/` 加进了暂存区）。
+spike-zig/test-*/
+spike-zig/diag-*/
 tools/bench-vs-sqlite/*.db
 tools/bench-vs-sqlite/*.db-wal
 tools/bench-vs-sqlite/*.db-shm

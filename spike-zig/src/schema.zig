@@ -7,6 +7,7 @@ const sql = @import("sql.zig");
 pub const Error = error{
     InvalidSchema,
     InvalidIdentifier,
+    InvalidProjection,
     MissingPrimaryKey,
     TooManyPrimaryKeys,
     TypeMismatch,
@@ -313,6 +314,12 @@ pub const Schema = struct {
         const bitmap_len = (n + 7) / 8;
         if (bytes.len < bitmap_len) return error.CorruptRow;
         if (dst.len != want.len) return error.TypeMismatch;
+        // **严格升序是硬前提，必须兜住**：本函数按下标游标 `wi` 单向前进，喂进非升序的
+        // `want` 时后面那些单元**根本不会被写**，`flat` 直接把未初始化内存当结果返回
+        // （`undefined` 不报错、只在特定值下表现出错误数据）。2026-11-03 由差分随机测试抓到。
+        //
+        // 判定放在**循环之后一次**（`wi != want.len`）：非升序 / 越界 / 重复值都必然导致
+        // 有列从未被匹配 ⇒ `wi` 走不满。这样只多一次比较，不给热路径增加逐行扫描。
         var r = codec.Reader{ .buf = bytes[bitmap_len..] };
         var wi: usize = 0;
         for (self.columns, 0..) |col, i| {
@@ -346,6 +353,8 @@ pub const Schema = struct {
                 },
             }
         }
+        // 走不满 = `want` 不是严格升序的子集（含越界/重复）⇒ 有单元没被写
+        if (wi != want.len) return error.InvalidProjection;
     }
 };
 
