@@ -1010,6 +1010,18 @@ pub const Segment = struct {
         return it;
     }
 
+    /// 把游标定位到稀疏索引项指向的块头，并校验该位置**在数据文件之内**。
+    ///
+    /// 为什么要校验：数据文件被截断后，稀疏索引里的 offset 会指向文件之外 ——
+    /// 那时 `RecIter.seek` 只是把 `pos` 设成越界值，下一次 `next()` 立刻返回 `null`，
+    /// 看起来就是「这个段没有数据」⇒ **静默少返回行**。段头明确声明这里有数据，
+    /// 所以「指到文件外」只能是损坏。
+    fn seekToEntry(self: *Segment, it: *codec.RecIter, idx: usize) !void {
+        const off: u64 = self.entries.items[idx].offset;
+        if (off > it.buf.len) return error.SegmentCorrupt;
+        it.seek(@intCast(off));
+    }
+
     fn mayContain(self: *const Segment, key: []const u8) bool {
         // 未解析时 `bits_len` 还是 0，会误以为「没有 Bloom、一律放行」——
         // 结果不丢数据但会静默退化成「每段全扫」。所有入口都已 `ensureParsed`，
@@ -1080,14 +1092,21 @@ pub const Segment = struct {
         // 只放到 `entries[i+1]` 会在扫完前一块就停，target 根本见不到 → 返回 null
         // （用例 `同一 key 的多个版本跨过索引边界` 与 `>255 公共前缀` 都会踩到）。
         const end: u64 = if (i + 2 < self.entries.items.len) self.entries.items[i + 2].offset else it.buf.len;
-        if (end <= begin) return null;
-        it.seek(begin);
+        // **必须先判越界再判空区间**：文件被截断时 `begin` 会大于文件长度，
+        // 而 `end`（=buf.len）比它小 ⇒ 旧写法 `if (end <= begin) return null` 会直接
+        // 把它当成「这段没有数据」，静默少一行都算不上，整个后半段都查不到。
+        if (begin > it.buf.len or end <= begin) return error.SegmentCorrupt;
+        try self.seekToEntry(it, i);
 
         var pos: usize = begin;
         while (pos < end) {
             // **就地比较，不重建 key**：块内是「公共前缀 + 后缀」，重建要走两次 memcpy，
             // 而点查只需要顺序（`RecIter.nextCmp` 的说明里有完整理由）。
-            const rec = it.nextCmp(key) orelse break;
+            const rec = it.nextCmp(key) orelse {
+                // `null` = 读完 或 解不出来；两者必须分开（否则损坏会被当成「没找到」）
+                if (it.corrupt) return error.SegmentCorrupt;
+                break;
+            };
             pos = rec.next;
             switch (rec.ord) {
                 .lt => continue,
@@ -1122,7 +1141,7 @@ pub const Segment = struct {
         const i = self.candidateIndex(start);
         const it = try self.iter();
         it.sink = &self.key_arena; // 收集型 API：key 直接重建进 arena
-        it.seek(@intCast(self.entries.items[i].offset));
+        try self.seekToEntry(it, i);
         // 只回看**上一行**的 key 判重：双缓冲就是为这个设计的。
         // 写成「记住上一次换 key 的那行」会把回看距离拉到任意远 → 缓冲被覆盖 → 误判重复、漏行。
         var prev_key: []const u8 = &.{};
@@ -1145,19 +1164,29 @@ pub const Segment = struct {
                 if (rec.flags == 0) try out.append(self.alloc, .{ .key = rec.key, .seq = rec.seq, .flags = rec.flags, .value = rec.value });
             }
         }
+        // 循环自然结束：必须区分「真的读完」与「解不出来就停了」——
+        // 后者会让调用方静默少几行数据（提前 `return` 的分支不查：那里根本没读完是正常的）。
+        if (it.corrupt) return error.SegmentCorrupt;
     }
 
     /// 流式游标：按 (key asc, seq desc) 逐条产出可见记录（不去重）。
     pub fn cursor(self: *Segment, start: []const u8, end: []const u8, snapshot: u64) !RefCursor {
         try self.ensureParsed();
         const view = try self.dataView();
-        var pos: usize = view.len;
+        var it = try codec.RecIter.init(self.alloc, view, INDEX_STRIDE, self.max_klen);
         if (self.entries.items.len > 0) {
-            pos = @intCast(self.entries.items[self.candidateIndex(start)].offset);
+            const ei = self.candidateIndex(start);
+            const off: u64 = self.entries.items[ei].offset;
+            if (off > view.len) {
+                it.deinit(self.alloc);
+                return error.SegmentCorrupt;
+            }
+            it.seek(@intCast(off));
+        } else {
+            it.seek(view.len);
         }
         // **游标自带一份迭代器**：多段归并时每个游标都要同时活着，不能共用段上的那份。
-        var it = try codec.RecIter.init(self.alloc, view, INDEX_STRIDE, self.max_klen);
-        it.seek(pos);
+        const pos = it.pos;
         // 空 start = 无下界：直接标记已越过，省掉每行一次无谓的 key 比较
         return .{ .seg = self, .pos = pos, .start = start, .end = end, .snapshot = snapshot, .passed_start = start.len == 0, .it = it };
     }
@@ -1174,7 +1203,7 @@ pub const Segment = struct {
         if (self.entries.items.len == 0) return;
         const i = self.candidateIndex(start);
         const it = try self.iter();
-        it.seek(@intCast(self.entries.items[i].offset));
+        try self.seekToEntry(it, i);
 
         while (it.next(self.alloc)) |rec| {
             switch (keyCmp(rec.key, end)) {
@@ -1190,6 +1219,8 @@ pub const Segment = struct {
                 .value = try self.alloc.dupe(u8, rec.value),
             });
         }
+        // 同上：损坏不能被当成「扫到了范围末尾」
+        if (it.corrupt) return error.SegmentCorrupt;
     }
 };
 

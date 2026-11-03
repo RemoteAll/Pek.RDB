@@ -452,6 +452,18 @@ pub const RecIter = struct {
     /// 设了就表示「重建出来的 key 要落成长期稳定切片」：不开双缓冲，直接向 arena 要内存。
     /// 给「先收集、后使用」的 API（`Table.scanRefs`）用，省掉一次额外 memcpy。
     sink: ?*KeyArena = null,
+    /// 上一次 `next` / `nextCmp` 是否因为**数据损坏或分配失败**才返回 `null`。
+    ///
+    /// **为什么必须有这个字段**：`next` 返回 `null` 本来有三种含义 ——
+    /// ① 正常读完；② `readRec` 解不出来（截断 / 扇区损坏）；③ `kbuf` 分配失败。
+    /// 调用方只看到一个 `null`，就必然把 ②③ 当成 ① ⇒ **静默少返回行**。
+    /// 这个坑已经咬过一次（归档自愈只挡「解出 0 条」，损坏在第 100 行时前 99 行照收），
+    /// 而在扫描/点查路径上更隐蔽：少几行数据没人会立刻发现。
+    ///
+    /// 修正方式刻意选了「不动签名」：`next` 仍是 `?RecView`（几十个调用点在热路径上），
+    /// 但调用方可以在**扫描结束后**用 `it.corrupt` 区分「读完」与「出错」。
+    /// `seek()` 会把它清零（一次新的扫描开始）。
+    corrupt: bool = false,
 
     /// `max_key` / `alloc` **已不再用于预分配**：缓冲改成惰性（内联优先，超长才堆分配）。
     /// 保留参数是为了不动几十个调用点；预分配换来的只是「超长 key 时少一次 realloc」，
@@ -471,6 +483,7 @@ pub const RecIter = struct {
     pub fn seek(self: *RecIter, pos: usize) void {
         self.pos = pos;
         self.blk_left = 0;
+        self.corrupt = false; // 新的一次扫描：上一次的损坏标记不能带到这次
     }
 
     /// 解下一条。**`key` 指向内部双缓冲（pfx>0 时），再下一次 `next()` 前有效。**
@@ -481,19 +494,31 @@ pub const RecIter = struct {
             self.pos += 1;
             self.blk_left = self.stride;
             // 块首记录存的是完整 key（pfx 不适用于它），顺带成为本块的前缀来源
-            const h0 = readRec(self.buf, self.pos, 0) orelse return null;
+            const h0 = readRec(self.buf, self.pos, 0) orelse {
+                self.corrupt = true; // 已经越过文件末尾了还在块头位置 ⇒ 块头后面没数据
+                return null;
+            };
             self.pos = h0.next;
             self.blk_left -= 1;
             self.base = h0.key;
             return h0;
         }
-        const h = readRec(self.buf, self.pos, self.pfx) orelse return null;
+        const h = readRec(self.buf, self.pos, self.pfx) orelse {
+            self.corrupt = true;
+            return null;
+        };
         self.pos = h.next;
         self.blk_left -= 1;
         if (self.pfx == 0) return h; // 零拷贝
-        if (self.pfx > self.base.len) return null; // 文件损坏
+        if (self.pfx > self.base.len) { // 文件损坏
+            self.corrupt = true;
+            return null;
+        }
         if (self.sink) |arena| {
-            const k = arena.alloc(alloc, h.klen) catch return null;
+            const k = arena.alloc(alloc, h.klen) catch {
+                self.corrupt = true; // 分配失败不能当成「读完了」
+                return null;
+            };
             @memcpy(k[0..self.pfx], self.base[0..self.pfx]);
             @memcpy(k[self.pfx..], h.key);
             return .{ .key = k, .value = h.value, .seq = h.seq, .flags = h.flags, .klen = h.klen, .next = h.next };
@@ -506,7 +531,10 @@ pub const RecIter = struct {
             return .{ .key = ib, .value = h.value, .seq = h.seq, .flags = h.flags, .klen = h.klen, .next = h.next };
         }
         const kb = &self.kbuf[self.cur];
-        kb.resize(alloc, h.klen) catch return null;
+        kb.resize(alloc, h.klen) catch {
+            self.corrupt = true; // 同上：OOM 不等于文件结束
+            return null;
+        };
         @memcpy(kb.items[0..self.pfx], self.base[0..self.pfx]);
         @memcpy(kb.items[self.pfx..], h.key);
         return .{ .key = kb.items, .value = h.value, .seq = h.seq, .flags = h.flags, .klen = h.klen, .next = h.next };
@@ -534,7 +562,10 @@ pub const RecIter = struct {
             self.pfx = self.buf[self.pos];
             self.pos += 1;
             self.blk_left = self.stride;
-            const h0 = readRec(self.buf, self.pos, 0) orelse return null;
+            const h0 = readRec(self.buf, self.pos, 0) orelse {
+                self.corrupt = true;
+                return null;
+            };
             self.pos = h0.next;
             self.blk_left -= 1;
             self.base = h0.key;
@@ -547,10 +578,16 @@ pub const RecIter = struct {
                 .next = h0.next,
             };
         }
-        const h = readRec(self.buf, self.pos, self.pfx) orelse return null;
+        const h = readRec(self.buf, self.pos, self.pfx) orelse {
+            self.corrupt = true;
+            return null;
+        };
         self.pos = h.next;
         self.blk_left -= 1;
-        if (self.pfx > self.base.len) return null; // 文件损坏（与 `next()` 同判据）
+        if (self.pfx > self.base.len) { // 文件损坏（与 `next()` 同判据）
+            self.corrupt = true;
+            return null;
+        }
         return .{
             .ord = cmpWithPrefix(self.base, self.pfx, h.key, target),
             .value = h.value,

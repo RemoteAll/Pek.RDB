@@ -107,6 +107,8 @@ fn indexCollect(
             if (owned.items.len >= m) return;
         }
     }
+    // 索引表损坏 ⇒ 候选集会静默变少（漏行）。`break` 是前缀越界（正常），不查。
+    if (it.corrupt) return error.SegmentCorrupt;
 }
 
 /// 维护索引项：`vals` 为行值，`skip_if_present` 用于「更新时新旧值相同就不动」。
@@ -250,6 +252,8 @@ fn selectByIndexOrder(
         try spans.append(alloc, .{ store.items.len, raw.len });
         try store.appendSlice(alloc, raw);
     }
+    // 索引表损坏 ⇒ 结果会静默少几行
+    if (it.corrupt) return error.SegmentCorrupt;
     // 切片在这之后才建：`store` 不再增长，指针稳定
     const rows = try alloc.alloc([]const u8, spans.items.len);
     defer alloc.free(rows);
@@ -617,6 +621,8 @@ fn joinLookup(
         for (rvals, row) |v, *dst| dst.* = try dupValue(a, v);
         try out.append(a, row);
     }
+    // JOIN 右表兜底全扫：段损坏会让连接静默少匹配
+    if (it.corrupt) return error.SegmentCorrupt;
 }
 
 fn dupValue(a: std.mem.Allocator, v: sql.Value) !sql.Value {
@@ -706,6 +712,8 @@ pub fn selectJoin(
             try pushJoined(a, &wide, row, sel, where_idx);
         }
     }
+    // 左表段损坏 ⇒ 宽行集会静默缺行
+    if (it.corrupt) return error.SegmentCorrupt;
 
     return try finishFromRows(left.table.io, &jschema, sel, alloc, wide.items);
 }
@@ -1225,6 +1233,7 @@ pub fn selectRowsHost(
             }
             try keep.append(alloc, rec.value);
         }
+        if (it.corrupt) return error.SegmentCorrupt;
         src = keep.items;
     } else {
         // 有 ORDER BY 时必须看完全部候选才能排序；无 LIMIT 时必须返回全部。
@@ -1246,6 +1255,7 @@ pub fn selectRowsHost(
                 try s.decodeRowInto(scratch, rec.value);
                 if (evalWhere(scratch[widx], w.op, w.value)) try keep.append(alloc, rec.value);
             }
+            if (it.corrupt) return error.SegmentCorrupt;
             src = keep.items;
         } else {
             // 无 WHERE：cap 接近实际行数，预分配能避免重分配；
@@ -2117,6 +2127,9 @@ pub fn forEachRow(
         }
         emitted += 1;
     }
+    // 流式回调路径：损坏必须报错。`emitted >= lim` 的 break 是提前终止（正常），但
+    // 损坏与「凑够了」在同一处退出时仍应报错 —— 宁可让调用方看到错误也不给他半份数据。
+    if (it.corrupt) return error.SegmentCorrupt;
     return emitted;
 }
 

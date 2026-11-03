@@ -1436,6 +1436,8 @@ pub const Table = struct {
                 n += 1;
                 total += rec.key.len + rec.value.len;
             }
+            // 损坏不能被当成「扫到了末尾」（否则下面会按偏小的 n 分配 → 静默少行）
+            if (it.corrupt) return error.SegmentCorrupt;
         }
 
         const buf = try self.alloc.alloc(u8, total);
@@ -1467,12 +1469,14 @@ pub const Table = struct {
                 records[i] = .{ .key = k, .seq = r.seq, .flags = r.flags, .value = v };
                 i += 1;
             }
+            if (it.corrupt) return error.SegmentCorrupt;
         }
         // 变少了也算违约：否则返回的 records 会是 n 条、后半段是未初始化内存。
         if (i != n) return error.ConcurrentModification;
         std.debug.assert(off == total);
         return .{ .alloc = self.alloc, .buf = buf, .records = records };
     }
+
     /// 通用 refs 扫描：memtable + 所有段的 k 路归并（值零拷贝借用；调用期间不得写）。
     ///
     /// **key 有效期**：指向本表内部的 `key_slab`，在下一次 `scanRefs` 之前都可用（value 不受影响）。
@@ -1482,6 +1486,7 @@ pub const Table = struct {
         try it.initStable(self, start, end, &self.key_arena);
         defer it.deinit();
         while (it.next()) |rec| try out.append(self.alloc, rec);
+        if (it.corrupt) return error.SegmentCorrupt;
     }
 
     /// 只收集 **value 切片**（不收集 key / seq / flags）。
@@ -1497,6 +1502,7 @@ pub const Table = struct {
         try it.init(self, start, end);
         defer it.deinit();
         while (it.next()) |rec| try out.append(self.alloc, rec.value);
+        if (it.corrupt) return error.SegmentCorrupt;
     }
 
     /// 全量合并：把全部段重写成一个新段。
@@ -1554,6 +1560,8 @@ pub const Table = struct {
                 try w.push(rec.key, rec.seq, rec.flags, rec.value);
                 rows += 1;
             }
+            // 源段有损坏就绝不能再把结果写进归档（那会把“少了几行”固化成“永久少几行”）
+            if (it.corrupt) return error.SegmentCorrupt;
         }
         // 必须在 finishBytes() **之前**取：它会接管/释放 Writer 的缓冲
         const data_bytes: u64 = @intCast(w.buf_base + w.buf.items.len);
@@ -1723,6 +1731,8 @@ pub const Table = struct {
                 try w.push(rec.key, rec.seq, rec.flags, rec.value);
                 rows += 1;
             }
+            // 同 `compact()`：源段损坏时宁可本轮回退，也不要写出残缺段
+            if (it.corrupt) return error.SegmentCorrupt;
         }
         const data_bytes: u64 = @intCast(w.buf_base + w.buf.items.len);
         const fin = try w.finishBytes();
@@ -1877,6 +1887,22 @@ pub const MergeIter = struct {
     last_buf: []u8 = &.{},
     last_key: []const u8 = &.{},
     have_last: bool = false,
+    /// 任一游标读到**损坏数据**（`codec.RecIter.corrupt`）⇒ 本次归并结果不完整。
+    /// `next()` 返回 null 后由调用方检查并报 `error.SegmentCorrupt` ——
+    /// 把「解不出来」当「读完了」会让扫描静默少返回行。
+    corrupt: bool = false,
+
+    /// 归并结束后汇总：任一游标出过错就置 `corrupt`（只读一次字段，不在热循环里）。
+    fn collectCorrupt(self: *MergeIter) void {
+        for (self.cursors.items) |*c| {
+            switch (c.*) {
+                .mem => {}, // memtable 在内存里，不存在「解不出来」
+                .seg => |*s| {
+                    if (s.it.corrupt) self.corrupt = true;
+                },
+            }
+        }
+    }
 
     /// 记下本行 key。传进来的 key 可能指向游标双缓冲（会被覆写），所以必须拷贝。
     inline fn setLast(self: *MergeIter, key: []const u8) void {
@@ -2034,7 +2060,10 @@ pub const MergeIter = struct {
     /// 走与单游标完全相同的逻辑（无比较、无堆维护）。
     fn nextConcat(self: *MergeIter) ?segmod.Segment.RefRecord {
         while (true) {
-            if (self.concat_i >= self.cursors.items.len) return null;
+            if (self.concat_i >= self.cursors.items.len) {
+                self.collectCorrupt();
+                return null;
+            }
             while (self.cursors.items[self.concat_i].next()) |rec| {
                 if (self.have_last and std.mem.eql(u8, rec.key, self.last_key)) continue;
                 self.setLast(rec.key);
@@ -2078,11 +2107,15 @@ pub const MergeIter = struct {
                 self.table.scan_rows_read += 1;
                 if (rec.flags == 0) return rec;
             }
+            self.collectCorrupt();
             return null;
         }
         if (self.concat) return self.nextConcat();
         while (true) {
-            if (self.heap_len == 0) return null;
+            if (self.heap_len == 0) {
+                self.collectCorrupt();
+                return null;
+            }
             const bi = self.heap[0];
             const rec = self.cur[bi].?;
 
@@ -3029,6 +3062,74 @@ test "自动 compaction: 段数达到阈值后自动合并，数据一致" {
         try std.testing.expectEqualStrings("v4", (try t2.get("k4", &out)).?);
         try std.testing.expect((try t2.get("k2", &out)) == null);
     }
+}
+
+test "段中间损坏：扫描/点查/合并都必须报 SegmentCorrupt，不许当「读完了」静默少返回行" {
+    // 这一类问题的根子：`codec.RecIter.next` 返回 null 有「读完 / 损坏 / OOM」三种含义，
+    // 调用方只看到 null 就会把损坏当成读完 ⇒ 少几十行数据且一声不响。
+    // 这条用例同时钉住四条路径：全表扫描、refs/values 收集、点查、合并。
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-corrupt-middle";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    const data_path = tmp ++ "/seg/000001.data";
+    // 两段：每段 300 行（stride=64 ⇒ 每段 5 个块），这样 `compact()` 才有东西可合。
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        defer t.deinit();
+        var i: i64 = 0;
+        while (i < 600) : (i += 1) {
+            var kb: [8]u8 = undefined;
+            codec.encodeI64Key(&kb, i);
+            try t.put(&kb, "0123456789abcdef");
+            if (i == 299) try t.flush();
+        }
+        try t.flush();
+        try std.testing.expectEqual(@as(usize, 2), t.segs.items.len);
+    }
+    // 只截断**第一段**到 3/4：前三块完整、第四块中途断掉（起点合法，不会走「seek 到文件外」那条）
+    {
+        const orig = try readAllBytes(dir, io, data_path, alloc);
+        defer alloc.free(orig);
+        try dir.deleteFile(io, data_path);
+        const f = try dir.createFile(io, data_path, .{ .truncate = true });
+        try f.writePositionalAll(io, orig[0 .. orig.len * 3 / 4], 0);
+        f.close(io);
+    }
+
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+
+    var hi: [16]u8 = @splat(0xFF);
+    // ① 全表扫描（以前会返回一个「少了几十行」的结果集）
+    try std.testing.expectError(error.SegmentCorrupt, t.scanRange(&[_]u8{}, &hi));
+    // ② 两种收集型扫描
+    {
+        var out: std.ArrayList(segmod.Segment.RefRecord) = .empty;
+        defer out.deinit(alloc);
+        try std.testing.expectError(error.SegmentCorrupt, t.scanRefs(&[_]u8{}, &hi, &out));
+    }
+    {
+        var out: std.ArrayList([]const u8) = .empty;
+        defer out.deinit(alloc);
+        try std.testing.expectError(error.SegmentCorrupt, t.scanValues(&[_]u8{}, &hi, &out));
+    }
+    // ③ 点查落在损坏段的中后部（key 220 还在完好区，必须用 280 —— 否则它真的是能查到）
+    {
+        var ob: std.ArrayList(u8) = .empty;
+        defer ob.deinit(alloc);
+        var kb: [8]u8 = undefined;
+        codec.encodeI64Key(&kb, 280);
+        try std.testing.expectError(error.SegmentCorrupt, t.get(&kb, &ob));
+    }
+    // ④ 合并：源段损坏时绝不许产出「残缺段」（那会把「少几行」固化成「永久少几行」）
+    try std.testing.expectError(error.SegmentCorrupt, t.compact());
 }
 
 test "auto_compact_burst：一次写（一次 flush 末尾）最多连做 burst 轮合并，单次停顿不被放大" {

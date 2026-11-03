@@ -199,6 +199,8 @@ pub fn fillIndexTimedChunks(
             chunks += 1;
         }
     }
+    // 基础表段损坏 ⇒ 索引会静默缺项（建出一个「少键」的索引，比报错危险得多）
+    if (cur.corrupt) return error.SegmentCorrupt;
     ph.scan_ns = (monoNs(io) - t_scan) -| emit_ns;
 
     // 2~3) 最后一块：排序 + 写成段
