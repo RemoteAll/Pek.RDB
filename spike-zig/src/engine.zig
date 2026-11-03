@@ -387,8 +387,11 @@ pub const Engine = struct {
             const path = try alloc.print("{s}/{s}", .{ root, name });
             defer alloc.free(path);
             var sch = try catalog.loadSchema(io, dir, path, alloc);
-            errdefer sch.deinit(alloc);
+            var sch_owned = true;
+            errdefer if (sch_owned) sch.deinit(alloc);
             var tbl = try tablemod.Table.open(io, dir, path, alloc, opts.table);
+            var tbl_owned = true;
+            errdefer if (tbl_owned) tbl.deinit();
 
             var idx_tables = std.StringHashMap(tablemod.Table).init(alloc);
             errdefer {
@@ -397,16 +400,21 @@ pub const Engine = struct {
                 idx_tables.deinit();
             }
             for (sch.indexes) |ix| {
-                const itbl = try openOrBuildIndex(io, dir, alloc, opts, path, &sch, &tbl, ix);
+                var itbl = try openOrBuildIndex(io, dir, alloc, opts, path, &sch, &tbl, ix);
+                var itbl_owned = true;
+                errdefer if (itbl_owned) itbl.deinit();
                 const ikey = try alloc.dupe(u8, ix.name);
                 errdefer alloc.free(ikey);
                 try idx_tables.put(ikey, itbl);
+                itbl_owned = false; // 已进 map
             }
 
             // 分两步：写在内层会让 put 失败时丢掉刚 dupe 的 name
             const key = try alloc.dupe(u8, name);
             errdefer alloc.free(key);
             try tables.put(key, .{ .schema = sch, .table = tbl, .idx_tables = idx_tables });
+            sch_owned = false;
+            tbl_owned = false;
         }
 
         return .{
@@ -469,22 +477,33 @@ pub const Engine = struct {
             };
         }
         var sch = try schema_mod.Schema.init(self.alloc, def.name, cols);
-        errdefer sch.deinit(self.alloc);
+        var sch_owned = true;
+        errdefer if (sch_owned) sch.deinit(self.alloc);
 
         const path = try self.alloc.print("{s}/{s}", .{ self.root, def.name });
         defer self.alloc.free(path);
         try self.dir.createDirPath(self.io, path);
         try catalog.saveSchema(self.io, self.dir, path, &sch, self.alloc);
 
-        const tbl = try tablemod.Table.open(self.io, self.dir, path, self.alloc, self.opts.table);
+        var tbl = try tablemod.Table.open(self.io, self.dir, path, self.alloc, self.opts.table);
+        // **打开了就要负责关**：`Table` 持有 mmap/文件句柄/路径切片，下面任何一次分配失败
+        // 都必须把它退回去（否则 base_path/wal_path/index_path 三块 + 句柄全漏）。
+        var tbl_owned = true;
+        errdefer if (tbl_owned) tbl.deinit();
+
         // 分两步：写在内层会让 put 失败时丢掉刚 dupe 的 name
         const key = try self.alloc.dupe(u8, def.name);
-        errdefer self.alloc.free(key);
+        var key_owned = true;
+        errdefer if (key_owned) self.alloc.free(key);
         try self.tables.put(key, .{
             .schema = sch,
             .table = tbl,
             .idx_tables = std.StringHashMap(tablemod.Table).init(self.alloc),
         });
+        // 所有权已交给 map：**从这里开始谁都不许再释放**，否则 deinit 时会二次释放
+        key_owned = false;
+        sch_owned = false;
+        tbl_owned = false;
         try self.saveCatalog();
         return true;
     }
@@ -568,11 +587,15 @@ pub const Engine = struct {
             &e.table,
             .{ .name = def.name, .column_idx = ci },
         );
-        errdefer itbl.deinit();
+        var itbl_owned = true;
+        errdefer if (itbl_owned) itbl.deinit();
 
         const name_copy = try self.alloc.dupe(u8, def.name);
-        errdefer self.alloc.free(name_copy);
+        var key_owned = true;
+        errdefer if (key_owned) self.alloc.free(name_copy);
         try e.idx_tables.put(name_copy, itbl);
+        itbl_owned = false; // 已进 map，再释放就是二次释放
+        key_owned = false; // key 也已交给 map
 
         _ = try e.schema.addIndex(self.alloc, def.name, ci);
         try catalog.saveSchema(self.io, self.dir, path, &e.schema, self.alloc);
@@ -2048,3 +2071,75 @@ test "索引回填分块：强制多块（每块 7 行）后必须合并成单�
     }
     try std.testing.expectEqual(want.items.len, n);
 }
+
+// ===========================================================================
+// **机械守卫：任意一次分配失败，都不许泄漏、也不许重复释放**
+//
+// 为什么单独立这一块：这类缺陷本项目已经栽过三次 —— §五十（`Writer` 失败路径泄漏）、
+// §一百零八（`proj` 双重释放）、§一百零九（「主键未命中」泄漏 `indices`）。
+// 共同点是「只在某一条退出路径上错」，正常路径全绿，**靠人读 diff 一次只能摸到一处**
+// （仓库里 53 个分配点、173 个顶层函数，逐轮抽查必然漏）。
+//
+// `checkAllAllocationFailures` 会让每个分配点**轮流**变成失败，把这类问题变成
+// 「跑测试就报」：以后谁在失败路径上漏了 `errdefer` / 重复 `free`，这里立刻红。
+//
+// 覆盖原则：**每条装配路径各取一个代表**（点查命中 / 未命中 / 索引 / 范围索引 /
+// JOIN 直写 / JOIN 排序 / GROUP BY / 流式），因为「谁负责释放」每条路都不一样。
+// ===========================================================================
+
+fn oomProbeFn(inject: std.mem.Allocator, root: []const u8, setup: []const []const u8, queries: []const []const u8) anyerror!void {
+    // **只用稳定分配器建库**：`std.Io.Threaded` 会开线程并在其他线程上分配，
+    // 拿注入式（单线程、计数确定）分配器包住它会让 `checkAllAllocationFailures`
+    // 报 `NondeterministicMemoryUsage` —— 那是测试装置的噪声，不是被测代码的缺陷。
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    var eng = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    defer eng.deinit();
+    // `run` 只接受**单条**语句（多余 token 会报 UnexpectedToken），所以初始化逐条跑
+    for (setup) |st| try run(&eng, alloc, st);
+
+    // 注入点就在「查询装配」这一次分配上 —— 重复释放/泄漏全出在这里的装配路径
+    for (queries) |q| {
+        var p = try sql.parse(alloc, q);
+        defer p.deinit();
+        var res = try eng.executeWithParams(p.stmt, null, inject);
+        switch (res) {
+            .rows => |*r| r.deinit(),
+            else => {},
+        }
+    }
+}
+
+const oom_setup = [_][]const u8{
+    "CREATE TABLE a (id INTEGER PRIMARY KEY, g INTEGER NOT NULL, s TEXT NOT NULL)",
+    "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER NOT NULL, n TEXT NOT NULL)",
+    "INSERT INTO a (id, g, s) VALUES (1,10,'x'), (2,10,'y'), (3,20,'z'), (4,99,'w')",
+    "INSERT INTO b (id, k, n) VALUES (10,10,'ten'), (11,10,'ten'), (12,20,'twenty')",
+    "CREATE INDEX idx_a_g ON a (g)",
+};
+
+const oom_queries = [_][]const u8{
+    "SELECT id, s FROM a WHERE id = 2", // 主键点查命中
+    "SELECT id, s FROM a WHERE id = 999", // 主键点查**未命中**（§一百零九 的泄漏点）
+    "SELECT id FROM a WHERE g = 10", // 二级索引等值
+    "SELECT id FROM a WHERE g >= 10 LIMIT 100", // 范围索引（本引擎 WHERE 只支持单个比较）
+    "SELECT * FROM a", // 全表 + 恒等投影
+    "SELECT COUNT(*) FROM a", // 聚合
+    "SELECT g, COUNT(*) FROM a GROUP BY g", // GROUP BY
+    "SELECT a.id, b.n FROM a JOIN b ON a.g = b.k", // JOIN 直写（无 ORDER BY）
+    "SELECT a.id, b.n FROM a JOIN b ON a.g = b.k ORDER BY a.id, b.id", // JOIN 拷贝（有 ORDER BY）
+    "SELECT a.id, b.n FROM a LEFT JOIN b ON a.g = b.k LIMIT 2 OFFSET 1", // LEFT + 提前终止
+    "SELECT id FROM a ORDER BY id DESC LIMIT 3", // 反向 top-K
+};
+
+test "任意分配失败：查询装配全路径不泄漏、不重复释放" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, oomProbeFn, .{ "test-oom-query", &oom_setup, &oom_queries });
+}
+
+

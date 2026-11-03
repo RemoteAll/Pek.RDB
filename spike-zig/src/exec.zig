@@ -88,7 +88,9 @@ fn indexCollect(
     const row_vals = try alloc.alloc(sql.Value, s.columns.len);
     defer alloc.free(row_vals);
     var vbuf: std.ArrayList(u8) = .empty;
-    defer vbuf.deinit(alloc);
+    // `t.get` 内部用**表自己的**分配器填充 `out`，释放必须用同一个：
+    // 两个分配器一攻一放是堆破坏的经典来源（生产里两者是同一个对象，所以不暴露）。
+    defer vbuf.deinit(t.alloc);
 
     // 游标可复用：JOIN 对右表的**每一行**都要扫一次索引前缀（1 万行 = 1 万次），
     // 而 `init` 每次都重建段的 `dataView`（open + mmap）与 `RecIter`（2 次分配）——
@@ -176,7 +178,7 @@ fn indexCollectRange(
     const row_vals = try alloc.alloc(sql.Value, s.columns.len);
     defer alloc.free(row_vals);
     var vbuf: std.ArrayList(u8) = .empty;
-    defer vbuf.deinit(alloc);
+    defer vbuf.deinit(t.alloc); // `t.get` 用自己的分配器填充 ⇒ 同源释放
 
     var it = tablemod.MergeIter{};
     try it.init(itbl, start, end);
@@ -282,7 +284,7 @@ fn selectByIndexOrder(
     var spans: std.ArrayList([2]usize) = .empty; // {off, len}
     defer spans.deinit(alloc);
     var vbuf: std.ArrayList(u8) = .empty;
-    defer vbuf.deinit(alloc);
+    defer vbuf.deinit(t.alloc); // `t.get` 用它自己的分配器填充 ⇒ 同源释放
 
     // ------------------------------------------------------------------
     // WHERE：谓词在扫描循环里判（不匹配的行**不占** limit 名额）。
@@ -1245,12 +1247,20 @@ fn finishFromRowsCopy(
             else => {},
         };
     }
-    const buf = try alloc.alloc(u8, total);
-    errdefer alloc.free(buf);
-    const flat = try alloc.alloc(sql.Value, rows.len * ncols);
-    errdefer alloc.free(flat);
-    const hdrs = try alloc.alloc([]sql.Value, rows.len);
-    errdefer alloc.free(hdrs);
+    // **三块缓冲直接挂在 `m` 上**，只留一个 `defer m.deinit()`：
+    // 旧写法是「三个 errdefer + 最后 `defer m.deinit()`」，一旦 `assembleMaterialized`
+    // 返回错误，`m.deinit` 和三个 errdefer 会**各释放一遍** ⇒ double free。
+    // `free` 对空切片是安全空操作（`Allocator.free` 第一句就 `if (bytes.len == 0) return`），
+    // 所以中途失败时 `m.deinit` 只会释放已经分配出来的那几块。
+    var m = Materialized{ .alloc = alloc };
+    defer m.deinit();
+    m.buf = try alloc.alloc(u8, total);
+    m.flat = try alloc.alloc(sql.Value, rows.len * ncols);
+    m.hdrs = try alloc.alloc([]sql.Value, rows.len);
+    m.ncols = ncols;
+    const buf = m.buf;
+    const flat = m.flat;
+    const hdrs = m.hdrs;
 
     var off: usize = 0;
     for (rows, 0..) |src, i| {
@@ -1258,8 +1268,6 @@ fn finishFromRowsCopy(
         for (src, 0..) |v, c| dst[c] = copyValue(buf, &off, v);
         hdrs[i] = dst;
     }
-    var m = Materialized{ .alloc = alloc, .flat = flat, .hdrs = hdrs, .buf = buf, .ncols = ncols };
-    defer m.deinit();
     if (timing_enabled) {
         const t1 = stamp(io);
         timing.decode += t1 - t0;
@@ -1432,7 +1440,14 @@ fn buildProjection(alloc: std.mem.Allocator, s: *const schema_mod.Schema, items:
             .aggregate => return error.UnsupportedStatement,
         }
     }
-    return .{ .indices = try indices.toOwnedSlice(alloc), .columns = try columns.toOwnedSlice(alloc) };
+    // **不能写成 `return .{ .indices = try ..., .columns = try ... }`**：
+    // 前一个 `toOwnedSlice` 成功、后一个失败时，前者的缓冲已经脱离 `indices`
+    // （`toOwnedSlice` 会把列表清空），errdefer 里 `deinit` 变空操作 ⇒ 泄漏。
+    // 2026-11-03 由 `checkAllAllocationFailures` 当场抓出（16 字节 = 2 个 usize）。
+    const idx_slice = try indices.toOwnedSlice(alloc);
+    errdefer alloc.free(idx_slice);
+    const col_slice = try columns.toOwnedSlice(alloc);
+    return .{ .indices = idx_slice, .columns = col_slice };
 }
 
 /// PK 等值查询走点查（不扫全表）。
@@ -1450,7 +1465,7 @@ fn selectByPk(t: *tablemod.Table, s: *const schema_mod.Schema, sel: sql.Select, 
     defer pg.deinit();
 
     var vbuf: std.ArrayList(u8) = .empty;
-    defer vbuf.deinit(alloc);
+    defer vbuf.deinit(t.alloc); // `t.get` 用自己的分配器填充 ⇒ 同源释放
 
     const raw = (try t.get(key, &vbuf)) orelse {
         const empty = try alloc.alloc([]sql.Value, 0);
@@ -1701,7 +1716,7 @@ pub fn selectRowsHost(
     var keep: std.ArrayList([]const u8) = .empty;
     defer keep.deinit(alloc);
     var all_vals: std.ArrayList([]const u8) = .empty;
-    defer all_vals.deinit(alloc);
+    defer all_vals.deinit(t.alloc); // `scanValues` 用 `t.alloc` 填 ⇒ 同源释放
     // 容量上界：各段行数 + memtable 行数（段合并过时偏大，但不会重分配）。
     var cap: usize = t.mem.len();
     for (t.segs.items) |sg| cap +|= sg.rows;
@@ -1737,7 +1752,10 @@ pub fn selectRowsHost(
     if (pk_order == true and sel.where == null and sel.limit != null) {
         const k = @as(usize, sel.offset orelse 0) + @as(usize, sel.limit.?);
         var top: std.ArrayList([]const u8) = .empty;
-        defer top.deinit(alloc);
+        // 「表方法用**自己的**分配器填调用方容器」是本仓的约定（`topKDesc` / `scanValues` /
+        // `scanRefs` / `get` 都是），所以释放必须用 `t.alloc`：两个分配器一攻一放属于堆破坏，
+        // 生产里两者恰好是同一个对象所以不暴露，但一旦变成「查询用另一个分配器」就会炸。
+        defer top.deinit(t.alloc);
         if (k > 0) {
             const t_k = stamp(t.io);
             const hit = try t.topKDesc(k, &top);
@@ -1804,7 +1822,7 @@ pub fn selectRowsHost(
             // （25 段 100 万行 ≈ 25ms）→ `sql_full` 18.63M → 12.86M（-31%）。
             // 对比 `Table.scanRange` 那个同款改法却是正收益：那里省的是 48B/条（RefRecord）
             // 且只有 20 万行，多一遍归并只 3.6ms。**同一种改法在不同规模下结论相反。**
-            try all_vals.ensureTotalCapacity(alloc, @min(cap, 1 << 20));
+            try all_vals.ensureTotalCapacity(t.alloc, @min(cap, 1 << 20));
             try t.scanValues(&[_]u8{}, &hi, &all_vals);
             src = all_vals.items;
         }

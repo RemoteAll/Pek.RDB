@@ -53,9 +53,15 @@ pub const Schema = struct {
         errdefer alloc.free(name_copy);
         const cols = try alloc.alloc(Column, columns.len);
         errdefer alloc.free(cols);
+        // **已经 dupe 出来的列名也要在失败时释放**：`alloc.dupe` 在循环中途失败时，
+        // 前面几列的名字已经分配了，只 free `cols` 数组会漏掉它们。
+        // （2026-11-03 由 `checkAllAllocationFailures` 当场抓出：2 字节的列名 "id" 泄漏。）
+        var duped: usize = 0;
+        errdefer for (cols[0..duped]) |c| alloc.free(c.name);
         for (columns, 0..) |c, i| {
             cols[i] = c;
             cols[i].name = try alloc.dupe(u8, c.name);
+            duped += 1;
         }
         return .{
             .name = name_copy,
