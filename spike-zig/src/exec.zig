@@ -505,6 +505,12 @@ fn buildOutput(
     end: usize,
 ) !Rows {
     defer alloc.free(proj.indices);
+    // 失败时 `proj.columns` 由本函数释放：调用方用 `ProjGuard.release()` 把所有权
+    // 完整交过来，不要再自己释放（否则就是重复释放）。
+    errdefer {
+        for (proj.columns) |c| alloc.free(c);
+        alloc.free(proj.columns);
+    }
     const ncols = s.columns.len;
     const n = end - start;
 
@@ -897,6 +903,12 @@ fn appendDupRow(
     try out.append(a, row);
 }
 
+/// `JoinSink` 预留容量的硬上限（`Value` 个数，16 B/个 ⇒ 65,536 个 ≈ 1 MB）。
+///
+/// 上限存在的理由见 `JoinSink.init`：按「左表行数 × 投影列数」预留，在
+/// 「大左表 + 宽投影 + 低命中率」下会是 GB 级请求 —— **预分配失败会让本来能跑完的查询报 OOM**。
+const join_sink_prealloc_cap: usize = 65_536;
+
 /// JOIN 产出装配器：**直接写最终布局**（投影后的 `flat` + `hdrs`）。
 ///
 /// 这一步是照 SQLite 的执行模型改的：`sqlite3_step` 把一行写进 prepare 时就分配好的
@@ -918,8 +930,11 @@ const JoinSink = struct {
 
     fn init(alloc: std.mem.Allocator, ncols: usize, expect_rows: usize) !JoinSink {
         var s = JoinSink{ .alloc = alloc, .ncols = ncols };
-        // 预留到估算行数：不预留就要经历 8→16→… 十几次扩容（每次 realloc + 拷贝）
-        const cap = @max(@as(usize, 8), expect_rows *| ncols);
+        // 预留到估算行数，但**必须有上限**：`expect_rows × ncols` 在「大左表 + 宽投影」下
+        // 是 GB 级（1000 万行 × 20 列 = 3.2 GB），而连接命中数本来就可能远小于左表行数
+        // （INNER JOIN 甚至可能为 0）。超出的部分交给 ArrayList 的倍增扩容。
+        const want = expect_rows *| ncols;
+        const cap = @max(@as(usize, 8), @min(want, join_sink_prealloc_cap));
         try s.flat.ensureTotalCapacity(alloc, cap);
         return s;
     }
@@ -1016,21 +1031,21 @@ pub fn selectJoin(
     // **无 `ORDER BY` 时直写最终布局**（`narrow`）：排序要按未投影的列比较，所以只有这一档能提前投影。
     // 直写路径下 `flat` 的宽度就是投影列数，`buildOutput` 会走「所有权转移」分支 ⇒ 全链只搬一次。
     const narrow = sel.order_by.len == 0;
-    // 排序前列校验（直写路径不做排序，但这里统一先校验，避免两条路行为不一致）
-    try validateOrderBy(&jschema, sel.order_by);
-    const proj = try buildProjection(alloc, &jschema, sel.items);
-    var proj_owned = true; // 出错时由 errdefer 释放；成功交给 buildOutput
-    errdefer if (proj_owned) {
-        for (proj.columns) |c| alloc.free(c);
-        alloc.free(proj.columns);
-        alloc.free(proj.indices);
-    };
+    // 直写路径要在循环**之前**知道投影列下标，所以只有它提前建投影；
+    // 排序路径交给 `finishFromRows`（它自己建，顺带做 ORDER BY 列校验）。
+    var pg: ProjGuard = .{ .alloc = alloc };
+    if (narrow) {
+        try validateOrderBy(&jschema, sel.order_by);
+        pg = ProjGuard.take(alloc, try buildProjection(alloc, &jschema, sel.items));
+    }
+    defer pg.deinit();
 
     var wide: std.ArrayList([]sql.Value) = .empty;
     var matches: std.ArrayList([]sql.Value) = .empty;
     const lvals = try alloc.alloc(sql.Value, na);
     defer alloc.free(lvals);
-    // 直写路径的「宽行」暂存（`na + nb` 个值），只用于 WHERE 判定与挑投影列
+    // 直写路径的「宽行」暂存（`na + nb` 个值），**只用于 WHERE 判定与挑投影列**；
+    // 一条查询只分配一次（不是每行），排序路径用不到也不算浪费。
     const wrow = try alloc.alloc(sql.Value, na + nb);
     defer alloc.free(wrow);
     var sink: JoinSink = .{ .alloc = alloc };
@@ -1052,8 +1067,10 @@ pub fn selectJoin(
     const use_hash = jr <= join_hash_max_rows and rowEstimate(left.table) * join_hash_min_left_ratio >= jr;
     if (use_hash) try jh.build(right, rcol, alloc, a);
     if (narrow) {
-        // 估算输出行数用于预留：左表行数 × 1（等值连接平均命中数），够用即可
-        sink = try JoinSink.init(alloc, proj.indices.len, rowEstimate(left.table));
+        // 预留容量：按「左表行数 × 投影列数」估，但**必须设上限** ——
+        // 左表 1000 万行、投影 20 列就是 3.2 GB，预分配会直接 OOM；
+        // 连接命中数本来就可能远小于左表行数（INNER 甚至可能为 0）。
+        sink = try JoinSink.init(alloc, pg.proj.indices.len, rowEstimate(left.table));
         sink_ready = true;
     }
     // `LIMIT` 且无 `ORDER BY` ⇒ 凑够 `offset + limit` 就停（顺序是确定的，提前停不改变结果）
@@ -1095,7 +1112,7 @@ pub fn selectJoin(
             if (jc.kind == .left) {
                 @memcpy(wrow[0..na], lvals);
                 for (wrow[na..]) |*dst| dst.* = .null;
-                try sinkJoined(&sink, wrow, proj.indices, sel, where_idx);
+                try sinkJoined(&sink, wrow, pg.proj.indices, sel, where_idx);
             }
             if (stop_at) |lim| if (sink.rows() >= lim) break :outer;
             continue;
@@ -1103,7 +1120,7 @@ pub fn selectJoin(
         for (matches.items) |rv| {
             @memcpy(wrow[0..na], lvals);
             @memcpy(wrow[na..], rv);
-            try sinkJoined(&sink, wrow, proj.indices, sel, where_idx);
+            try sinkJoined(&sink, wrow, pg.proj.indices, sel, where_idx);
             if (stop_at) |lim| if (sink.rows() >= lim) break :outer;
         }
     }
@@ -1115,12 +1132,11 @@ pub fn selectJoin(
         sink_ready = false; // 所有权已转给 m
         sink.deinit();
         defer m.deinit();
-        proj_owned = false;
-        return assembleMaterialized(left.table.io, &jschema, sel, alloc, proj, &m, 0);
+        return assembleMaterialized(left.table.io, &jschema, sel, alloc, pg.release(), &m, stamp(left.table.io));
     }
 
-    proj_owned = false;
-    return finishFromRowsCopy(left.table.io, &jschema, sel, alloc, proj, wide.items, 0);
+    // 排序路径：交给 `finishFromRows`（它自建投影 + 校验 ORDER BY，再深拷装配）
+    return finishFromRows(left.table.io, &jschema, sel, alloc, wide.items);
 }
 
 /// 直写路径的「入结果集」：`WHERE` 先判（在宽行上），命中就按投影列写进 sink。
@@ -1193,37 +1209,29 @@ fn finishFromRows(
     var t0 = stamp(io);
     // 排序前列校验：比较器不能返回错误，解析失败会静默变成「不排序」
     try validateOrderBy(s, sel.order_by);
-    const proj = try buildProjection(alloc, s, sel.items);
+    var pg = ProjGuard.take(alloc, try buildProjection(alloc, s, sel.items));
+    defer pg.deinit();
     if (timing_enabled) {
         const t1 = stamp(io);
         timing.projection += t1 - t0;
         t0 = t1;
     }
-    errdefer {
-        for (proj.columns) |c| alloc.free(c);
-        alloc.free(proj.columns);
-        alloc.free(proj.indices);
-    }
-    return finishFromRowsCopy(io, s, sel, alloc, proj, rows, t0);
+    return finishFromRowsCopy(io, s, sel, alloc, &pg, rows, t0);
 }
 
 /// 主体：把 `rows` 深拷成 `Materialized` 后交给 `assembleMaterialized`。
-/// `proj` 由调用方建好并交出所有权；`ORDER BY` 列校验由调用方先做。
+/// `pg` 的释放由调用方的 `defer` 负责；本函数只在交给 `buildOutput` 时 `release()`。
 fn finishFromRowsCopy(
     io: std.Io,
     s: *const schema_mod.Schema,
     sel: sql.Select,
     alloc: std.mem.Allocator,
-    proj: Projection,
+    pg: *ProjGuard,
     rows: []const []sql.Value,
     t0_in: u64,
 ) !Rows {
     var t0 = t0_in;
-    errdefer {
-        for (proj.columns) |c| alloc.free(c);
-        alloc.free(proj.columns);
-        alloc.free(proj.indices);
-    }
+    const proj = pg.proj;
 
     // 深拷贝 text/blob：它们指向 JOIN 的 arena，出函数就失效。
     //
@@ -1273,7 +1281,7 @@ fn finishFromRowsCopy(
         timing.decode += t1 - t0;
         t0 = t1;
     }
-    return assembleMaterialized(io, s, sel, alloc, proj, &m, t0);
+    return assembleMaterialized(io, s, sel, alloc, pg.release(), &m, t0);
 }
 
 /// 装配尾部：排序 → OFFSET/LIMIT 切片 → 按投影产出 `Rows`。
@@ -1362,6 +1370,36 @@ const Projection = struct {
     columns: [][]const u8,
 };
 
+/// `Projection` 的所有权守卫。
+///
+/// **为什么必须有一个显式守卫**：`buildOutput` 会**接手** `proj` —— 成功时把 `columns` 交给
+/// `Rows`，失败时自己释放（`indices` 一直由它的 `defer` 释放）。而调用方在调用它**之前**
+/// 也可能出错，那些路径又得自己释放。两边都「顺手 free 一下」就变成**重复释放**
+/// （检查历史：`finishFromValues` / `finishFromRowsCopy` / `selectJoin` 都在 errdefer 里
+/// 连 `indices` 一起释放，而 `buildOutput` 内部的 `defer` 已经释放过了 ⇒ OOM 路径 double free），
+/// 都不释放则是泄漏。用 `release()` 把所有权交出去，这一层就不再有人猜。
+const ProjGuard = struct {
+    alloc: std.mem.Allocator,
+    proj: Projection = .{ .indices = &.{}, .columns = &.{} },
+    owned: bool = false,
+
+    fn take(alloc: std.mem.Allocator, p: Projection) ProjGuard {
+        return .{ .alloc = alloc, .proj = p, .owned = true };
+    }
+
+    fn release(self: *ProjGuard) Projection {
+        self.owned = false;
+        return self.proj;
+    }
+
+    fn deinit(self: *ProjGuard) void {
+        if (!self.owned) return;
+        for (self.proj.columns) |c| self.alloc.free(c);
+        self.alloc.free(self.proj.columns);
+        self.alloc.free(self.proj.indices);
+    }
+};
+
 /// 列名解析：**完整名优先**，再退化成「裸名唯一匹配」。
 ///
 /// 为什么需要后者：JOIN 的合成 schema 列名是 `表.列`（`t.id`、`u.id`），
@@ -1424,25 +1462,22 @@ fn selectByPk(t: *tablemod.Table, s: *const schema_mod.Schema, sel: sql.Select, 
     const key = try s.encodeKey(alloc, vals);
     defer alloc.free(key);
 
-    const proj = try buildProjection(alloc, s, sel.items);
-    errdefer {
-        for (proj.columns) |c| alloc.free(c);
-        alloc.free(proj.columns);
-    }
+    var pg = ProjGuard.take(alloc, try buildProjection(alloc, s, sel.items));
+    defer pg.deinit();
 
     var vbuf: std.ArrayList(u8) = .empty;
     defer vbuf.deinit(alloc);
 
     const raw = (try t.get(key, &vbuf)) orelse {
         const empty = try alloc.alloc([]sql.Value, 0);
-        return .{ .alloc = alloc, .columns = proj.columns, .rows = empty };
+        return .{ .alloc = alloc, .columns = pg.release().columns, .rows = empty };
     };
 
     const one = [_][]const u8{raw};
     // 点查只要一行，额外做投影裁剪没有意义（单行解码成本可忽略），保持全列。
     var m = try decodeAll(alloc, s, &one, null);
     defer m.deinit();
-    return buildOutput(alloc, s, &m, proj, 0, 1);
+    return buildOutput(alloc, s, &m, pg.release(), 0, 1);
 }
 
 pub fn updateRows(
@@ -1916,18 +1951,13 @@ fn finishFromValues(
     var t0 = stamp(io);
     // 排序前列校验：比较器不能返回错误，解析失败会静默变成「不排序」
     try validateOrderBy(s, sel.order_by);
-    const proj = try buildProjection(alloc, s, sel.items);
+    var pg = ProjGuard.take(alloc, try buildProjection(alloc, s, sel.items));
+    defer pg.deinit();
+    const proj = pg.proj;
     if (timing_enabled) {
         const t1 = stamp(io);
         timing.projection += t1 - t0;
         t0 = t1;
-    }
-    errdefer {
-        for (proj.columns) |c| alloc.free(c);
-        alloc.free(proj.columns);
-        // `proj.indices` 平时由 `buildOutput` 的 defer 释放；但若下面提前返回（
-        // decodeAll 失败），这里必须自己收拾。
-        alloc.free(proj.indices);
     }
 
     const ascending = blk: {
@@ -1961,7 +1991,7 @@ fn finishFromValues(
         t0 = t1;
         timing.calls += 1;
     }
-    const out = try buildOutput(alloc, s, &m, proj, start, end);
+    const out = try buildOutput(alloc, s, &m, pg.release(), start, end);
     if (timing_enabled) timing.output += stamp(io) - t0;
     return out;
 }

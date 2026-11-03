@@ -1151,6 +1151,12 @@ test "JOIN 直写路径（无 ORDER BY）与排序路径逐格一致，并保持
             "SELECT p.id, q.n FROM p JOIN q ON p.k = q.k WHERE q.n > 1",
             "SELECT p.id, q.n FROM p JOIN q ON p.k = q.k WHERE q.n > 1 ORDER BY p.id, q.id",
         },
+        // WHERE 引用的列**不在投影里**：直写路径必须用「宽行」判 WHERE 再投影，
+        // 若先投影再判就会 `ColumnNotFound` 或静默判错（这正是提前投影最容易踩的坑）
+        .{
+            "SELECT p.k FROM p JOIN q ON p.k = q.k WHERE q.n > 2",
+            "SELECT p.k FROM p JOIN q ON p.k = q.k WHERE q.n > 2 ORDER BY p.id, q.id",
+        },
         // LIMIT：直写路径会「凑够就停」，结果必须与全量再截断一致
         .{
             "SELECT p.id, q.id FROM p JOIN q ON p.k = q.k LIMIT 3",
