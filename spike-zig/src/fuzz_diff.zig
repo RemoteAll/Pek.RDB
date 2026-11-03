@@ -868,6 +868,27 @@ test "差分随机：DML 更新/删除后全表与索引一致" {
             var q: Buf = .empty;
             defer q.deinit(alloc);
 
+            // ---- 主键迁移（`UPDATE ... SET id = ...`）----
+            // 索引键 = 值 ++ 主键，所以改主键要「删旧行 + 删旧索引项 + 插新行 + 插新索引项」
+            // 四步全对齐。只改非主键列永远碰不到这条路径，而它恰恰最容易漏掉其中一步。
+            // 新主键取「当前最大 + 1..5」（预留区，保证不与现有主键撞车：撞车会变成两行同键，
+            // 那是「重复键怎么写」的另一条用例，不是索引维护）。
+            if (rows.items.len > 0 and rng.truthy(6)) {
+                var max_id: i64 = 0;
+                for (rows.items) |r| max_id = @max(max_id, r.id);
+                const old_id = rows.items[rng.below(rows.items.len)].id;
+                const new_id = max_id + 1 + @as(i64, @intCast(rng.below(5)));
+                try q.appendSlice(alloc, "UPDATE t SET id = ");
+                try addInt(alloc, &q, new_id);
+                try q.appendSlice(alloc, " WHERE id = ");
+                try addInt(alloc, &q, old_id);
+                try execSilent(&eng, alloc, q.items);
+                for (rows.items) |*r| {
+                    if (r.id == old_id) r.id = new_id;
+                }
+                continue;
+            }
+
             if (rng.truthy(2)) {
                 // UPDATE
                 const set_col = all_cols[rng.below(all_cols.len)];
@@ -927,15 +948,21 @@ test "差分随机：DML 更新/删除后全表与索引一致" {
             }
         }
 
+        // 参考表按 id 排序（主键迁移会打乱原插入顺序），对账全部基于这份
+        var sorted: std.ArrayList(Row) = .empty;
+        defer sorted.deinit(alloc);
+        try sorted.appendSlice(alloc, rows.items);
+        std.mem.sort(Row, sorted.items, {}, idLess);
+
         // 对账 ①：全表（走全扫 + 主键排序）
         {
             const got_rows = try fetchAll(&eng, alloc, "SELECT id, g, s FROM t ORDER BY id");
-            defer freeRows(&got_rows, alloc);
-            if (!rowsEqual(&got_rows, rows.items)) {
+            defer freeRows(got_rows, alloc);
+            if (!rowsEqual(&got_rows, sorted.items)) {
                 std.debug.print("[DML 第 {d} 轮] 全表对账不符：引擎 {d} 行 / 参考 {d} 行\n", .{
-                    round, got_rows.len, rows.items.len,
+                    round, got_rows.len, sorted.items.len,
                 });
-                dumpFirst(&got_rows, rows.items);
+                dumpFirst(&got_rows, sorted.items);
                 fails += 1;
             }
         }
@@ -962,11 +989,11 @@ test "差分随机：DML 更新/删除后全表与索引一致" {
                 }
                 try q.appendSlice(alloc, " ORDER BY id");
                 const got_ids = try fetchAll(&eng, alloc, q.items);
-                defer freeRows(&got_ids, alloc);
+                defer freeRows(got_ids, alloc);
 
                 var want_ids: std.ArrayList(sql.Value) = .empty;
                 defer want_ids.deinit(alloc);
-                for (rows.items) |r| {
+                for (sorted.items) |r| {
                     const cell = rowCol(r, c);
                     if (tagOf(cell) == .null) continue;
                     if (valueOrd(cell, v) != .eq) continue;
@@ -1038,8 +1065,8 @@ fn fetchAll(eng: *engine.Engine, alloc: std.mem.Allocator, text: []const u8) ![]
     }
 }
 
-fn freeRows(rows: *const [][]sql.Value, alloc: std.mem.Allocator) void {
-    for (rows.*) |row| {
+fn freeRows(rows: []const []sql.Value, alloc: std.mem.Allocator) void {
+    for (rows) |row| {
         for (row) |v| switch (v) {
             .text => |x| alloc.free(x),
             .blob => |x| alloc.free(x),
@@ -1047,7 +1074,11 @@ fn freeRows(rows: *const [][]sql.Value, alloc: std.mem.Allocator) void {
         };
         alloc.free(row);
     }
-    alloc.free(rows.*);
+    alloc.free(rows);
+}
+
+fn idLess(_: void, a: Row, b: Row) bool {
+    return a.id < b.id;
 }
 
 fn rowsEqual(got: *const [][]sql.Value, want: []const Row) bool {
@@ -1074,4 +1105,546 @@ fn dumpFirst(got: *const [][]sql.Value, want: []const Row) void {
             i, r.id, describe(rowCol(r, .g), &b1), describe(rowCol(r, .s), &b2),
         });
     }
+}
+
+// ===========================================================================
+// 聚合 / GROUP BY / HAVING 差分
+//
+// 为什么单独做：`selectGrouped` 有 550 行、四条互相纠缠的语义（分组键编码、隐藏排序列、
+// HAVING 的聚合可能不在选择列表、SUM/AVG 的整数/浮点分野）。这类逻辑一旦错，
+// 报出来的数字**看着完全正常**（少算一行、把 NULL 当 0、AVG 用错分母），
+// 没有任何断言会红 —— 只能靠「与朴素参考实现逐格比」。
+//
+// 参考实现刻意用 O(组数 × 组内行数) 的笨写法：每组现扫一遍算聚合，好读、不易同错。
+// ===========================================================================
+
+const AggItem = struct { func: sql.AggFunc, col: ?Col };
+
+const AggOut = union(enum) { grp: Col, agg: AggItem };
+
+const AggCase = struct {
+    group_by: []const Col,
+    items: []const AggOut,
+    where: ?Cond = null,
+    having: ?struct { item: AggItem, op: sql.CmpOp, lit: sql.Value } = null,
+};
+
+fn aggFuncName(f: sql.AggFunc) []const u8 {
+    return switch (f) {
+        .count => "count",
+        .sum => "sum",
+        .avg => "avg",
+        .min => "min",
+        .max => "max",
+    };
+}
+
+fn aggLabelAlloc(alloc: std.mem.Allocator, item: AggItem) ![]const u8 {
+    return if (item.col) |c|
+        try alloc.print("{s}({s})", .{ aggFuncName(item.func), colName(c) })
+    else
+        try alloc.print("{s}(*)", .{aggFuncName(item.func)});
+}
+
+fn genAggItem(rng: *Rng) AggItem {
+    const funcs = [_]sql.AggFunc{ .count, .count, .sum, .avg, .min, .max };
+    const f = funcs[rng.below(funcs.len)];
+    // `count(*)`
+    if (f == .count and rng.truthy(3)) return .{ .func = .count, .col = null };
+    // SUM/AVG 只对数值列有意义（对 text 引擎直接报 TypeMismatch，那是另一条用例）
+    const cols: []const Col = if (f == .sum or f == .avg) &[_]Col{ .id, .g } else &all_cols;
+    return .{ .func = f, .col = cols[rng.below(cols.len)] };
+}
+
+fn genAgg(alloc: std.mem.Allocator, rng: *Rng, out: *Buf) !AggCase {
+    var group_by: std.ArrayList(Col) = .empty;
+    const mode = rng.below(4);
+    if (mode != 0) { // 25% 全局聚合
+        try group_by.append(alloc, .g);
+        if (mode >= 2) try group_by.append(alloc, .s); // 50% 两列分组
+    }
+
+    var items: std.ArrayList(AggOut) = .empty;
+    for (group_by.items) |c| try items.append(alloc, .{ .grp = c });
+    const naggs = 1 + rng.below(2);
+    for (0..naggs) |_| try items.append(alloc, .{ .agg = genAggItem(rng) });
+
+    try out.appendSlice(alloc, "SELECT ");
+    for (items.items, 0..) |it, i| {
+        if (i > 0) try out.appendSlice(alloc, ", ");
+        switch (it) {
+            .grp => |c| try out.appendSlice(alloc, colName(c)),
+            .agg => |a| {
+                const lab = try aggLabelAlloc(alloc, a);
+                defer alloc.free(lab);
+                try out.appendSlice(alloc, lab);
+            },
+        }
+    }
+    try out.appendSlice(alloc, " FROM t");
+
+    var case = AggCase{ .group_by = &.{}, .items = &.{} };
+    if (rng.truthy(3)) {
+        const num_only = [_]Col{ .id, .g };
+        const c = num_only[rng.below(num_only.len)];
+        const op = ops[rng.below(ops.len)];
+        const lit: sql.Value = .{ .integer = @as(i64, @intCast(rng.below(6))) - 1 };
+        try out.appendSlice(alloc, " WHERE ");
+        try out.appendSlice(alloc, colName(c));
+        try out.appendSlice(alloc, " ");
+        try out.appendSlice(alloc, opText[opIndex(op)]);
+        try out.appendSlice(alloc, " ");
+        try addInt(alloc, out, lit.integer);
+        case.where = .{ .col = c, .op = op, .lit = lit };
+    }
+    if (group_by.items.len > 0) {
+        try out.appendSlice(alloc, " GROUP BY ");
+        for (group_by.items, 0..) |c, i| {
+            if (i > 0) try out.appendSlice(alloc, ", ");
+            try out.appendSlice(alloc, colName(c));
+        }
+    }
+    if (rng.truthy(3)) {
+        // HAVING 的聚合**故意不与投影里的重复**，覆盖「补隐藏槽」那条路径
+        const having_funcs = [_]sql.AggFunc{ .count, .sum, .min };
+        const hf = having_funcs[rng.below(having_funcs.len)];
+        // `sum(*)` / `min(*)` 不是合法 SQL：只有 count 接受 `*`
+        const ha = AggItem{ .func = hf, .col = if (hf != .count or rng.truthy(2)) .g else null };
+        const hop = ops[rng.below(ops.len)];
+        const hlit: sql.Value = .{ .integer = @as(i64, @intCast(rng.below(4))) };
+        try out.appendSlice(alloc, " HAVING ");
+        const lab = try aggLabelAlloc(alloc, ha);
+        defer alloc.free(lab);
+        try out.appendSlice(alloc, lab);
+        try out.appendSlice(alloc, " ");
+        try out.appendSlice(alloc, opText[opIndex(hop)]);
+        try out.appendSlice(alloc, " ");
+        try addInt(alloc, out, hlit.integer);
+        case.having = .{ .item = ha, .op = hop, .lit = hlit };
+    }
+    case.group_by = try group_by.toOwnedSlice(alloc);
+    case.items = try items.toOwnedSlice(alloc);
+    return case;
+}
+
+/// 朴素聚合：在一组行上现扫一遍。`null` 列跳过；空集时 SUM/AVG/MIN/MAX 都是 NULL。
+fn computeAgg(rows: []const Row, item: AggItem) sql.Value {
+    switch (item.func) {
+        .count => {
+            if (item.col) |c| {
+                var n: i64 = 0;
+                for (rows) |r| {
+                    if (tagOf(rowCol(r, c)) != .null) n += 1;
+                }
+                return .{ .integer = n };
+            }
+            return .{ .integer = @intCast(rows.len) };
+        },
+        .sum, .avg => {
+            var sum: i128 = 0;
+            var n: i64 = 0;
+            for (rows) |r| {
+                const v = rowCol(r, item.col.?);
+                switch (v) {
+                    .null => {},
+                    .integer => |x| {
+                        sum += x;
+                        n += 1;
+                    },
+                    else => unreachable,
+                }
+            }
+            if (n == 0) return .{ .null = {} };
+            if (item.func == .sum) return .{ .integer = std.math.cast(i64, sum).? };
+            return .{ .real = @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(n)) };
+        },
+        .min, .max => {
+            var best: sql.Value = .{ .null = {} };
+            for (rows) |r| {
+                const v = rowCol(r, item.col.?);
+                if (tagOf(v) == .null) continue;
+                if (tagOf(best) == .null) {
+                    best = v;
+                    continue;
+                }
+                const ord = valueOrd(v, best);
+                if (item.func == .min and ord == .lt) best = v;
+                if (item.func == .max and ord == .gt) best = v;
+            }
+            return best;
+        },
+    }
+}
+
+fn oracleAgg(arena: std.mem.Allocator, rows: []const Row, case: AggCase) ![][]sql.Value {
+    const filt = try arena.alloc(Row, rows.len);
+    var nf: usize = 0;
+    for (rows) |r| {
+        if (case.where) |w| {
+            if (!evalCmp(rowCol(r, w.col), w.op, w.lit)) continue;
+        }
+        filt[nf] = r;
+        nf += 1;
+    }
+
+    const Grp = struct { key: []sql.Value, rows: std.ArrayList(Row) };
+    var groups: std.ArrayList(Grp) = .empty;
+    if (case.group_by.len == 0) {
+        // 全局聚合：空输入也产出一组（SQL 语义）
+        try groups.append(arena, .{ .key = &.{}, .rows = .empty });
+        for (filt[0..nf]) |r| try groups.items[0].rows.append(arena, r);
+    } else {
+        for (filt[0..nf]) |r| {
+            const key = try arena.alloc(sql.Value, case.group_by.len);
+            for (case.group_by, 0..) |c, i| key[i] = rowCol(r, c);
+            var hit: ?usize = null;
+            for (groups.items, 0..) |g, gi| {
+                var same = true;
+                for (g.key, key) |a, b| {
+                    if (valueOrd(a, b) != .eq) {
+                        same = false;
+                        break;
+                    }
+                }
+                if (same) {
+                    hit = gi;
+                    break;
+                }
+            }
+            if (hit) |gi| {
+                try groups.items[gi].rows.append(arena, r);
+            } else {
+                var grp = Grp{ .key = key, .rows = .empty };
+                try grp.rows.append(arena, r);
+                try groups.append(arena, grp);
+            }
+        }
+    }
+
+    var out: std.ArrayList([]sql.Value) = .empty;
+    for (groups.items) |g| {
+        // HAVING：聚合值 NULL 视为 unknown ⇒ 整组被滤掉
+        if (case.having) |hv| {
+            const hv_val = computeAgg(g.rows.items, hv.item);
+            if (tagOf(hv_val) == .null) continue;
+            if (!evalCmp(hv_val, hv.op, hv.lit)) continue;
+        }
+        const one = try arena.alloc(sql.Value, case.items.len);
+        for (case.items, 0..) |it, i| {
+            one[i] = switch (it) {
+                .grp => |c| blk: {
+                    for (case.group_by, 0..) |gc, k| {
+                        if (gc == c) break :blk g.key[k];
+                    }
+                    unreachable;
+                },
+                .agg => |a| computeAgg(g.rows.items, a),
+            };
+        }
+        try out.append(arena, one);
+    }
+    return out.items;
+}
+
+test "差分随机：聚合 / GROUP BY / HAVING 与朴素参考实现一致" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+    const root = "test-fuzz-agg";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    var eng = try engine.Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    defer eng.deinit();
+
+    const ins = try buildTInsert(alloc);
+    defer alloc.free(ins);
+    for ([_][]const u8{
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, s TEXT)",
+        ins,
+        "CREATE INDEX idx_t_g ON t (g)",
+    }) |st| try execSilent(&eng, alloc, st);
+
+    const rows = buildT();
+    var rng = Rng{ .s = 0x5deece66d1234567 };
+    var fails: usize = 0;
+    const iters = 250;
+    for (0..iters) |it| {
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var q: Buf = .empty;
+        const case = try genAgg(arena, &rng, &q);
+
+        var p = sql.parse(alloc, q.items) catch |e| {
+            std.debug.print("[聚合 #{d}] 解析失败 {s}: {s}\n", .{ it, @errorName(e), q.items });
+            fails += 1;
+            continue;
+        };
+        defer p.deinit();
+        var res = eng.execute(p.stmt, alloc) catch |e| {
+            std.debug.print("[聚合 #{d}] 执行失败 {s}: {s}\n", .{ it, @errorName(e), q.items });
+            fails += 1;
+            continue;
+        };
+        switch (res) {
+            .rows => |*got| {
+                defer got.deinit();
+                const want = try oracleAgg(arena, &rows, case);
+                // 无 ORDER BY ⇒ 组顺序未定义，按多重集比
+                std.mem.sort([]sql.Value, got.rows, {}, rowLexLess);
+                std.mem.sort([]sql.Value, want, {}, rowLexLess);
+
+                var ok = got.rows.len == want.len and got.columns.len == case.items.len;
+                if (ok) {
+                    for (got.columns, 0..) |cn, ci| {
+                        const exp = switch (case.items[ci]) {
+                            .grp => |c| try alloc.dupe(u8, colName(c)),
+                            .agg => |a| try aggLabelAlloc(alloc, a),
+                        };
+                        defer alloc.free(exp);
+                        if (!std.ascii.eqlIgnoreCase(cn, exp)) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if (ok) {
+                    outer: for (got.rows, want) |grow, wrow| {
+                        if (grow.len != wrow.len) {
+                            ok = false;
+                            break :outer;
+                        }
+                        for (grow, wrow) |gv, wv| {
+                            if (!valueEq(gv, wv)) {
+                                ok = false;
+                                break :outer;
+                            }
+                        }
+                    }
+                }
+                if (!ok) {
+                    std.debug.print("\n[MISMATCH-AGG #{d}] {s}\n", .{ it, q.items });
+                    std.debug.print("  engine cols({d}):", .{got.columns.len});
+                    for (got.columns) |c| std.debug.print(" {s}", .{c});
+                    std.debug.print("  rows={d}\n", .{got.rows.len});
+                    for (got.rows[0..@min(5, got.rows.len)], 0..) |r, i| {
+                        std.debug.print("  e[{d}] ", .{i});
+                        printRow(r);
+                        std.debug.print("\n", .{});
+                    }
+                    std.debug.print("  oracle rows={d}\n", .{want.len});
+                    for (want[0..@min(5, want.len)], 0..) |r, i| {
+                        std.debug.print("  o[{d}] ", .{i});
+                        printRow(r);
+                        std.debug.print("\n", .{});
+                    }
+                    fails += 1;
+                }
+            },
+            else => {
+                std.debug.print("[聚合 #{d}] 未返回行集 ← {s}\n", .{ it, q.items });
+                fails += 1;
+            },
+        }
+    }
+    std.debug.print("[差分聚合] {d} 条随机查询，失败 {d}\n", .{ iters, fails });
+    try std.testing.expectEqual(@as(usize, 0), fails);
+}
+
+// ===========================================================================
+// WAL 截断（恢复健壮性）
+//
+// 真实世界的中断点**一定**落在记录中间：断电、`kill -9`、磁盘写满、容器被驱逐。
+// 恢复时只有两种结果可以接受：
+//   ① 显式报错（可诊断，带得出来是哪一步/哪一段）；
+//   ② 恢复到「**完整记录的连续前缀**」，且每行数据与写入值逐字节一致。
+// **不可接受**：静默返回半条记录（长度对、内容是垃圾）、跳过损坏段继续当没事、
+// 或者恢复出来的行集不是前缀（出现「后面的行在、前面的行没了」）。
+//
+// 每次重开都开两次：恢复必须是幂等的（第二次读到的与第一次完全一样），
+// 否则说明恢复过程又写坏了什么。
+//
+// **造「崩溃态」的正确做法**（第一版写错过，记在这里）：
+// `Engine.deinit` 会把 memtable 刷成段并把 WAL 截回 0，所以「写完 → 正常关闭 → 截断 WAL」
+// 截的是一个**空文件**，用例看着绿、实际什么都没测（实测 `total = 0`）。
+// 正确构造：① 建一个只有 schema、没有数据的库并正常关闭（WAL 归零）；
+// ② 另开一次、插入若干行，**在关闭之前**把 WAL 字节读出来；
+// ③ 每个截断点：重建空库 → 把捕获的 WAL 前 `cut` 字节写回去 → 重开 ⇒ 这才是断电现场。
+// 并且显式断言「捕获到的 WAL 非空」，防止将来又退化成空跑。
+// ===========================================================================
+
+/// 建一个只有表结构、没有数据的库并正常关闭（此时 WAL 被截回 0）。
+fn buildSchemaOnly(io: std.Io, dir: std.Io.Dir, root: []const u8, alloc: std.mem.Allocator) !void {
+    var eng = try engine.Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    defer eng.deinit();
+    try execSilent(&eng, alloc, "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, s TEXT)");
+}
+
+fn walPath(alloc: std.mem.Allocator, root: []const u8) ![]u8 {
+    return alloc.print("{s}/t/wal/000001.wal", .{root});
+}
+
+/// 在「关闭之前」把 WAL 的字节整段读出来 —— 这就是崩溃时会留在磁盘上的东西。
+///
+/// **必须 `wal_sync_every = 1`**：`wal.append` 只把记录堆在内存 buffer 里，
+/// 真正 `writePositionalAll` 发生在 `sync()`（默认 `wal_sync_every = 0` ⇒ 永不同步），
+/// 所以用 0 抓到的永远是 0 字节（第一版就是这么空跑到绿的）。
+fn captureWalBytes(io: std.Io, dir: std.Io.Dir, root: []const u8, alloc: std.mem.Allocator, rows: []const Row) ![]u8 {
+    var eng = try engine.Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 1 } });
+    defer eng.deinit();
+    for (rows) |r| {
+        var b: Buf = .empty;
+        defer b.deinit(alloc);
+        try b.appendSlice(alloc, "INSERT INTO t (id, g, s) VALUES (");
+        try addInt(alloc, &b, r.id);
+        try b.appendSlice(alloc, ", ");
+        if (r.g) |g| try addInt(alloc, &b, g) else try b.appendSlice(alloc, "NULL");
+        try b.appendSlice(alloc, ", ");
+        if (r.s) |v| {
+            try b.appendSlice(alloc, "'");
+            try b.appendSlice(alloc, v);
+            try b.appendSlice(alloc, "'");
+        } else try b.appendSlice(alloc, "NULL");
+        try b.appendSlice(alloc, ")");
+        try execSilent(&eng, alloc, b.items);
+    }
+    // 此刻引擎还开着、memtable 还没刷 —— WAL 里就是那 N 条记录
+    const path = try walPath(alloc, root);
+    defer alloc.free(path);
+    const f = try dir.openFile(io, path, .{});
+    defer f.close(io);
+    const size: usize = @intCast((try f.stat(io)).size);
+    const buf = try alloc.alloc(u8, size);
+    errdefer alloc.free(buf);
+    const n = try f.readPositionalAll(io, buf, 0);
+    return buf[0..n];
+}
+
+fn reopenAndRead(io: std.Io, dir: std.Io.Dir, root: []const u8, alloc: std.mem.Allocator) ![][]sql.Value {
+    var eng = try engine.Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    defer eng.deinit();
+    return fetchAll(&eng, alloc, "SELECT id, g, s FROM t ORDER BY id");
+}
+
+test "WAL 截断：只能是完整前缀或显式报错，不得静默返回坏数据" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+    const root = "test-wal-trunc";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    const all = buildT();
+    const rows = all[0..13];
+
+    // ① 空库（schema 已落盘、WAL = 0）→ ② 再开一次灌数据并在关闭前抓 WAL 字节
+    try buildSchemaOnly(io, dir, root, alloc);
+    const wal_bytes = try captureWalBytes(io, dir, root, alloc, rows);
+    defer alloc.free(wal_bytes);
+    const total: u64 = wal_bytes.len;
+    // 防退化：抓不到内容说明「崩溃态」没造出来，这时用例是空跑，必须直接报错
+    try std.testing.expect(total > 0);
+
+    var fails: usize = 0;
+    var explicit_errors: usize = 0;
+    var recovered: usize = 0;
+    var max_rows: usize = 0;
+    var partial_rows: usize = 0;
+
+    const cuts = [_]u64{ 0, 1, 2, 4, 7, 8, 16, total / 4, total / 2, total * 3 / 4, total * 7 / 8, total -| 32, total -| 16, total -| 8, total -| 4, total -| 1, total };
+    for (cuts) |cut| {
+        if (cut > total) continue;
+        dir.deleteTree(io, root) catch {};
+        try buildSchemaOnly(io, dir, root, alloc);
+
+        // 把捕获的 WAL 前 `cut` 字节写回去 —— 等价于「写到一半断电」
+        {
+            const path = try walPath(alloc, root);
+            defer alloc.free(path);
+            const f = try dir.openFile(io, path, .{ .mode = .read_write });
+            defer f.close(io);
+            try f.writePositionalAll(io, wal_bytes[0..@intCast(cut)], 0);
+            try f.setLength(io, cut);
+        }
+
+        // ③ 重开：允许显式报错
+        const got = reopenAndRead(io, dir, root, alloc) catch |e| {
+            std.debug.print("[WAL 截断 {d}/{d}] 显式报错：{s}\n", .{ cut, total, @errorName(e) });
+            explicit_errors += 1;
+            continue;
+        };
+        defer freeRows(got, alloc);
+        recovered += 1;
+        max_rows = @max(max_rows, got.len);
+        if (got.len > 0 and got.len < rows.len) partial_rows += 1;
+
+        // ④ 必须正好是「完整记录的连续前缀」，且值逐字节一致
+        var bad: ?[]const u8 = null;
+        if (got.len > rows.len) {
+            bad = "行数超过写入数";
+        } else {
+            for (got, 0..) |g, i| {
+                if (g.len != 3) {
+                    bad = "列数不对";
+                    break;
+                }
+                if (!valueEq(g[0], .{ .integer = rows[i].id })) {
+                    bad = "主键不是前缀";
+                    break;
+                }
+                if (!valueEq(g[1], rowCol(rows[i], .g)) or !valueEq(g[2], rowCol(rows[i], .s))) {
+                    bad = "值不是写入值（半条记录/脏数据）";
+                    break;
+                }
+            }
+        }
+
+        // ⑤ 恢复要幂等
+        if (bad == null) {
+            const again = reopenAndRead(io, dir, root, alloc) catch |e| blk: {
+                std.debug.print("[WAL 截断 {d}/{d}] 第二次重开报错 {s}\n", .{ cut, total, @errorName(e) });
+                fails += 1;
+                break :blk &[_][]sql.Value{};
+            };
+            defer freeRows(again, alloc);
+            if (again.len != got.len) {
+                bad = "两次重开结果不一致（恢复不幂等）";
+            } else {
+                for (again, got) |a, b| {
+                    for (a, b) |av, bv| {
+                        if (!valueEq(av, bv)) {
+                            bad = "两次重开结果不一致（恢复不幂等）";
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (bad) |why| {
+            std.debug.print("[WAL 截断 {d}/{d}] {s}：恢复出 {d} 行\n", .{ cut, total, why, got.len });
+            for (got, 0..) |g, i| {
+                std.debug.print("  r[{d}] ", .{i});
+                printRow(g);
+                std.debug.print("\n", .{});
+            }
+            fails += 1;
+        }
+    }
+    std.debug.print("[WAL 截断] 崩溃态 WAL 总长 {d} 字节；{d} 个截断点：显式报错 {d}、恢复成功 {d}、不合格 {d}\n", .{
+        total, cuts.len, explicit_errors, recovered, fails,
+    });
+    // **防空跑**：如果引擎根本不重放 WAL，每个截断点都会恢复出 0 行，上面那些断言
+    // 全都「通过」—— 什么都没测。所以必须钉死两件事：
+    //   ① 完整 WAL 能恢复出全部行（重放真的发生了）
+    //   ② 至少有一个截断点恢复出「部分行」（截断点真的落在记录中间）
+    try std.testing.expectEqual(rows.len, max_rows);
+    try std.testing.expect(partial_rows > 0);
+    try std.testing.expectEqual(@as(usize, 0), fails);
 }
