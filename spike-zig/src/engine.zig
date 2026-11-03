@@ -21,6 +21,7 @@ pub const Entry = struct {
 
 pub const Result = union(enum) {
     created: bool,
+    dropped: bool,
     inserted: usize,
     updated: usize,
     deleted: usize,
@@ -501,6 +502,7 @@ pub const Engine = struct {
         switch (stmt) {
             .create_table => |def| return .{ .created = try self.createTable(def) },
             .create_index => |def| return .{ .created = try self.createIndex(def) },
+            .drop_index => |def| return .{ .dropped = try self.dropIndex(def) },
             .insert => |ins| {
                 const e = self.tables.getPtr(ins.table) orelse return error.TableNotFound;
                 var host = exec.IndexHost{ .schema = &e.schema, .tables = &e.idx_tables };
@@ -575,6 +577,44 @@ pub const Engine = struct {
         _ = try e.schema.addIndex(self.alloc, def.name, ci);
         try catalog.saveSchema(self.io, self.dir, path, &e.schema, self.alloc);
         return true;
+    }
+
+    /// `DROP INDEX name`：从 schema 移除 → 落盘 → 删索引表目录。
+    ///
+    /// **顺序不能反**：先删目录、后存 schema 时，一旦崩在中间，schema 里还留着这个索引，
+    /// 下次打开会把它当「已存在的索引表」去打开（表不在 ⇒ 报错或静默重建全表），
+    /// 而查询侧仍认为「这列有索引」→ 走一条拿不到数据的路径 ⇒ **漏行**。
+    /// 先存 schema 则最坏结果只是一个没人引用的孤儿目录（垃圾，不是错数据）。
+    pub fn dropIndex(self: *Engine, def: sql.DropIndex) !bool {
+        var it = self.tables.iterator();
+        while (it.next()) |kv| {
+            const e = kv.value_ptr;
+            const ix = e.schema.findIndex(def.name) orelse continue;
+            // `findIndex` 返回的是值拷贝，`name` 还指向 schema 数组里的内存 ——
+            // 下面 `removeIndex` 会释放它，所以先把名字抄一份。
+            const key = try self.alloc.dupe(u8, ix.name);
+            defer self.alloc.free(key);
+
+            const path = try self.alloc.print("{s}/{s}", .{ self.root, kv.key_ptr.* });
+            defer self.alloc.free(path);
+
+            // 1) 内存：schema 与索引表集合都摘掉（此后查询不再认为有索引）
+            _ = e.schema.removeIndex(self.alloc, key);
+            if (e.idx_tables.fetchRemove(key)) |rm| {
+                var t = rm.value;
+                t.deinit();
+                self.alloc.free(rm.key);
+            }
+            // 2) 落盘 schema（这一步成功后，索引在逻辑上已经不存在）
+            try catalog.saveSchema(self.io, self.dir, path, &e.schema, self.alloc);
+            // 3) 最后删目录；删失败只是留下孤儿文件，不影响正确性
+            const idx_path = try self.alloc.print("{s}/idx/{s}", .{ path, key });
+            defer self.alloc.free(idx_path);
+            self.dir.deleteTree(self.io, idx_path) catch {};
+            return true;
+        }
+        if (def.if_exists) return false;
+        return error.IndexNotFound;
     }
 };
 
@@ -1047,20 +1087,64 @@ test "JOIN：INNER/LEFT、ON 反向、索引路径、裸名歧义、不支持的
     try run(&eng, alloc, "CREATE INDEX idx_name ON u (name)");
     try run(&eng, alloc, "INSERT INTO t (id, uid, tag) VALUES (5, 0, 'ten')");
     {
-        // 确定性证据：右表 ON 列有索引时，右表主表**不该被全扫**。
-        // （若退回全扫，这里会变成「左行数 × 右行数」，结果一样但代价完全不同。）
+        // 确定性证据：**右表最多只扫一遍**（哈希连接整表建一次索引）。
+        // 旧口径是「右表主表一行都不扫」（按行查索引前缀），换哈希连接后必然扫一次；
+        // 但若退化成「左行数 × 右行数」的嵌套全扫，这里会变成 15 —— 那才是要拦的。
         eng.get("u").?.table.scan_rows_read = 0;
         var rows = try queryRows(&eng, alloc, "SELECT t.id, u.id FROM t JOIN u ON t.tag = u.name ORDER BY t.id");
         defer rows.deinit();
         try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
         try std.testing.expectEqual(@as(i64, 5), rows.rows[0][0].integer);
         try std.testing.expectEqual(@as(i64, 10), rows.rows[0][1].integer);
-        try std.testing.expectEqual(@as(u64, 0), eng.get("u").?.table.scan_rows_read);
+        try std.testing.expect(eng.get("u").?.table.scan_rows_read <= 3);
     }
 
     // 不支持的形态：自连接（需要别名）与非等值 ON
     try std.testing.expectError(error.UnsupportedStatement, queryRows(&eng, alloc, "SELECT t.id FROM t JOIN t ON t.id = t.uid"));
     try std.testing.expectError(error.UnexpectedToken, queryRows(&eng, alloc, "SELECT t.id FROM t JOIN u ON t.uid > u.id"));
+}
+
+// 哈希连接与嵌套循环是**两条代码路径**，结果必须逐格相同。
+// 撤销这条用例的方式：把 `use_hash` 写死成 `false` ⇒ 只测嵌套循环；写死成 `true` ⇒ 只测哈希。
+test "JOIN：哈希连接与嵌套循环（索引前缀扫描）结果逐格一致" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const root = "test-engine-join-hash-vs-loop";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    var eng = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    defer eng.deinit();
+
+    try run(&eng, alloc, "CREATE TABLE p (id INTEGER PRIMARY KEY, k TEXT NOT NULL)");
+    try run(&eng, alloc, "CREATE TABLE q (id INTEGER PRIMARY KEY, k TEXT NOT NULL, n INTEGER NOT NULL)");
+    try run(&eng, alloc, "CREATE INDEX idx_q_k ON q (k)");
+    try run(&eng, alloc, "INSERT INTO p (id, k) VALUES (1,'aa'), (2,'bb'), (3,'cc'), (4,'aa')");
+    try run(&eng, alloc, "INSERT INTO q (id, k, n) VALUES (10,'aa',1), (11,'aa',2), (12,'cc',3), (13,'zz',4)");
+
+    const jq = "SELECT p.id, q.id, q.n FROM p JOIN q ON p.k = q.k ORDER BY p.id, q.id";
+
+    var hash_rows = try queryRows(&eng, alloc, jq);
+    defer hash_rows.deinit();
+    // 1→{10,11}、4→{10,11}、3→{12}，共 5 行（`bb` 与 `zz` 两侧都无匹配）
+    try std.testing.expectEqual(@as(usize, 5), hash_rows.rows.len);
+
+    const saved = exec.join_hash_max_rows;
+    exec.join_hash_max_rows = 0; // 上限设 0 ⇒ 强制走嵌套循环（索引前缀扫描）
+    defer exec.join_hash_max_rows = saved;
+
+    var loop_rows = try queryRows(&eng, alloc, jq);
+    defer loop_rows.deinit();
+
+    try std.testing.expectEqual(hash_rows.rows.len, loop_rows.rows.len);
+    for (hash_rows.rows, loop_rows.rows) |hr, lr| {
+        try std.testing.expectEqual(hr.len, lr.len);
+        for (hr, lr) |x, y| try std.testing.expect(schema_mod.valueCmp(x, y) == .eq);
+    }
 }
 
 // JOIN 的边界与「以前会静默」的形态：`*` 投影、1:N 多匹配、LEFT+WHERE 滤 NULL、
@@ -1244,6 +1328,322 @@ test "ORDER BY 索引列：正序/降序 + LIMIT/OFFSET 走索引，结果与全
             std.debug.print("case {d}: 走索引却扫了主表 {d} 行\n", .{ ci, idx_scanned });
             return error.IndexPathScannedTable;
         }
+    }
+}
+
+/// 测试用：按「第 2 列（升序）→ 第 1 列（升序）」排结果行。
+/// 无 `ORDER BY` 时 SQL 不保证行序，所以「走索引」与「走全表」两条路径
+/// 只能比**集合**——各自排序后再逐行比。
+fn lessCol1ThenCol0(_: void, a: []sql.Value, b: []sql.Value) bool {
+    const av = if (a.len > 1) a[1].integer else 0;
+    const bv = if (b.len > 1) b[1].integer else 0;
+    if (av != bv) return av < bv;
+    return a[0].integer < b[0].integer;
+}
+
+// 范围谓词（`>` / `>=` / `<` / `<=`）走索引键区间：把「值分量」的上下界翻译成
+// `MergeIter` 的 `[start, end)`。对照组是「同值但无索引的 `h` 列」（全表扫）。
+test "索引范围查询：> / >= / < / <= 走索引键区间，结果与全表一致" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const root = "test-engine-index-range";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    var eng = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    defer eng.deinit();
+
+    try run(&eng, alloc, "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER NOT NULL, h INTEGER NOT NULL)");
+    var b: usize = 0;
+    while (b < 6) : (b += 1) {
+        var sb: std.ArrayList(u8) = .empty;
+        defer sb.deinit(alloc);
+        try sb.appendSlice(alloc, "INSERT INTO t (id, g, h) VALUES ");
+        for (0..50) |j| {
+            const i: i64 = @intCast(b * 50 + j);
+            const g: i64 = @intCast(@mod(i * 7, 23));
+            try sb.appendSlice(alloc, if (j == 0) "" else ", ");
+            var num: [64]u8 = undefined;
+            try sb.appendSlice(alloc, try std.fmt.bufPrint(&num, "({d}, {d}, {d})", .{ i, g, g }));
+        }
+        try run(&eng, alloc, sb.items);
+    }
+    try run(&eng, alloc, "CREATE INDEX idx_g ON t (g)");
+
+    // LIMIT 取 300（> 命中数）⇒ 索引路径取全集，集合才可比
+    const cases = [_]struct { by_idx: []const u8, full: []const u8 }{
+        .{ .by_idx = "SELECT id, g FROM t WHERE g > 20 LIMIT 300", .full = "SELECT id, g FROM t WHERE h > 20" },
+        .{ .by_idx = "SELECT id, g FROM t WHERE g >= 21 LIMIT 300", .full = "SELECT id, g FROM t WHERE h >= 21" },
+        .{ .by_idx = "SELECT id, g FROM t WHERE g < 2 LIMIT 300", .full = "SELECT id, g FROM t WHERE h < 2" },
+        .{ .by_idx = "SELECT id, g FROM t WHERE g <= 1 LIMIT 300", .full = "SELECT id, g FROM t WHERE h <= 1" },
+        // 边界：区间为空（上界超过最大值 / 下界低于最小值）
+        .{ .by_idx = "SELECT id, g FROM t WHERE g > 22 LIMIT 300", .full = "SELECT id, g FROM t WHERE h > 22" },
+        .{ .by_idx = "SELECT id, g FROM t WHERE g < 0 LIMIT 300", .full = "SELECT id, g FROM t WHERE h < 0" },
+    };
+
+    for (cases, 0..) |c, ci| {
+        eng.get("t").?.table.scan_rows_read = 0;
+        var got = try queryRows(&eng, alloc, c.by_idx);
+        defer got.deinit();
+        const scanned = eng.get("t").?.table.scan_rows_read;
+
+        var want = try queryRows(&eng, alloc, c.full);
+        defer want.deinit();
+
+        if (got.rows.len != want.rows.len) {
+            std.debug.print("case {d}: 行数 {d} != {d}\n", .{ ci, got.rows.len, want.rows.len });
+            return error.RowCountMismatch;
+        }
+        std.mem.sort([]sql.Value, got.rows, {}, lessCol1ThenCol0);
+        std.mem.sort([]sql.Value, want.rows, {}, lessCol1ThenCol0);
+        for (got.rows, want.rows, 0..) |gr, wr, ri| {
+            if (gr[0].integer != wr[0].integer or gr[1].integer != wr[1].integer) {
+                std.debug.print("case {d} 第 {d} 行: idx={any} full={any}\n", .{ ci, ri, gr, wr });
+                return error.ValueMismatch;
+            }
+        }
+        // 确定性证据：命中非空时必须走索引（不扫主表）
+        if (want.rows.len > 0 and scanned != 0) {
+            std.debug.print("case {d}: 走索引却扫了主表 {d} 行\n", .{ ci, scanned });
+            return error.IndexPathScannedTable;
+        }
+    }
+}
+
+// **NULL 参与比较**：`x < 5` / `x <= 5` 对 NULL 行是 UNKNOWN（不匹配）。
+//
+// 这类分歧最容易被漏掉：索引键里根本不收 NULL，所以「走索引」那条路径天然不含 NULL 行；
+// 而全表扫如果只判了谓词右侧（`b`），`valueCmp(NULL, 5) == .lt` 就会把 NULL 行算成命中
+// ⇒ **同一句 SQL 走索引与走全表条数不同**。用例两侧都跑、要求条数相同。
+test "NULL 与范围谓词：走索引与走全表的条数必须一致（NULL 不算命中）" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const root = "test-engine-null-range";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    var eng = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    defer eng.deinit();
+
+    try run(&eng, alloc, "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, h INTEGER)");
+    var b: usize = 0;
+    while (b < 4) : (b += 1) {
+        var sb: std.ArrayList(u8) = .empty;
+        defer sb.deinit(alloc);
+        try sb.appendSlice(alloc, "INSERT INTO t (id, n, h) VALUES ");
+        for (0..25) |j| {
+            const i: i64 = @intCast(b * 25 + j);
+            const v: i64 = @intCast(@mod(i * 5, 11));
+            try sb.appendSlice(alloc, if (j == 0) "" else ", ");
+            var num: [64]u8 = undefined;
+            // 每 4 行「n 与 h 同时为 NULL」（h 是 n 的**无索引镜像**，用来强制走全表扫）；
+            // 两列的 NULL 形态必须完全一致，否则两条 SQL 本来就不该同条数。
+            if (@mod(i, 4) == 0) {
+                try sb.appendSlice(alloc, try std.fmt.bufPrint(&num, "({d}, NULL, NULL)", .{i}));
+            } else {
+                try sb.appendSlice(alloc, try std.fmt.bufPrint(&num, "({d}, {d}, {d})", .{ i, v, v }));
+            }
+        }
+        try run(&eng, alloc, sb.items);
+    }
+    try run(&eng, alloc, "CREATE INDEX idx_n ON t (n)");
+
+    const cases = [_]struct { by_idx: []const u8, full: []const u8 }{
+        .{ .by_idx = "SELECT id, n FROM t WHERE n < 4 LIMIT 300", .full = "SELECT id, h FROM t WHERE h < 4" },
+        .{ .by_idx = "SELECT id, n FROM t WHERE n <= 4 LIMIT 300", .full = "SELECT id, h FROM t WHERE h <= 4" },
+        .{ .by_idx = "SELECT id, n FROM t WHERE n > 6 LIMIT 300", .full = "SELECT id, h FROM t WHERE h > 6" },
+    };
+    for (cases, 0..) |c, ci| {
+        var got = try queryRows(&eng, alloc, c.by_idx);
+        defer got.deinit();
+        var want = try queryRows(&eng, alloc, c.full);
+        defer want.deinit();
+        if (got.rows.len != want.rows.len) {
+            std.debug.print("case {d}: 索引 {d} 行 != 全表 {d} 行\n", .{ ci, got.rows.len, want.rows.len });
+            return error.NullComparisonDiverged;
+        }
+        // 方向性证据：表里确实有 NULL 行，且它们一条都没被算成命中
+        try std.testing.expect(want.rows.len < 100);
+        for (got.rows) |r| try std.testing.expect(r[1] != .null);
+    }
+}
+
+/// 测试用：text 列（第 2 列）升序 → 第 1 列升序。
+fn lessTextCol1ThenCol0(_: void, a: []sql.Value, b: []sql.Value) bool {
+    const ao = std.mem.order(u8, a[1].text, b[1].text);
+    if (ao != .eq) return ao == .lt;
+    return a[0].integer < b[0].integer;
+}
+
+// **text 列的范围查询**：值分量是「转义 + `0x00 0x01` 收尾」的**变长**编码，
+// 所以范围扫描里每条记录的「值分量长度」都可能不同 —— 切主键必须按本行自己的长度
+// （`indexPkSlice` 扫终止符），按谓词那个值的编码长度切会切到别的字节上。
+test "索引范围查询（text 变长值分量）：切主键必须按本行长度，不能按谓词的编码长度" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const root = "test-engine-index-range-text";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    var eng = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    defer eng.deinit();
+
+    try run(&eng, alloc, "CREATE TABLE t2 (id INTEGER PRIMARY KEY, s TEXT NOT NULL, h TEXT NOT NULL)");
+    // 200 行，s 的长度在 1..5 之间循环（"a" / "aa" / "aaa" / "aaaa" / "aaaaa"）
+    var b: usize = 0;
+    while (b < 4) : (b += 1) {
+        var sb: std.ArrayList(u8) = .empty;
+        defer sb.deinit(alloc);
+        try sb.appendSlice(alloc, "INSERT INTO t2 (id, s, h) VALUES ");
+        for (0..50) |j| {
+            const i: i64 = @intCast(b * 50 + j);
+            const n: usize = @intCast(@mod(i, 5) + 1);
+            var sv: [8]u8 = @splat('a');
+            const s = sv[0..n];
+            try sb.appendSlice(alloc, if (j == 0) "" else ", ");
+            var num: [64]u8 = undefined;
+            try sb.appendSlice(alloc, try std.fmt.bufPrint(&num, "({d}, '{s}', '{s}')", .{ i, s, s }));
+        }
+        try run(&eng, alloc, sb.items);
+    }
+    try run(&eng, alloc, "CREATE INDEX idx_s ON t2 (s)");
+
+    const cases = [_]struct { by_idx: []const u8, full: []const u8 }{
+        // 'aaa' 的编码长度是 5（3 字节 + 2 字节终止符），比 'aa'/'a' 长 —— 最容易暴露切错
+        .{ .by_idx = "SELECT id, s FROM t2 WHERE s > 'aaa' LIMIT 999", .full = "SELECT id, s FROM t2 WHERE h > 'aaa'" },
+        .{ .by_idx = "SELECT id, s FROM t2 WHERE s < 'aaa' LIMIT 999", .full = "SELECT id, s FROM t2 WHERE h < 'aaa'" },
+        .{ .by_idx = "SELECT id, s FROM t2 WHERE s >= 'aa' LIMIT 999", .full = "SELECT id, s FROM t2 WHERE h >= 'aa'" },
+        .{ .by_idx = "SELECT id, s FROM t2 WHERE s <= 'aa' LIMIT 999", .full = "SELECT id, s FROM t2 WHERE h <= 'aa'" },
+    };
+
+    for (cases, 0..) |c, ci| {
+        eng.get("t2").?.table.scan_rows_read = 0;
+        var got = try queryRows(&eng, alloc, c.by_idx);
+        defer got.deinit();
+        const scanned = eng.get("t2").?.table.scan_rows_read;
+
+        var want = try queryRows(&eng, alloc, c.full);
+        defer want.deinit();
+
+        if (got.rows.len != want.rows.len) {
+            std.debug.print("text case {d}: 行数 {d} != {d}\n", .{ ci, got.rows.len, want.rows.len });
+            return error.RowCountMismatch;
+        }
+        std.mem.sort([]sql.Value, got.rows, {}, lessTextCol1ThenCol0);
+        std.mem.sort([]sql.Value, want.rows, {}, lessTextCol1ThenCol0);
+        for (got.rows, want.rows, 0..) |gr, wr, ri| {
+            if (gr[0].integer != wr[0].integer or !std.mem.eql(u8, gr[1].text, wr[1].text)) {
+                std.debug.print("text case {d} 第 {d} 行: idx={any} full={any}\n", .{ ci, ri, gr, wr });
+                return error.ValueMismatch;
+            }
+        }
+        if (want.rows.len > 0 and scanned != 0) {
+            std.debug.print("text case {d}: 走索引却扫了主表 {d} 行\n", .{ ci, scanned });
+            return error.IndexPathScannedTable;
+        }
+    }
+}
+
+test "DROP INDEX：删除后查询退回全表且结果不变，重开不复活，再建仍走索引" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const root = "test-engine-drop-index";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    var dropped_ok = false;
+    {
+        var eng = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+        defer eng.deinit();
+
+        try run(&eng, alloc, "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER NOT NULL)");
+        var b: usize = 0;
+        while (b < 4) : (b += 1) {
+            var sb: std.ArrayList(u8) = .empty;
+            defer sb.deinit(alloc);
+            try sb.appendSlice(alloc, "INSERT INTO t (id, g) VALUES ");
+            for (0..25) |j| {
+                const i: i64 = @intCast(b * 25 + j);
+                try sb.appendSlice(alloc, if (j == 0) "" else ", ");
+                var num: [48]u8 = undefined;
+                try sb.appendSlice(alloc, try std.fmt.bufPrint(&num, "({d}, {d})", .{ i, @mod(i, 10) }));
+            }
+            try run(&eng, alloc, sb.items);
+        }
+        try run(&eng, alloc, "CREATE INDEX idx_g ON t (g)");
+
+        // 建好后必须走索引（不扫主表），并记下命中行数
+        eng.get("t").?.table.scan_rows_read = 0;
+        var r1 = try queryRows(&eng, alloc, "SELECT id FROM t WHERE g = 7");
+        defer r1.deinit();
+        const hits = r1.rows.len;
+        try std.testing.expect(hits > 0);
+        try std.testing.expectEqual(@as(u64, 0), eng.get("t").?.table.scan_rows_read);
+
+        // DROP 之后：结果一致，但**退回全表**（必须真的扫主表，证明索引已被摘除）
+        {
+            var p = try sql.parse(alloc, "DROP INDEX idx_g");
+            defer p.deinit();
+            const res = try eng.execute(p.stmt, alloc);
+            try std.testing.expectEqual(true, res.dropped);
+        }
+        eng.get("t").?.table.scan_rows_read = 0;
+        var r2 = try queryRows(&eng, alloc, "SELECT id FROM t WHERE g = 7");
+        defer r2.deinit();
+        try std.testing.expectEqual(hits, r2.rows.len);
+        try std.testing.expect(eng.get("t").?.table.scan_rows_read > 0);
+
+        // IF EXISTS：删一个不存在的索引不报错；不带 IF EXISTS 必须报 IndexNotFound
+        {
+            var p = try sql.parse(alloc, "DROP INDEX IF EXISTS nope");
+            defer p.deinit();
+            const res = try eng.execute(p.stmt, alloc);
+            try std.testing.expectEqual(false, res.dropped);
+        }
+        {
+            var p = try sql.parse(alloc, "DROP INDEX nope");
+            defer p.deinit();
+            try std.testing.expectError(error.IndexNotFound, eng.execute(p.stmt, alloc));
+        }
+
+        // 再建一次：回填后查询又走索引（证明「删掉再建」不是一次性状态）
+        try run(&eng, alloc, "CREATE INDEX idx_g ON t (g)");
+        eng.get("t").?.table.scan_rows_read = 0;
+        var r3 = try queryRows(&eng, alloc, "SELECT id FROM t WHERE g = 7");
+        defer r3.deinit();
+        try std.testing.expectEqual(hits, r3.rows.len);
+        try std.testing.expectEqual(@as(u64, 0), eng.get("t").?.table.scan_rows_read);
+
+        dropped_ok = true;
+    }
+    try std.testing.expect(dropped_ok);
+
+    // 重开：最后一次「再建」必须已经落盘 ⇒ 索引存在，且查询走索引
+    {
+        var eng = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+        defer eng.deinit();
+        try std.testing.expect(eng.get("t").?.schema.findIndex("idx_g") != null);
+        eng.get("t").?.table.scan_rows_read = 0;
+        var r = try queryRows(&eng, alloc, "SELECT id FROM t WHERE g = 7");
+        defer r.deinit();
+        try std.testing.expect(r.rows.len > 0);
+        try std.testing.expectEqual(@as(u64, 0), eng.get("t").?.table.scan_rows_read);
     }
 }
 

@@ -804,6 +804,61 @@ fn main() -> rusqlite::Result<()> {
                     println!("sql_where_orderby_index10_digest,{},{}", got_rows, digest);
                     println!("sql_where_orderby_index10_med_us,{},{:.1}", REPS, med * 1e6);
                 }
+
+                // JOIN：左表 1 万行 × 右表 1 千行（ON 列建索引），128 次取中位。
+                // 与 Zig 侧 `sql_join_index` 完全同一个形状、同一条 SQL。
+                {
+                    ca.execute_batch(
+                        "CREATE TABLE bench_l (id INTEGER PRIMARY KEY, g INTEGER NOT NULL, x INTEGER NOT NULL);
+                         CREATE TABLE bench_r (id INTEGER PRIMARY KEY, k INTEGER NOT NULL, y INTEGER NOT NULL)",
+                    )?;
+                    ca.execute_batch("BEGIN")?;
+                    {
+                        let mut st = ca.prepare("INSERT INTO bench_l (id, g, x) VALUES (?1, ?2, ?3)")?;
+                        for id in 0..10_000i64 {
+                            st.execute(rusqlite::params![id, id % 1000, id % 1000])?;
+                        }
+                    }
+                    {
+                        let mut st = ca.prepare("INSERT INTO bench_r (id, k, y) VALUES (?1, ?2, ?3)")?;
+                        for id in 0..1000i64 {
+                            st.execute(rusqlite::params![id, id, id])?;
+                        }
+                    }
+                    ca.execute_batch("COMMIT")?;
+                    ca.execute_batch("CREATE INDEX idx_r_k ON bench_r(k)")?;
+
+                    let mut stmt = ca.prepare(
+                        "SELECT bench_l.id, bench_l.x, bench_r.y FROM bench_l JOIN bench_r ON bench_l.g = bench_r.k",
+                    )?;
+                    const REPS: usize = 128;
+                    let mut samples: Vec<(f64, usize)> = Vec::with_capacity(REPS);
+                    let mut got_rows: usize = 0;
+                    let mut digest: i64 = 0;
+                    for _ in 0..REPS {
+                        let t0 = Instant::now();
+                        let mut n: usize = 0;
+                        let mut d: i64 = 0;
+                        {
+                            let mut rows = stmt.query([])?;
+                            while let Some(r) = rows.next()? {
+                                d = d
+                                    .wrapping_add(r.get::<_, i64>(0)?.wrapping_mul(31))
+                                    .wrapping_add(r.get::<_, i64>(2)?);
+                                n += 1;
+                            }
+                        }
+                        samples.push((t0.elapsed().as_secs_f64(), n));
+                        got_rows += n;
+                        digest = digest.wrapping_add(d);
+                    }
+                    samples.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    let (med, n) = samples[REPS / 2];
+                    println!("sql_join_index,{},{}", n, n as f64 / med);
+                    println!("sql_join_index_rows,{},0", got_rows);
+                    println!("sql_join_index_digest,{},{}", got_rows, digest);
+                    println!("sql_join_index_med_us,{},{:.1}", REPS, med * 1e6);
+                }
             }
         }
         drop(c3);

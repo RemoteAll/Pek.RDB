@@ -237,6 +237,21 @@ const ScanCursor = union(enum) {
         }
     }
 
+    /// 换查询区间重新开始（复用已建的段游标）。
+    /// memtable 游标只能重建迭代器（skiplist 没有 seek 复用），但它不分配，照样便宜。
+    fn reset(self: *ScanCursor, table: *Table, start: []const u8, end: []const u8) void {
+        switch (self.*) {
+            .mem => |*m| {
+                m.* = .{
+                    .it = table.mem.iteratorFrom(start),
+                    .end = end,
+                    .snapshot = table.visible,
+                };
+            },
+            .seg => |*s| s.reset(start, end),
+        }
+    }
+
     fn useStableKeys(self: *ScanCursor, arena: ?*segmod.KeyArena) void {
         switch (self.*) {
             .mem => {},
@@ -1891,6 +1906,8 @@ pub const MergeIter = struct {
     /// `next()` 返回 null 后由调用方检查并报 `error.SegmentCorrupt` ——
     /// 把「解不出来」当「读完了」会让扫描静默少返回行。
     corrupt: bool = false,
+    /// 是否已经 `init` 过（`reset` 的前提）。`deinit` 会清掉。
+    live: bool = false,
 
     /// 归并结束后汇总：任一游标出过错就置 `corrupt`（只读一次字段，不在热循环里）。
     fn collectCorrupt(self: *MergeIter) void {
@@ -1935,6 +1952,9 @@ pub const MergeIter = struct {
     }
 
     /// 段游标的公共构造：裁剪判定 + 建游标 + 稳定 key 模式。
+    ///
+    /// `prune = false` 时**不按区间裁段** —— 这是给「游标复用」用的：`MergeIter.reset`
+    /// 会把同一批游标指向**另一个区间**，而被裁掉的段在新区间里可能正好命中。
     fn addSegCursor(
         self: *MergeIter,
         table: *Table,
@@ -1942,6 +1962,7 @@ pub const MergeIter = struct {
         start: []const u8,
         end: []const u8,
         arena: ?*segmod.KeyArena,
+        prune: bool,
         pruned_before: *usize,
     ) !void {
         // **反向段裁剪**（§16.1.23）：段内最大 key 都小于查询起点 → 整段不可能命中。
@@ -1952,7 +1973,7 @@ pub const MergeIter = struct {
         // 收益不只在大表：`s.cursor()` 里每段都要 `ensureParsed()`（整段 CRC）+
         // `dataView()`（open + mmap，平台成本 ~0.3ms/段）。冷重开后的窄范围查询
         // 以前要为「一行都不命中」的段付这笔钱，现在是零。
-        if (start.len > 0 and !table.opts.no_prune_before) {
+        if (prune and start.len > 0 and !table.opts.no_prune_before) {
             if (s.maxKey()) |k1| {
                 if (segmod.keyCmp(k1, start) == .lt) {
                     pruned_before.* += 1;
@@ -1965,7 +1986,7 @@ pub const MergeIter = struct {
         //
         // 实测背景：200 万行、25 段时纯遍历只有 7.26M 行/s，而单段表能到 11–17M；
         // 顺序写入的段 key 范围几乎不重叠，这一刀能砍掉大部分路数。
-        if (end.len > 0) {
+        if (prune and end.len > 0) {
             // 用 `firstKey()`（段头部就有，不需要 `ensureParsed`）——
             // 冷重开只解析头部，裁剪判定的信息已经够了。
             if (s.firstKey()) |k0| {
@@ -1986,7 +2007,27 @@ pub const MergeIter = struct {
         arena: ?*segmod.KeyArena,
         only: ?[]const usize,
     ) !void {
-        self.* = .{ .table = table };
+        try self.initStablePrune(table, start, end, arena, only, true);
+    }
+
+    /// **建一份可以反复 `reset` 的游标集**：不按区间裁段，保证任何区间的扫描都能命中。
+    ///
+    /// JOIN 的右表查找每次区间都不同（每行一个前缀），若第一次按区间裁了段，
+    /// 后续区间里本该命中的段就永远找不回来 —— 实测表现为 JOIN 少返回行。
+    pub fn initNoPrune(self: *MergeIter, table: *Table) !void {
+        try self.initStablePrune(table, &[_]u8{}, &[_]u8{}, null, null, false);
+    }
+
+    fn initStablePrune(
+        self: *MergeIter,
+        table: *Table,
+        start: []const u8,
+        end: []const u8,
+        arena: ?*segmod.KeyArena,
+        only: ?[]const usize,
+        prune: bool,
+    ) !void {
+        self.* = .{ .table = table, .live = true };
         const alloc = table.alloc;
         var pruned_before: usize = 0;
         // init 中途失败时要自己清干净：调用方是在 init 成功后才注册 defer deinit 的
@@ -2013,10 +2054,12 @@ pub const MergeIter = struct {
             } });
         }
         if (only) |idxs| {
-            for (idxs) |si| try self.addSegCursor(table, &table.segs.items[si], start, end, arena, &pruned_before);
+            for (idxs) |si| try self.addSegCursor(table, &table.segs.items[si], start, end, arena, prune, &pruned_before);
         } else {
-            for (table.segs.items) |*s| try self.addSegCursor(table, s, start, end, arena, &pruned_before);
+            for (table.segs.items) |*s| try self.addSegCursor(table, s, start, end, arena, prune, &pruned_before);
         }
+        // 顺序拼接的前提是「段 key 范围两两不重叠」，裁剪并不会破坏它；
+        // 但 `prune = false`（可复用游标）时仍可拼接 —— 拼接只看段间是否重叠。
         if (only == null and self.cursors.items.len > 1 and canConcat(table)) {
             // 顺序拼接：段 key 范围两两不重叠且有序 → 按段依次耗尽游标。
             // §16.1.21 实测：25 路归并每行 2 次比较 + 一次跨游标间接调用，
@@ -2089,6 +2132,7 @@ pub const MergeIter = struct {
     }
 
     pub fn deinit(self: *MergeIter) void {
+        self.live = false;
         if (self.cur.len > 0) self.table.alloc.free(self.cur);
         if (self.heap.len > 0) self.table.alloc.free(self.heap);
         // **只能 free `last_heap`**：`last_buf` 可能指向结构体内的 `last_inline`（free 它是 UB）
@@ -2096,6 +2140,40 @@ pub const MergeIter = struct {
         for (self.cursors.items) |*c| c.deinit(self.table.alloc);
         self.cursors.deinit(self.table.alloc);
         self.table.merge_compares_total += self.compares;
+    }
+
+    /// 复用已建游标，换一个查询区间重新开始。
+    ///
+    /// **为什么需要**：JOIN 的右表查找对**每一行**都要扫一次索引前缀（1 万行 = 1 万次），
+    /// 而 `init` 每次都重建每个段游标（`dataView` = open + mmap、`RecIter.init` = 2 次分配）。
+    /// 实测：1 万行 JOIN 13.9 ms，而 SQLite 同一条 SQL 2.4 ms —— 大头就是这 1 万次重建。
+    ///
+    /// 前提：同一张表、同样的段集合（区间可以变）。若 `live == false` 或表不一致，
+    /// 返回 `false` 让调用方回退到 `init`（宁可慢一点，也不要归并错段）。
+    pub fn reset(self: *MergeIter, table: *Table, start: []const u8, end: []const u8) bool {
+        if (!self.live or self.table != table) return false;
+        self.corrupt = false;
+        self.have_last = false;
+        self.compares = 0;
+        self.concat_i = 0;
+        for (self.cursors.items) |*c| c.reset(table, start, end);
+        if (self.cursors.items.len <= 1 or self.concat) return true;
+        // 堆模式：重读每条游标的第一条，再整堆重排
+        self.heap_len = 0;
+        for (self.cursors.items, 0..) |*c, i| {
+            self.cur[i] = c.next();
+            if (self.cur[i] == null) continue;
+            self.heap[self.heap_len] = i;
+            self.heap_len += 1;
+        }
+        if (self.heap_len > 1) {
+            var i = self.heap_len / 2;
+            while (i > 0) {
+                i -= 1;
+                self.siftDown(i);
+            }
+        }
+        return true;
     }
 
     pub fn next(self: *MergeIter) ?segmod.Segment.RefRecord {

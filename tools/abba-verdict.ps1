@@ -74,6 +74,9 @@ $pairs = @(
     # bound and the order, so both sides stop after 10 rows. This is the item that used to fall
     # back to a full table scan on our side (no WHERE support on the index-order path).
     @('sql_where_orderby_index10', 'sql_where_orderby_index10', $true),
+    # JOIN: same two tables on both sides, same INNER JOIN, same index on the ON column,
+    # 128 reps median with the statement prepared outside the timed region.
+    @('sql_join_index', 'sql_join_index', $true),
     # Index build time is a one-shot latency-like metric (milliseconds, lower is better).
     @('sql_index_build', 'sql_index_build', $false),
     # The three items below are per-row writes on our side vs a single transaction on SQLite (its

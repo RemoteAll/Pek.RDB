@@ -232,6 +232,12 @@ pub const CreateIndex = struct {
     column: []const u8,
 };
 
+/// `DROP INDEX [IF EXISTS] name` —— 删除已建索引（不写表名，与 SQLite 一致）。
+pub const DropIndex = struct {
+    if_exists: bool = false,
+    name: []const u8,
+};
+
 pub const Value = union(enum) {
     null,
     integer: i64,
@@ -352,6 +358,7 @@ pub const Delete = struct {
 pub const Statement = union(enum) {
     create_table: CreateTable,
     create_index: CreateIndex,
+    drop_index: DropIndex,
     insert: Insert,
     select: Select,
     update: Update,
@@ -894,7 +901,20 @@ const Parser = struct {
         if (isKw(self.tok, "select")) return self.parseSelect();
         if (isKw(self.tok, "update")) return self.parseUpdate();
         if (isKw(self.tok, "delete")) return self.parseDelete();
+        if (isKw(self.tok, "drop")) return self.parseDropIndex();
         return error.UnsupportedStatement;
+    }
+
+    fn parseDropIndex(self: *Parser) Error!Statement {
+        try self.expectKw("drop");
+        try self.expectKw("index");
+        var if_exists = false;
+        if (try self.acceptKw("if")) {
+            try self.expectKw("exists");
+            if_exists = true;
+        }
+        const name = try self.parseIdent();
+        return .{ .drop_index = .{ .if_exists = if_exists, .name = name } };
     }
 
     fn parseCreateIndex(self: *Parser) Error!Statement {

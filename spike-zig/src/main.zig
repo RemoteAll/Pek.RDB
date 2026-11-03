@@ -15,6 +15,17 @@ fn nowNs(io: std.Io) u64 {
     return @intCast(ts.nanoseconds);
 }
 
+/// 解析 + 执行一条 SQL（基准里建表/灌数用；结果若是 `rows` 立刻释放）。
+fn runSql(eng: *spike.engine.Engine, alloc: std.mem.Allocator, text: []const u8) !void {
+    var p = try spike.sql.parse(alloc, text);
+    defer p.deinit();
+    var res = try eng.execute(p.stmt, alloc);
+    switch (res) {
+        .rows => |*rows| rows.deinit(),
+        else => {},
+    }
+}
+
 /// **裸文件写探针**：完全不经过引擎，只做「建文件 → 分块写 → 每块 fsync」。
 ///
 /// 存在的理由：审计发现同一份配置、同一数据量的 `big_put` 与 `b8_put` 在同一轮里能差 4×
@@ -1033,6 +1044,86 @@ fn benchMain() !void {
                     std.debug.print("sql_where_orderby_index10_digest,{d},{d}\n", .{ got_rows, digest });
                     std.debug.print("sql_where_orderby_index10_med_us,{d},{d:.1}\n", .{ reps, @as(f64, @floatFromInt(med)) / 1000.0 });
                     std.debug.print("sql_where_orderby_index10_readrows,{d},0\n", .{t5.scan_rows_read});
+                }
+
+                // JOIN：左表 1 万行 × 右表 1 千行（ON 列建索引），128 次取中位。
+                // 与 SQLite 同一条 SQL、同形状数据、同样给 ON 列建索引 ——
+                // 这是「实现了但一直没和 SQLite 对过」的那一项。
+                {
+                    const jroot = "bench-join-db";
+                    dir.deleteTree(io, jroot) catch {};
+                    defer dir.deleteTree(io, jroot) catch {};
+
+                    var jeng = try spike.engine.Engine.open(io, dir, jroot, alloc, .{ .table = .{ .wal_sync_every = 10_000 } });
+                    defer jeng.deinit();
+
+                    try runSql(&jeng, alloc, "CREATE TABLE bench_l (id INTEGER PRIMARY KEY, g INTEGER NOT NULL, x INTEGER NOT NULL)");
+                    try runSql(&jeng, alloc, "CREATE TABLE bench_r (id INTEGER PRIMARY KEY, k INTEGER NOT NULL, y INTEGER NOT NULL)");
+                    // 左 1 万行（g = id % 1000）、右 1 千行（k = id，唯一）⇒ 内连接结果 1 万行
+                    {
+                        var ji: i64 = 0;
+                        while (ji < 10_000) : (ji += 50) {
+                            var sb: std.ArrayList(u8) = .empty;
+                            defer sb.deinit(alloc);
+                            try sb.appendSlice(alloc, "INSERT INTO bench_l (id, g, x) VALUES ");
+                            var j: i64 = 0;
+                            while (j < 50) : (j += 1) {
+                                const id = ji + j;
+                                try sb.appendSlice(alloc, if (j == 0) "" else ", ");
+                                var num: [64]u8 = undefined;
+                                try sb.appendSlice(alloc, try std.fmt.bufPrint(&num, "({d}, {d}, {d})", .{ id, @mod(id, 1000), @mod(id, 1000) }));
+                            }
+                            try runSql(&jeng, alloc, sb.items);
+                        }
+                    }
+                    {
+                        var ri: i64 = 0;
+                        while (ri < 1000) : (ri += 50) {
+                            var sb: std.ArrayList(u8) = .empty;
+                            defer sb.deinit(alloc);
+                            try sb.appendSlice(alloc, "INSERT INTO bench_r (id, k, y) VALUES ");
+                            var j: i64 = 0;
+                            while (j < 50) : (j += 1) {
+                                const id = ri + j;
+                                try sb.appendSlice(alloc, if (j == 0) "" else ", ");
+                                var num: [64]u8 = undefined;
+                                try sb.appendSlice(alloc, try std.fmt.bufPrint(&num, "({d}, {d}, {d})", .{ id, id, id }));
+                            }
+                            try runSql(&jeng, alloc, sb.items);
+                        }
+                    }
+                    try runSql(&jeng, alloc, "CREATE INDEX idx_r_k ON bench_r (k)");
+
+                    const join_sql = "SELECT bench_l.id, bench_l.x, bench_r.y FROM bench_l JOIN bench_r ON bench_l.g = bench_r.k";
+                    var jp = try spike.sql.parse(alloc, join_sql);
+                    defer jp.deinit();
+
+                    const jreps: usize = 128;
+                    var samples = try alloc.alloc(u64, jreps);
+                    defer alloc.free(samples);
+                    var got_rows: usize = 0;
+                    var digest: i64 = 0;
+                    var r: usize = 0;
+                    while (r < jreps) : (r += 1) {
+                        const t0 = nowNs(io);
+                        var res = try jeng.execute(jp.stmt, alloc);
+                        samples[r] = nowNs(io) - t0;
+                        switch (res) {
+                            .rows => |*rows| {
+                                got_rows += rows.rows.len;
+                                for (rows.rows) |row| digest +%= row[0].integer *% 31 +% row[2].integer;
+                                rows.deinit();
+                            },
+                            else => return error.UnexpectedResult,
+                        }
+                    }
+                    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+                    const med = samples[jreps / 2];
+                    const per = got_rows / jreps;
+                    std.debug.print("sql_join_index,{d},{d:.0}\n", .{ per, opsPerSec(@intCast(per), med) });
+                    std.debug.print("sql_join_index_rows,{d},0\n", .{got_rows});
+                    std.debug.print("sql_join_index_digest,{d},{d}\n", .{ got_rows, digest });
+                    std.debug.print("sql_join_index_med_us,{d},{d:.1}\n", .{ jreps, @as(f64, @floatFromInt(med)) / 1000.0 });
                 }
             }
         }

@@ -75,6 +75,7 @@ fn indexCollect(
     alloc: std.mem.Allocator,
     owned: *std.ArrayList([]u8),
     max: ?usize,
+    reuse: ?*tablemod.MergeIter,
 ) !void {
     if (isNullValue(want)) return; // `= NULL` 永远不匹配
     const itbl = host.onColumn(column_idx) orelse return error.ColumnNotFound;
@@ -89,9 +90,25 @@ fn indexCollect(
     var vbuf: std.ArrayList(u8) = .empty;
     defer vbuf.deinit(alloc);
 
-    var it = tablemod.MergeIter{};
-    try it.init(itbl, prefix, hi);
-    defer it.deinit();
+    // 游标可复用：JOIN 对右表的**每一行**都要扫一次索引前缀（1 万行 = 1 万次），
+    // 而 `init` 每次都重建段的 `dataView`（open + mmap）与 `RecIter`（2 次分配）——
+    // 实测这一项把 1 万行 JOIN 拖到 13.9 ms（SQLite 同 SQL 2.4 ms）。
+    var local_it = tablemod.MergeIter{};
+    defer if (local_it.live) local_it.deinit();
+    const it: *tablemod.MergeIter = blk: {
+        if (reuse) |r| {
+            if (!r.reset(itbl, prefix, hi)) {
+                if (r.live) r.deinit();
+                // **不裁段**：同一个游标要被指向成千上万个不同区间，裁剪是按区间做的，
+                // 裁掉一次就再也找不回来（实测会让 JOIN 少返回行）。
+                try r.initNoPrune(itbl);
+                _ = r.reset(itbl, prefix, hi);
+            }
+            break :blk r;
+        }
+        try local_it.init(itbl, prefix, hi);
+        break :blk &local_it;
+    };
 
     while (it.next()) |rec| {
         // 前缀不匹配就停：脏项、以及上界为「无上界」时的越界都靠这一句兜住
@@ -108,6 +125,77 @@ fn indexCollect(
         }
     }
     // 索引表损坏 ⇒ 候选集会静默变少（漏行）。`break` 是前缀越界（正常），不查。
+    if (it.corrupt) return error.SegmentCorrupt;
+}
+
+/// 按索引列出「列 `<op>` want」的候选行值（**范围扫描**，已回表复核）。
+///
+/// 索引键 = `值分量 ++ 主键分量`，而值分量「顺序保持 + 自定界」⇒ 范围谓词就是一段键区间：
+///
+/// | 谓词 | 扫描区间 |
+/// |---|---|
+/// | `>  v` | `[upperBound(v分量), ∞)` —— 跳过整个「= v」前缀（同值所有主键都 ≤ 上界） |
+/// | `>= v` | `[v分量, ∞)` |
+/// | `<  v` | `(−∞, v分量)` |
+/// | `<= v` | `(−∞, upperBound(v分量))` |
+///
+/// 上界是**排他**的（`MergeIter` 的 `end` 语义），所以 `<=` 必须用 `upperBound`。
+/// `!=` 无法用一段区间表达，直接拒掉（调用方不会送来）。
+///
+/// 主键用 `indexPkSlice` 切而不是按 `comp.len` 切：**范围扫描里的值分量长度可能各不相同**
+/// （text 列 `"a"` 与 `"aaaa"` 编码长度不同），按本行谓词的长度切会切错。
+fn indexCollectRange(
+    host: *const IndexHost,
+    t: *tablemod.Table,
+    s: *const schema_mod.Schema,
+    column_idx: usize,
+    op: sql.CmpOp,
+    want: sql.Value,
+    alloc: std.mem.Allocator,
+    owned: *std.ArrayList([]u8),
+    max: ?usize,
+) !void {
+    if (isNullValue(want)) return; // 与 NULL 比较恒不匹配
+    const itbl = host.onColumn(column_idx) orelse return error.ColumnNotFound;
+
+    const comp = try s.encodeValueComponent(alloc, column_idx, want);
+    defer alloc.free(comp);
+    const hi = try prefixUpperBound(alloc, comp);
+    defer alloc.free(hi);
+
+    var start: []const u8 = &.{};
+    var end: []const u8 = &.{};
+    switch (op) {
+        .gt => start = hi,
+        .ge => start = comp,
+        .lt => end = comp,
+        .le => end = hi,
+        .eq, .ne => return error.UnsupportedStatement,
+    }
+
+    const row_vals = try alloc.alloc(sql.Value, s.columns.len);
+    defer alloc.free(row_vals);
+    var vbuf: std.ArrayList(u8) = .empty;
+    defer vbuf.deinit(alloc);
+
+    var it = tablemod.MergeIter{};
+    try it.init(itbl, start, end);
+    defer it.deinit();
+
+    while (it.next()) |rec| {
+        const pk = try indexPkSlice(s, column_idx, rec.key);
+        const raw = (try t.get(pk, &vbuf)) orelse continue; // 行已删 → 脏项
+        try s.decodeRowInto(row_vals, raw);
+        // **回表复核**：索引项可能过期（更新/删除的中间态），必须重判谓词
+        if (!evalWhere(row_vals[column_idx], op, want)) continue;
+        const copy = try alloc.dupe(u8, raw);
+        errdefer alloc.free(copy);
+        try owned.append(alloc, copy);
+        if (max) |m| {
+            if (owned.items.len >= m) return;
+        }
+    }
+    // 索引表损坏 ⇒ 候选集会静默变少（漏行）
     if (it.corrupt) return error.SegmentCorrupt;
 }
 
@@ -273,7 +361,11 @@ fn evalWhere(a: sql.Value, op: sql.CmpOp, b: sql.Value) bool {
     // **与 NULL 比较恒不匹配**（SQL 的 UNKNOWN）。`valueCmp` 把 NULL 当作「比任何值都小」，
     // 直接拿它比较会让 `WHERE x >= NULL` 变成「全部行」——语义错，而且会让
     // 「走索引 / 走全表」两条路径给出不同结果（索引键里根本不收 NULL）。
-    if (isNullValue(b)) return false;
+    //
+    // **两侧都要判**：只判 `b` 时，`x < 5` / `x <= 5` / `x <> 5` 对 NULL 行会返回 true
+    // （因为 `valueCmp(NULL, 5) == .lt`），而索引路径根本不收 NULL ⇒ 同一句 SQL
+    // 「走索引 / 走全表」条数不同。2026-11-03 审计抓到的这一类分歧。
+    if (isNullValue(a) or isNullValue(b)) return false;
     const ord = schema_mod.valueCmp(a, b);
     return switch (op) {
         .eq => ord == .eq,
@@ -579,6 +671,9 @@ fn joinLookup(
     alloc: std.mem.Allocator,
     a: std.mem.Allocator,
     out: *std.ArrayList([]sql.Value),
+    /// 可复用的索引扫描游标（整个 JOIN 共一个）：右表要对左表每一行查一次，
+    /// 不复用的话 1 万行就要重建 1 万次段游标（实测把 JOIN 拖到 SQLite 的 5.7 倍慢）。
+    reuse: ?*tablemod.MergeIter,
 ) !void {
     if (isNullValue(want)) return; // `= NULL` 永远无匹配（与 WHERE 同口径）
     const nb = rt.schema.columns.len;
@@ -602,7 +697,7 @@ fn joinLookup(
                 for (owned.items) |x| alloc.free(x);
                 owned.deinit(alloc);
             }
-            try indexCollect(h, rt.table, rt.schema, col_idx, want, alloc, &owned, null);
+            try indexCollect(h, rt.table, rt.schema, col_idx, want, alloc, &owned, null, reuse);
             for (owned.items) |raw| try appendDupRow(rt.schema, raw, alloc, a, out, nb);
             return;
         }
@@ -631,6 +726,141 @@ fn dupValue(a: std.mem.Allocator, v: sql.Value) !sql.Value {
         .blob => |x| .{ .blob = try a.dupe(u8, x) },
         else => v,
     };
+}
+
+/// 哈希连接的内存上限（右表行数）：超过就走索引/点查的嵌套循环。
+///
+/// 右表每行要在内存里留一份解码后的行（`nb × 16B`）+ 一条链节点 + 一份键，
+/// 20 万行 × 3 列 ≈ 10 MB —— 再大就该交给索引路径，而不是把整表塞进内存。
+/// `pub var` 是为了让用例能把它设成 0 去覆盖嵌套循环的兵底路径。
+pub var join_hash_max_rows: usize = 200_000;
+
+/// 「建哈希」与「按行查索引」的交叉点：左表行数 × 4 还不足以覆盖右表行数时，
+/// 建一次全表哈希反而更贵（例：左 1 行 / 右 10 万行 ⇒ 哈希要解 10 万行，索引探测只要 1 次）。
+const join_hash_min_left_ratio: usize = 4;
+
+/// 右表行数估算（memtable + 各段行数），只用来决定走不走哈希连接，不参与正确性。
+fn rowEstimate(t: *tablemod.Table) usize {
+    var n: usize = @intCast(t.mem.len());
+    for (t.segs.items) |s| n +|= @as(usize, @intCast(s.rows));
+    return n;
+}
+
+/// 一个分组：右表里键相同的全部行，按**右表扫描顺序**串成链。
+const HashGroup = struct { head: u32 = no_entry, tail: u32 = no_entry };
+const no_entry: u32 = std.math.maxInt(u32);
+const HashEntry = struct { next: u32 = no_entry, row: []sql.Value };
+
+/// JOIN 的**哈希连接**侧：右表整表扫一遍建「键 → 行链」，左表每行 O(1) 探测。
+///
+/// **为什么必须有这条路径**：等值 JOIN 原来的做法是「左表每行查一次右表」
+/// （索引前缀扫描 / 主键点查 / 全表扫）。实测本引擎的单次点查就要 ~1.9 µs
+/// （`sql_get` 521k 次/s），所以 1 万行 JOIN 无论怎么"复用游标"都卡在 12.5 ms 以上，
+/// 而 SQLite 同一条 SQL 是 2.4 ms。要做的是**根本不按行查**，不是把单次查得更快。
+///
+/// 键的规范化口径与 `valueCmp` 对齐：整数与实数是**同一个数值空间**（都按 f64 比较），
+/// 所以 `1` 与 `1.0` 落同一个桶；text/blob 按字节。命中后仍用 `valueCmp` 复核一次，
+/// 保证「哈希判等」永远是 `valueCmp` 判等的充分条件而不是替代品。
+const JoinHash = struct {
+    map: std.StringHashMapUnmanaged(HashGroup) = .empty,
+    entries: std.ArrayList(HashEntry) = .empty,
+
+    fn build(
+        self: *JoinHash,
+        rt: JoinedTable,
+        col_idx: usize,
+        alloc: std.mem.Allocator,
+        a: std.mem.Allocator,
+    ) !void {
+        const nb = rt.schema.columns.len;
+        const vals = try alloc.alloc(sql.Value, nb);
+        defer alloc.free(vals);
+        var kbuf: std.ArrayList(u8) = .empty;
+        defer kbuf.deinit(alloc);
+        var it = tablemod.MergeIter{};
+        try it.init(rt.table, &[_]u8{}, &[_]u8{});
+        defer it.deinit();
+        while (it.next()) |rec| {
+            try rt.schema.decodeRowInto(vals, rec.value);
+            if (isNullValue(vals[col_idx])) continue; // `= NULL` 永不匹配
+            const kb = try hashKeyInto(alloc, &kbuf, vals[col_idx]);
+            const gop = try self.map.getOrPut(alloc, kb);
+            if (!gop.found_existing) {
+                // 键拷进 arena（生命周期同结果集），map 的桶由 `alloc` 管
+                gop.key_ptr.* = try a.dupe(u8, kb);
+                gop.value_ptr.* = .{};
+            }
+            const row = try a.alloc(sql.Value, nb);
+            for (vals, row) |v, *dst| dst.* = try dupValue(a, v);
+            if (gop.value_ptr.tail != no_entry) {
+                self.entries.items[gop.value_ptr.tail].next = @intCast(self.entries.items.len);
+            } else {
+                gop.value_ptr.head = @intCast(self.entries.items.len);
+            }
+            gop.value_ptr.tail = @intCast(self.entries.items.len);
+            try self.entries.append(alloc, .{ .row = row });
+        }
+        if (it.corrupt) return error.SegmentCorrupt;
+    }
+
+    /// 把 `want` 命中的右表行**按右表顺序**追加进 `out`（行本就住在 arena 里，无需再拷）。
+    fn probe(
+        self: *JoinHash,
+        col_idx: usize,
+        want: sql.Value,
+        alloc: std.mem.Allocator,
+        a: std.mem.Allocator,
+        kbuf: *std.ArrayList(u8),
+        out: *std.ArrayList([]sql.Value),
+    ) !void {
+        if (isNullValue(want)) return;
+        const kb = try hashKeyInto(alloc, kbuf, want);
+        const g = self.map.get(kb) orelse return;
+        var e = g.head;
+        while (e != no_entry) {
+            const ent = self.entries.items[e];
+            // 复核：哈希只是「可能相等」，判等一律以 `valueCmp` 为准
+            if (schema_mod.valueCmp(ent.row[col_idx], want) == .eq) try out.append(a, ent.row);
+            e = ent.next;
+        }
+    }
+
+    fn deinit(self: *JoinHash, alloc: std.mem.Allocator) void {
+        self.map.deinit(alloc); // 键在 arena 里，这里只释放桶
+        self.entries.deinit(alloc);
+    }
+};
+
+/// 哈希键：数值统一走 f64（与 `valueCmp` 的数值比较口径一致），text/blob 走字节。
+/// 写进调用方的复用缓冲，返回值只在下次调用前有效。
+fn hashKeyInto(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), v: sql.Value) ![]const u8 {
+    buf.clearRetainingCapacity();
+    switch (v) {
+        .null => try buf.append(alloc, 0),
+        .integer, .real => {
+            try buf.append(alloc, 'n');
+            var f: f64 = switch (v) {
+                .integer => |x| @floatFromInt(x),
+                .real => |x| x,
+                else => unreachable,
+            };
+            if (f == 0) f = 0; // -0.0 与 +0.0 必须同桶（`valueCmp` 判等）
+            var bits: u64 = @bitCast(f);
+            bits = if ((bits >> 63) != 0) ~bits else bits | 0x8000_0000_0000_0000;
+            var b: [8]u8 = undefined;
+            std.mem.writeInt(u64, &b, bits, .big);
+            try buf.appendSlice(alloc, &b);
+        },
+        .text => |s| {
+            try buf.append(alloc, 't');
+            try buf.appendSlice(alloc, s);
+        },
+        .blob => |s| {
+            try buf.append(alloc, 'b');
+            try buf.appendSlice(alloc, s);
+        },
+    }
+    return buf.items;
 }
 
 fn appendDupRow(
@@ -692,10 +922,27 @@ pub fn selectJoin(
     var it = tablemod.MergeIter{};
     try it.init(left.table, &[_]u8{}, &[_]u8{});
     defer it.deinit();
+    // 右表索引查找共用**一个**扫描游标：JOIN 对左表每一行都要查一次右表，
+    // 每行都重建段游标（open + mmap + 2 次分配）会把这条路径拖成 SQLite 的 5 倍慢。
+    var rscan: tablemod.MergeIter = .{};
+    defer if (rscan.live) rscan.deinit();
+    // **哈希连接**（右表放得进内存就一律走它）：整表建一次哈希，左表每行 O(1) 探测。
+    // 嵌套循环（下面 `joinLookup`）只在小表以外/内存受限时兜底。
+    var jh: JoinHash = .{};
+    defer jh.deinit(alloc);
+    const jr = rowEstimate(right.table);
+    const use_hash = jr <= join_hash_max_rows and rowEstimate(left.table) * join_hash_min_left_ratio >= jr;
+    if (use_hash) try jh.build(right, rcol, alloc, a);
+    var kbuf: std.ArrayList(u8) = .empty;
+    defer kbuf.deinit(alloc);
     while (it.next()) |rec| {
         try left.schema.decodeRowInto(lvals, rec.value);
         matches.clearRetainingCapacity();
-        try joinLookup(right, rcol, lvals[lcol], alloc, a, &matches);
+        if (use_hash) {
+            try jh.probe(rcol, lvals[lcol], alloc, a, &kbuf, &matches);
+        } else {
+            try joinLookup(right, rcol, lvals[lcol], alloc, a, &matches, &rscan);
+        }
         if (matches.items.len == 0) {
             if (jc.kind == .left) {
                 const row = try a.alloc(sql.Value, na + nb);
@@ -1129,7 +1376,35 @@ pub fn selectRowsHost(
                             const l = sel.limit orelse break :blk null;
                             break :blk @as(usize, sel.offset orelse 0) + @as(usize, l);
                         } else null;
-                        try indexCollect(h, t, s, ci, w.value, alloc, &owned, max);
+                        try indexCollect(h, t, s, ci, w.value, alloc, &owned, max, null);
+                        return finishFromValues(t.io, s, sel, alloc, owned.items);
+                    }
+                }
+            }
+        }
+    }
+
+    // 二级索引范围：`WHERE <已建索引的列> <op> 常量 LIMIT k`（无 ORDER BY）→ 只扫命中那段键区间。
+    //
+    // **为什么限定「有 LIMIT 且无 ORDER BY」**：范围谓词的结果集大小事先未知。
+    // `WHERE g > 50000` 在 100 万行均匀数据上命中 50 万行 —— 走索引要 50 万次回表，
+    // 比顺序全表扫**慢**；而 `... LIMIT 10` 只需从区间起点取 10 条就停，快几个数量级。
+    // 有 ORDER BY 时结果必须全量物化，同理不走索引。
+    //
+    // 可空列**不需要**闸门：`x > 5` 对 NULL 是 UNKNOWN（不匹配），而索引本来就不收 NULL ——
+    // 两侧语义一致（与 `ORDER BY <可空索引列>` 那种「漏掉 NULL 就排错」的情形不同）。
+    if (host) |h| {
+        if (sel.where) |w| {
+            if (sel.order_by.len == 0 and sel.limit != null and w.op != .eq and w.op != .ne) {
+                if (s.indexOf(w.column)) |ci| {
+                    if (ci != s.pk_index and h.onColumn(ci) != null) {
+                        var owned: std.ArrayList([]u8) = .empty;
+                        defer {
+                            for (owned.items) |x| alloc.free(x);
+                            owned.deinit(alloc);
+                        }
+                        const max = @as(usize, sel.offset orelse 0) + @as(usize, sel.limit.?);
+                        try indexCollectRange(h, t, s, ci, w.op, w.value, alloc, &owned, max);
                         return finishFromValues(t.io, s, sel, alloc, owned.items);
                     }
                 }

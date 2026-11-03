@@ -94,6 +94,30 @@ pub const Schema = struct {
         return true;
     }
 
+    /// 移除一个索引（名字比较大小写不敏感）。返回是否真的移除了。
+    ///
+    /// 数组**就地压缩**而不是重分配：`indexes` 上挂的是 `name` 的堆内存，
+    /// 重建数组还得逐项搬指针，收益为零。
+    pub fn removeIndex(self: *Schema, alloc: std.mem.Allocator, name: []const u8) bool {
+        var i: usize = 0;
+        while (i < self.indexes.len) : (i += 1) {
+            if (!std.ascii.eqlIgnoreCase(self.indexes[i].name, name)) continue;
+            const n = self.indexes.len;
+            alloc.free(self.indexes[i].name);
+            if (i + 1 < n) {
+                std.mem.copyForwards(IndexDef, self.indexes[i .. n - 1], self.indexes[i + 1 .. n]);
+            }
+            if (n > 1) {
+                self.indexes = self.indexes[0 .. n - 1];
+            } else {
+                alloc.free(self.indexes);
+                self.indexes = &[_]IndexDef{};
+            }
+            return true;
+        }
+        return false;
+    }
+
     /// 哪些索引建在这一列上（单列索引最多一个，返回第一个）。
     pub fn indexOnColumn(self: *const Schema, column_idx: usize) ?IndexDef {
         for (self.indexes) |ix| {

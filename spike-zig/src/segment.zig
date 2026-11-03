@@ -1242,6 +1242,26 @@ pub const RefCursor = struct {
         self.it.deinit(self.seg.alloc);
     }
 
+    /// 换查询区间重新开始，**复用这份游标**（不重建 `RecIter`、不重开数据文件）。
+    ///
+    /// 为什么需要：JOIN 对右表的每一行都要扫一次索引前缀（1 万行 = 1 万次），
+    /// 而 `Segment.cursor()` 每次都 `dataView()`（open + mmap）+ `RecIter.init`（2 次分配）。
+    pub fn reset(self: *RefCursor, start: []const u8, end: []const u8) void {
+        self.start = start;
+        self.end = end;
+        self.passed_start = start.len == 0;
+        const view = self.it.buf;
+        if (self.seg.entries.items.len > 0) {
+            const off: u64 = self.seg.entries.items[self.seg.candidateIndex(start)].offset;
+            // 越界（文件被截断）就定位到末尾：本次归并拿不到数据，
+            // 但损坏由 `codec.RecIter.corrupt` / 上层检查兜（与 `seekToEntry` 同口径）
+            self.it.seek(@intCast(@min(off, view.len)));
+        } else {
+            self.it.seek(view.len);
+        }
+        self.pos = self.it.pos;
+    }
+
     pub fn next(self: *RefCursor) ?Segment.RefRecord {
         while (self.it.next(self.seg.alloc)) |rec| {
             self.pos = rec.next;
