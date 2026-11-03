@@ -996,6 +996,44 @@ fn benchMain() !void {
                     std.debug.print("sql_orderby_index10_med_us,{d},{d:.1}\n", .{ reps, @as(f64, @floatFromInt(med)) / 1000.0 });
                     std.debug.print("sql_orderby_index10_readrows,{d},0\n", .{t5.scan_rows_read});
                 }
+
+                // `WHERE g >= ? ORDER BY g ASC LIMIT 10`：索引同时承担「范围下界」与「排序」，
+                // 扫到凑够 10 行就停。这是 §16.1.46 的遗留缺口（有 WHERE 时仍走全表 + 排序）。
+                // 与 SQLite 同一条语句、同一个阈值；`x` 不在索引里 ⇒ 两侧都必须回表。
+                {
+                    const reps: usize = 200;
+                    var items_wo = [_]spike.sql.SelectItem{ .{ .column = "x" }, .{ .column = "g" } };
+                    var ord_wo = [_]spike.sql.OrderItem{.{ .column = "g", .desc = false }};
+                    const sel_wo = spike.sql.Select{
+                        .items = &items_wo,
+                        .table = "bench_agg",
+                        .where = .{ .column = "g", .op = .ge, .value = .{ .integer = 50_000 } },
+                        .order_by = &ord_wo,
+                        .limit = 10,
+                    };
+                    t5.scan_rows_read = 0; // 确定性指标：走索引时主表应当只读 10 行级别
+                    var samples = try alloc.alloc(u64, reps);
+                    defer alloc.free(samples);
+                    var got_rows: usize = 0;
+                    var digest: i64 = 0;
+                    var r: usize = 0;
+                    while (r < reps) : (r += 1) {
+                        const t0 = nowNs(io);
+                        var rows_wo = try spike.exec.selectRowsHost(&t5, &s5, sel_wo, alloc, &host);
+                        samples[r] = nowNs(io) - t0;
+                        got_rows += rows_wo.rows.len;
+                        for (rows_wo.rows) |rr| digest +%= rr[0].integer *% 31 +% rr[1].integer;
+                        rows_wo.deinit();
+                    }
+                    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+                    const med = samples[reps / 2];
+                    const per = got_rows / reps;
+                    std.debug.print("sql_where_orderby_index10,{d},{d:.0}\n", .{ per, opsPerSec(@intCast(per), med) });
+                    std.debug.print("sql_where_orderby_index10_rows,{d},0\n", .{got_rows});
+                    std.debug.print("sql_where_orderby_index10_digest,{d},{d}\n", .{ got_rows, digest });
+                    std.debug.print("sql_where_orderby_index10_med_us,{d},{d:.1}\n", .{ reps, @as(f64, @floatFromInt(med)) / 1000.0 });
+                    std.debug.print("sql_where_orderby_index10_readrows,{d},0\n", .{t5.scan_rows_read});
+                }
             }
         }
         // 物化成本拆解：把 selectRows 的四个阶段分别计时，**不猜**。

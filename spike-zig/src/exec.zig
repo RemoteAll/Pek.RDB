@@ -171,7 +171,8 @@ fn indexPkSlice(s: *const schema_mod.Schema, ci: usize, key: []const u8) ![]cons
 /// 先让 `DESC` 回退全量路径（正确优先）。`Table.topKDesc` 也不能复用：它输出的是
 /// **值**，而索引表的值是空的。
 ///
-/// 返回 `null` = 这条路径不适用/没凑够（无 LIMIT、全是脏项等），调用方回退全量路径。
+/// 返回 `null` = 这条路径不适用（没有索引 / 没有 LIMIT），调用方回退全量路径。
+/// **0 行是合法结果**（谓词无匹配），不会回退 —— 回退只会把同样的活儿白干一遍。
 fn selectByIndexOrder(
     host: *const IndexHost,
     t: *tablemod.Table,
@@ -193,17 +194,62 @@ fn selectByIndexOrder(
     var vbuf: std.ArrayList(u8) = .empty;
     defer vbuf.deinit(alloc);
 
+    // ------------------------------------------------------------------
+    // WHERE：谓词在扫描循环里判（不匹配的行**不占** limit 名额）。
+    // 若谓词正好作用在排序列上，索引键还给出整体下界 —— 直接 seek 过去，
+    // 不必从头扫（`WHERE g >= 50000` 只读后半段）。
+    //
+    // 这是 §16.1.46 留的缺口：以前只要带 WHERE 就整条回退全表扫描。
+    // 实测 `WHERE g >= 50000 ORDER BY g LIMIT 10`（100 万行）：
+    // 每次扫 100 万行、53.97 ms，SQLite 5.0 µs（≈10800×）。
+    // ------------------------------------------------------------------
+    var where_col: ?usize = null;
+    var where_op: sql.CmpOp = .eq;
+    var where_val: sql.Value = .{ .null = {} };
+    var start_owned: ?[]u8 = null;
+    defer if (start_owned) |p| alloc.free(p);
+    var end_owned: ?[]u8 = null;
+    defer if (end_owned) |p| alloc.free(p);
+    var start: []const u8 = &.{};
+    var end: []const u8 = &.{};
+    if (sel.where) |w| {
+        const wci = s.indexOf(w.column) orelse return error.ColumnNotFound;
+        where_col = wci;
+        where_op = w.op;
+        where_val = w.value;
+        // 只有「谓词列 == 排序列」时才有整体下界；`>=` 与 `=` 都能定下界（同一个值分量前缀），
+        // `=` 顺带能用前缀上界把范围收死。`>` / `<=` 不剪枝：值分量编码的边界靠推断容易出错，
+        // 交给循环过滤更稳妥（慢一点但不会错）。
+        if (wci == ci and !isNullValue(w.value) and (w.op == .ge or w.op == .eq)) {
+            const pfx = try s.encodeValueComponent(alloc, ci, w.value);
+            start_owned = pfx;
+            start = pfx;
+            if (w.op == .eq) {
+                const hi = try prefixUpperBound(alloc, pfx);
+                end_owned = hi;
+                end = hi;
+            }
+        }
+    }
+
+    const row_vals: ?[]sql.Value = if (where_col != null) try alloc.alloc(sql.Value, s.columns.len) else null;
+    defer if (row_vals) |rv| alloc.free(rv);
+
     var it = tablemod.MergeIter{};
-    try it.init(itbl, &[_]u8{}, &[_]u8{});
+    try it.init(itbl, start, end);
     defer it.deinit();
     while (it.next()) |rec| {
         if (spans.items.len >= want) break;
         const pk = try indexPkSlice(s, ci, rec.key);
         const raw = (try t.get(pk, &vbuf)) orelse continue; // 脏项
+        if (where_col) |wci| {
+            try s.decodeRowInto(row_vals.?, raw);
+            // **回表后重判**：索引项可能过期（更新/删除的中间态），不能只信索引键
+            if (!evalWhere(row_vals.?[wci], where_op, where_val)) continue;
+        }
         try spans.append(alloc, .{ store.items.len, raw.len });
         try store.appendSlice(alloc, raw);
     }
-    if (spans.items.len == 0) return null;
     // 切片在这之后才建：`store` 不再增长，指针稳定
     const rows = try alloc.alloc([]const u8, spans.items.len);
     defer alloc.free(rows);
@@ -212,12 +258,18 @@ fn selectByIndexOrder(
     // **索引顺序已经满足 ORDER BY**：把 `order_by` 清掉再交给统一装配 —— 装配层就会
     // ①跳过排序、②只 decode 投影用到的列（`want = proj.indices`）。这两件事本来由
     // 「排序列必须先解码」那条约束逼出来的，索引路径不需要付。
+    // `where` 也清掉：循环里已经判过，装配层再判一遍只是白解码。
     var sel2 = sel;
     sel2.order_by = &[_]sql.OrderItem{};
+    sel2.where = null;
     return try finishFromValues(t.io, s, sel2, alloc, rows);
 }
 
 fn evalWhere(a: sql.Value, op: sql.CmpOp, b: sql.Value) bool {
+    // **与 NULL 比较恒不匹配**（SQL 的 UNKNOWN）。`valueCmp` 把 NULL 当作「比任何值都小」，
+    // 直接拿它比较会让 `WHERE x >= NULL` 变成「全部行」——语义错，而且会让
+    // 「走索引 / 走全表」两条路径给出不同结果（索引键里根本不收 NULL）。
+    if (isNullValue(b)) return false;
     const ord = schema_mod.valueCmp(a, b);
     return switch (op) {
         .eq => ord == .eq,
@@ -1077,14 +1129,15 @@ pub fn selectRowsHost(
         }
     }
 
-    // 索引排序：`ORDER BY <已建索引的非主键列> ASC LIMIT n`（无 WHERE）⇒ 索引顺序即该列顺序，
-    // 顺序扫到凑够就停，既不必扫主表也不必对结果排序（§九十七）。
+    // 索引排序：`ORDER BY <已建索引的非主键列> ASC LIMIT n`（WHERE 可有可无）
+    // ⇒ 索引顺序即该列顺序，顺序扫到凑够就停，既不必扫主表也不必对结果排序（§九十七）。
+    // 带 WHERE 时谓词在循环里判、且谓词落在排序列上时借索引键下界 seek（§一百零四）。
     //
     // **只对 `NOT NULL` 列启用**：NULL 不入索引（`putIndexEntries` 里 `isNullValue` 直接跳过），
     // 可空列走索引会把 NULL 行整批漏掉 —— 而升序里 NULL 恰恰排在最前面。
     // （把 NULL 也编进索引、按「比任何值都小」排序是后续项；在那之前宁可走全表。）
     if (host) |h| {
-        if (sel.where == null and sel.order_by.len == 1 and sel.limit != null and !sel.order_by[0].desc) {
+        if (sel.order_by.len == 1 and sel.limit != null and !sel.order_by[0].desc) {
             const o = sel.order_by[0];
             if (s.indexOf(o.column)) |ci| {
                 if (ci != s.pk_index and s.columns[ci].not_null and h.onColumn(ci) != null) {

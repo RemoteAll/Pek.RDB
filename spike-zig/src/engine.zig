@@ -1245,6 +1245,86 @@ test "ORDER BY 索引列：正序/降序 + LIMIT/OFFSET 走索引，结果与全
     }
 }
 
+// `WHERE` + `ORDER BY <索引列>`：谓词在扫描循环里判，谓词落在排序列上时用索引键下界剪枝。
+// 对照组用「同值但无索引的 `h`」—— 两条查询语义等价，结果必须逐行相同。
+test "WHERE + ORDER BY 索引列：下界剪枝与逐行过滤都正确，且不扫主表" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const root = "test-engine-where-order-idx";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    var eng = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    defer eng.deinit();
+
+    try run(&eng, alloc, "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER NOT NULL, h INTEGER NOT NULL)");
+
+    // 300 行，g 只有 23 个取值（大量并列）；h 与 g 同值但**不建索引**，用作对照组
+    var b: usize = 0;
+    while (b < 6) : (b += 1) {
+        var sb: std.ArrayList(u8) = .empty;
+        defer sb.deinit(alloc);
+        try sb.appendSlice(alloc, "INSERT INTO t (id, g, h) VALUES ");
+        for (0..50) |j| {
+            const i: i64 = @intCast(b * 50 + j);
+            const g: i64 = @intCast(@mod(i * 7, 23));
+            try sb.appendSlice(alloc, if (j == 0) "" else ", ");
+            var num: [64]u8 = undefined;
+            try sb.appendSlice(alloc, try std.fmt.bufPrint(&num, "({d}, {d}, {d})", .{ i, g, g }));
+        }
+        try run(&eng, alloc, sb.items);
+    }
+    try run(&eng, alloc, "CREATE INDEX idx_g ON t (g)");
+
+    const cases = [_]struct { by_idx: []const u8, full: []const u8, must_index: bool }{
+        // 谓词 = 排序列 + `>=`：索引键给下界，直接 seek 过去
+        .{ .by_idx = "SELECT id, g FROM t WHERE g >= 15 ORDER BY g ASC LIMIT 10", .full = "SELECT id, g FROM t WHERE h >= 15 ORDER BY h ASC LIMIT 10", .must_index = true },
+        // 等值：下界与上界都能用前缀收死
+        .{ .by_idx = "SELECT id, g FROM t WHERE g = 7 ORDER BY g LIMIT 5", .full = "SELECT id, g FROM t WHERE h = 7 ORDER BY h LIMIT 5", .must_index = true },
+        // `>` / `<=` 不剪枝（值分量边界靠推断容易错），但仍逐行过滤
+        .{ .by_idx = "SELECT id, g FROM t WHERE g > 15 ORDER BY g LIMIT 5", .full = "SELECT id, g FROM t WHERE h > 15 ORDER BY h LIMIT 5", .must_index = true },
+        .{ .by_idx = "SELECT id, g FROM t WHERE g <= 3 ORDER BY g LIMIT 5", .full = "SELECT id, g FROM t WHERE h <= 3 ORDER BY h LIMIT 5", .must_index = true },
+        // 谓词**不在**排序列上：不能剪枝，必须逐行回表判
+        .{ .by_idx = "SELECT id, g FROM t WHERE h >= 15 ORDER BY g LIMIT 10", .full = "SELECT id, g FROM t WHERE g >= 15 ORDER BY h LIMIT 10", .must_index = true },
+        // OFFSET：被跳过的行不占 limit 名额
+        .{ .by_idx = "SELECT id, g FROM t WHERE g >= 15 ORDER BY g LIMIT 10 OFFSET 5", .full = "SELECT id, g FROM t WHERE h >= 15 ORDER BY h LIMIT 10 OFFSET 5", .must_index = true },
+        // 空结果：必须返回 0 行（不许报错，也不许因为「索引路径 0 行」就回退全表）
+        .{ .by_idx = "SELECT id, g FROM t WHERE g >= 1000 ORDER BY g LIMIT 5", .full = "SELECT id, g FROM t WHERE h >= 1000 ORDER BY h LIMIT 5", .must_index = true },
+        // 与 NULL 比较恒不匹配：`>= NULL` 不能变成「全部行」，也不能因为给 NULL 编码而报错
+        .{ .by_idx = "SELECT id, g FROM t WHERE g >= NULL ORDER BY g LIMIT 5", .full = "SELECT id, g FROM t WHERE h >= NULL ORDER BY h LIMIT 5", .must_index = true },
+    };
+
+    for (cases, 0..) |c, ci| {
+        eng.get("t").?.table.scan_rows_read = 0;
+        var got = try queryRows(&eng, alloc, c.by_idx);
+        defer got.deinit();
+        const idx_scanned = eng.get("t").?.table.scan_rows_read;
+
+        var want = try queryRows(&eng, alloc, c.full);
+        defer want.deinit();
+
+        if (got.rows.len != want.rows.len) {
+            std.debug.print("case {d}: 行数 {d} != {d}\n", .{ ci, got.rows.len, want.rows.len });
+            return error.RowCountMismatch;
+        }
+        for (got.rows, want.rows, 0..) |gr, wr, ri| {
+            if (gr[0].integer != wr[0].integer or gr[1].integer != wr[1].integer) {
+                std.debug.print("case {d} 第 {d} 行: idx={any} full={any}\n", .{ ci, ri, gr, wr });
+                return error.ValueMismatch;
+            }
+        }
+        // 确定性证据：索引路径不扫主表（只有回表）
+        if (c.must_index and idx_scanned != 0) {
+            std.debug.print("case {d}: 走索引却扫了主表 {d} 行\n", .{ ci, idx_scanned });
+            return error.IndexPathScannedTable;
+        }
+    }
+}
+
 // 可空列**不能**走索引排序：NULL 不入索引，走索引会把 NULL 行整批漏掉，
 // 而升序里 NULL 恰恰排在最前面。这条用例钉住「宁可慢也不能少行」。
 test "ORDER BY 可空索引列：NULL 行不能丢（必须回退全表，不走索引）" {

@@ -768,6 +768,42 @@ fn main() -> rusqlite::Result<()> {
                     println!("sql_orderby_index10_digest,{},{}", got_rows, digest);
                     println!("sql_orderby_index10_med_us,{},{:.1}", REPS, med * 1e6);
                 }
+
+                // WHERE + ORDER BY the same indexed column + LIMIT: the index gives both the
+                // range lower bound and the order, so both sides should stop after 10 rows.
+                // This closes the gap noted for our engine (WHERE still forced a full scan).
+                {
+                    let mut stmt = ca.prepare(
+                        "SELECT x, g FROM agg WHERE g >= 50000 ORDER BY g ASC LIMIT 10",
+                    )?;
+                    const REPS: usize = 200;
+                    let mut samples: Vec<(f64, usize)> = Vec::with_capacity(REPS);
+                    let mut got_rows: usize = 0;
+                    let mut digest: i64 = 0;
+                    for _ in 0..REPS {
+                        let t0 = Instant::now();
+                        let mut n: usize = 0;
+                        let mut d: i64 = 0;
+                        {
+                            let mut rows = stmt.query([])?;
+                            while let Some(r) = rows.next()? {
+                                d = d
+                                    .wrapping_add(r.get::<_, i64>(0)?.wrapping_mul(31))
+                                    .wrapping_add(r.get::<_, i64>(1)?);
+                                n += 1;
+                            }
+                        }
+                        samples.push((t0.elapsed().as_secs_f64(), n));
+                        got_rows += n;
+                        digest = digest.wrapping_add(d);
+                    }
+                    samples.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    let (med, n) = samples[REPS / 2];
+                    println!("sql_where_orderby_index10,{},{}", n, n as f64 / med);
+                    println!("sql_where_orderby_index10_rows,{},0", got_rows);
+                    println!("sql_where_orderby_index10_digest,{},{}", got_rows, digest);
+                    println!("sql_where_orderby_index10_med_us,{},{:.1}", REPS, med * 1e6);
+                }
             }
         }
         drop(c3);

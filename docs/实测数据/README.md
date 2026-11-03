@@ -448,3 +448,16 @@ foreach ($r in 1,2,3) { ./zig-out/bin/spike-bench-ac 2>&1 | Tee-Object -FilePath
 > 纪律：这批 4 轮里 `big_tier12` 与 `tier6-r1` 出现 3–14× 的同场景抖动（磁盘/杀软），按
 > `docs/决策记录.md` §九十八 的规矩，**批内跨 2× 的那一档不下结论**，只用来确认方向。
 
+## `WHERE` + `ORDER BY <索引列>` 探针（2026-11-03 起）
+
+`sql_where_orderby_index10`：两侧同一条 SQL
+`SELECT x, g FROM agg WHERE g >= 50000 ORDER BY g ASC LIMIT 10`（100 万行、`idx_g(g)`），
+200 次取中位、`prepare` 在计时外 —— 与 `sql_orderby_index10` 完全同口径，只是多了一个谓词。
+
+| 批次 | 内容 |
+|---|---|
+| `zig/sqlite-2026-11-03-p37` | **修复前基线**：我们每次扫 100 万行（`readrows` 2 亿）、**53,967 µs**；SQLite 5.0 µs ⇒ **0.000×**（0/3 ALWAYS BEHIND） |
+| `zig/sqlite-2026-11-03-p38` | **修复后**：**4.4–6.5 µs**（首轮 6.5 为冷启动）、`readrows` = **0**；SQLite 4.4–4.5 µs ⇒ **0.967×**，两侧只差 0.1 µs（≈2%，µs 级噪声底）⇒ 判**持平** |
+
+> 约 **12000×** 提升。`p38` 全批 29 项 always-ahead / 1 项 always-behind（就是本项，差 2%）/ 2 项未决。
+
