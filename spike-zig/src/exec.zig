@@ -746,6 +746,20 @@ fn rowEstimate(t: *tablemod.Table) usize {
     return n;
 }
 
+/// 哈希键的临时缓冲。
+///
+/// 数值键固定 9 字节（1 字节类型 + 8 字节全序 f64）⇒ 直接写栈缓冲，**不进 ArrayList**；
+/// 只有 text/blob 长度不定才用 `txt`。进 JOIN 热循环的每一次探测都要算一次键，
+/// 所以不给它分配器分配路径。
+const HashKeyBuf = struct {
+    num: [9]u8 = undefined,
+    txt: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *HashKeyBuf, alloc: std.mem.Allocator) void {
+        self.txt.deinit(alloc);
+    }
+};
+
 /// 一个分组：右表里键相同的全部行，按**右表扫描顺序**串成链。
 const HashGroup = struct { head: u32 = no_entry, tail: u32 = no_entry };
 const no_entry: u32 = std.math.maxInt(u32);
@@ -775,19 +789,19 @@ const JoinHash = struct {
         const nb = rt.schema.columns.len;
         const vals = try alloc.alloc(sql.Value, nb);
         defer alloc.free(vals);
-        var kbuf: std.ArrayList(u8) = .empty;
-        defer kbuf.deinit(alloc);
+        var kb: HashKeyBuf = .{};
+        defer kb.deinit(alloc);
         var it = tablemod.MergeIter{};
         try it.init(rt.table, &[_]u8{}, &[_]u8{});
         defer it.deinit();
         while (it.next()) |rec| {
             try rt.schema.decodeRowInto(vals, rec.value);
             if (isNullValue(vals[col_idx])) continue; // `= NULL` 永不匹配
-            const kb = try hashKeyInto(alloc, &kbuf, vals[col_idx]);
-            const gop = try self.map.getOrPut(alloc, kb);
+            const k = try hashKeyInto(&kb, alloc, vals[col_idx]);
+            const gop = try self.map.getOrPut(alloc, k);
             if (!gop.found_existing) {
                 // 键拷进 arena（生命周期同结果集），map 的桶由 `alloc` 管
-                gop.key_ptr.* = try a.dupe(u8, kb);
+                gop.key_ptr.* = try a.dupe(u8, k);
                 gop.value_ptr.* = .{};
             }
             const row = try a.alloc(sql.Value, nb);
@@ -810,12 +824,12 @@ const JoinHash = struct {
         want: sql.Value,
         alloc: std.mem.Allocator,
         a: std.mem.Allocator,
-        kbuf: *std.ArrayList(u8),
+        kb: *HashKeyBuf,
         out: *std.ArrayList([]sql.Value),
     ) !void {
         if (isNullValue(want)) return;
-        const kb = try hashKeyInto(alloc, kbuf, want);
-        const g = self.map.get(kb) orelse return;
+        const k = try hashKeyInto(kb, alloc, want);
+        const g = self.map.get(k) orelse return;
         var e = g.head;
         while (e != no_entry) {
             const ent = self.entries.items[e];
@@ -832,13 +846,11 @@ const JoinHash = struct {
 };
 
 /// 哈希键：数值统一走 f64（与 `valueCmp` 的数值比较口径一致），text/blob 走字节。
-/// 写进调用方的复用缓冲，返回值只在下次调用前有效。
-fn hashKeyInto(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), v: sql.Value) ![]const u8 {
-    buf.clearRetainingCapacity();
+/// 返回值只在下次调用前有效。
+fn hashKeyInto(kb: *HashKeyBuf, alloc: std.mem.Allocator, v: sql.Value) ![]const u8 {
     switch (v) {
-        .null => try buf.append(alloc, 0),
         .integer, .real => {
-            try buf.append(alloc, 'n');
+            kb.num[0] = 'n';
             var f: f64 = switch (v) {
                 .integer => |x| @floatFromInt(x),
                 .real => |x| x,
@@ -847,20 +859,26 @@ fn hashKeyInto(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), v: sql.Value) 
             if (f == 0) f = 0; // -0.0 与 +0.0 必须同桶（`valueCmp` 判等）
             var bits: u64 = @bitCast(f);
             bits = if ((bits >> 63) != 0) ~bits else bits | 0x8000_0000_0000_0000;
-            var b: [8]u8 = undefined;
-            std.mem.writeInt(u64, &b, bits, .big);
-            try buf.appendSlice(alloc, &b);
+            std.mem.writeInt(u64, kb.num[1..9], bits, .big);
+            return kb.num[0..9];
+        },
+        .null => {
+            kb.num[0] = 0;
+            return kb.num[0..1];
         },
         .text => |s| {
-            try buf.append(alloc, 't');
-            try buf.appendSlice(alloc, s);
+            kb.txt.clearRetainingCapacity();
+            try kb.txt.append(alloc, 't');
+            try kb.txt.appendSlice(alloc, s);
+            return kb.txt.items;
         },
         .blob => |s| {
-            try buf.append(alloc, 'b');
-            try buf.appendSlice(alloc, s);
+            kb.txt.clearRetainingCapacity();
+            try kb.txt.append(alloc, 'b');
+            try kb.txt.appendSlice(alloc, s);
+            return kb.txt.items;
         },
     }
-    return buf.items;
 }
 
 fn appendDupRow(
@@ -878,6 +896,87 @@ fn appendDupRow(
     for (tmp, row) |v, *dst| dst.* = try dupValue(a, v);
     try out.append(a, row);
 }
+
+/// JOIN 产出装配器：**直接写最终布局**（投影后的 `flat` + `hdrs`）。
+///
+/// 这一步是照 SQLite 的执行模型改的：`sqlite3_step` 把一行写进 prepare 时就分配好的
+/// 寄存器数组，**每行不分配、不搬运**。我们原来的写法是「arena 逐行分配一个宽行 →
+/// `finishFromRows` 再深拷一遍 → `buildOutput` 按投影再拷一遍」，1 万行要搬运
+/// 近百万元素并反复触碰新分配的页（首次触碰的缺页是实打实的钱）。
+///
+/// text/blob 先追加进 `txt` 并**记下单元下标**，最后统一回填切片 —— 不能存切片指针，
+/// `flat`/`txt` 扩容会让它们失效（这也是为什么不能用「先记指针后修补」的偷懒写法）。
+const JoinSink = struct {
+    alloc: std.mem.Allocator,
+    flat: std.ArrayList(sql.Value) = .empty,
+    txt: std.ArrayList(u8) = .empty,
+    fix: std.ArrayList(TxtFix) = .empty,
+    /// 每行写入的列数（= 投影列数）
+    ncols: usize = 0,
+
+    const TxtFix = struct { cell: usize, start: usize, len: usize };
+
+    fn init(alloc: std.mem.Allocator, ncols: usize, expect_rows: usize) !JoinSink {
+        var s = JoinSink{ .alloc = alloc, .ncols = ncols };
+        // 预留到估算行数：不预留就要经历 8→16→… 十几次扩容（每次 realloc + 拷贝）
+        const cap = @max(@as(usize, 8), expect_rows *| ncols);
+        try s.flat.ensureTotalCapacity(alloc, cap);
+        return s;
+    }
+
+    fn deinit(self: *JoinSink) void {
+        self.flat.deinit(self.alloc);
+        self.txt.deinit(self.alloc);
+        self.fix.deinit(self.alloc);
+    }
+
+    inline fn rows(self: *const JoinSink) usize {
+        return if (self.ncols == 0) 0 else self.flat.items.len / self.ncols;
+    }
+
+    /// 写入一行（`vals.len` 必须等于 `ncols`）。text/blob 在这里就拷进 `txt`。
+    fn emit(self: *JoinSink, vals: []const sql.Value) !void {
+        for (vals) |v| {
+            const cell = self.flat.items.len;
+            switch (v) {
+                .text => |x| {
+                    try self.flat.append(self.alloc, .{ .text = &.{} });
+                    const st = self.txt.items.len;
+                    try self.txt.appendSlice(self.alloc, x);
+                    try self.fix.append(self.alloc, .{ .cell = cell, .start = st, .len = x.len });
+                },
+                .blob => |x| {
+                    try self.flat.append(self.alloc, .{ .blob = &.{} });
+                    const st = self.txt.items.len;
+                    try self.txt.appendSlice(self.alloc, x);
+                    try self.fix.append(self.alloc, .{ .cell = cell, .start = st, .len = x.len });
+                },
+                else => try self.flat.append(self.alloc, v),
+            }
+        }
+    }
+
+    /// 收尾成可直接交给 `assembleMaterialized` 的 `Materialized`（所有权转移）。
+    fn materialize(self: *JoinSink) !Materialized {
+        const nrows = self.rows();
+        const flat = try self.flat.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(flat);
+        const buf = try self.txt.toOwnedSlice(self.alloc);
+        errdefer self.alloc.free(buf);
+        for (self.fix.items) |f| {
+            const sl = buf[f.start..][0..f.len];
+            flat[f.cell] = switch (flat[f.cell]) {
+                .text => .{ .text = sl },
+                .blob => .{ .blob = sl },
+                else => unreachable,
+            };
+        }
+        const hdrs = try self.alloc.alloc([]sql.Value, nrows);
+        errdefer self.alloc.free(hdrs);
+        for (0..nrows) |i| hdrs[i] = flat[i * self.ncols ..][0..self.ncols];
+        return .{ .alloc = self.alloc, .flat = flat, .hdrs = hdrs, .buf = buf, .ncols = self.ncols };
+    }
+};
 
 /// `[INNER|LEFT] JOIN` 执行：左表流式扫描 × 右表按键查找，物化成宽行后走统一装配。
 ///
@@ -914,10 +1013,29 @@ pub fn selectJoin(
     // WHERE 在**宽行**上过滤：单表路径在扫描阶段就过滤了，JOIN 没有那个阶段，
     // 漏了这一步会让 `WHERE u.name = 'ten'` 静默失效（用例当场抓到过）。
     const where_idx: ?usize = if (sel.where) |w| try resolveColumn(&jschema, w.column) else null;
+    // **无 `ORDER BY` 时直写最终布局**（`narrow`）：排序要按未投影的列比较，所以只有这一档能提前投影。
+    // 直写路径下 `flat` 的宽度就是投影列数，`buildOutput` 会走「所有权转移」分支 ⇒ 全链只搬一次。
+    const narrow = sel.order_by.len == 0;
+    // 排序前列校验（直写路径不做排序，但这里统一先校验，避免两条路行为不一致）
+    try validateOrderBy(&jschema, sel.order_by);
+    const proj = try buildProjection(alloc, &jschema, sel.items);
+    var proj_owned = true; // 出错时由 errdefer 释放；成功交给 buildOutput
+    errdefer if (proj_owned) {
+        for (proj.columns) |c| alloc.free(c);
+        alloc.free(proj.columns);
+        alloc.free(proj.indices);
+    };
+
     var wide: std.ArrayList([]sql.Value) = .empty;
     var matches: std.ArrayList([]sql.Value) = .empty;
     const lvals = try alloc.alloc(sql.Value, na);
     defer alloc.free(lvals);
+    // 直写路径的「宽行」暂存（`na + nb` 个值），只用于 WHERE 判定与挑投影列
+    const wrow = try alloc.alloc(sql.Value, na + nb);
+    defer alloc.free(wrow);
+    var sink: JoinSink = .{ .alloc = alloc };
+    var sink_ready = false;
+    defer if (sink_ready) sink.deinit();
 
     var it = tablemod.MergeIter{};
     try it.init(left.table, &[_]u8{}, &[_]u8{});
@@ -933,36 +1051,99 @@ pub fn selectJoin(
     const jr = rowEstimate(right.table);
     const use_hash = jr <= join_hash_max_rows and rowEstimate(left.table) * join_hash_min_left_ratio >= jr;
     if (use_hash) try jh.build(right, rcol, alloc, a);
-    var kbuf: std.ArrayList(u8) = .empty;
-    defer kbuf.deinit(alloc);
-    while (it.next()) |rec| {
+    if (narrow) {
+        // 估算输出行数用于预留：左表行数 × 1（等值连接平均命中数），够用即可
+        sink = try JoinSink.init(alloc, proj.indices.len, rowEstimate(left.table));
+        sink_ready = true;
+    }
+    // `LIMIT` 且无 `ORDER BY` ⇒ 凑够 `offset + limit` 就停（顺序是确定的，提前停不改变结果）
+    const stop_at: ?usize = if (narrow and sel.limit != null)
+        @as(usize, sel.limit.?) + @as(usize, sel.offset orelse 0)
+    else
+        null;
+    var kb: HashKeyBuf = .{};
+    defer kb.deinit(alloc);
+    outer: while (it.next()) |rec| {
         try left.schema.decodeRowInto(lvals, rec.value);
         matches.clearRetainingCapacity();
         if (use_hash) {
-            try jh.probe(rcol, lvals[lcol], alloc, a, &kbuf, &matches);
+            try jh.probe(rcol, lvals[lcol], alloc, a, &kb, &matches);
         } else {
             try joinLookup(right, rcol, lvals[lcol], alloc, a, &matches, &rscan);
         }
-        if (matches.items.len == 0) {
-            if (jc.kind == .left) {
+        if (!narrow) {
+            if (matches.items.len == 0) {
+                if (jc.kind == .left) {
+                    const row = try a.alloc(sql.Value, na + nb);
+                    for (row[0..na], lvals) |*dst, v| dst.* = try dupValue(a, v);
+                    for (row[na..]) |*dst| dst.* = .null;
+                    try pushJoined(a, &wide, row, sel, where_idx);
+                }
+                continue;
+            }
+            for (matches.items) |rv| {
                 const row = try a.alloc(sql.Value, na + nb);
                 for (row[0..na], lvals) |*dst, v| dst.* = try dupValue(a, v);
-                for (row[na..]) |*dst| dst.* = .null;
+                @memcpy(row[na..], rv);
                 try pushJoined(a, &wide, row, sel, where_idx);
             }
             continue;
         }
+        // ---- 直写路径 ----
+        // 左值**不深拷**：text/blob 立刻被 `sink.emit` 拷进 `txt`，`lvals` 在本轮内一直有效。
+        if (matches.items.len == 0) {
+            if (jc.kind == .left) {
+                @memcpy(wrow[0..na], lvals);
+                for (wrow[na..]) |*dst| dst.* = .null;
+                try sinkJoined(&sink, wrow, proj.indices, sel, where_idx);
+            }
+            if (stop_at) |lim| if (sink.rows() >= lim) break :outer;
+            continue;
+        }
         for (matches.items) |rv| {
-            const row = try a.alloc(sql.Value, na + nb);
-            for (row[0..na], lvals) |*dst, v| dst.* = try dupValue(a, v);
-            @memcpy(row[na..], rv);
-            try pushJoined(a, &wide, row, sel, where_idx);
+            @memcpy(wrow[0..na], lvals);
+            @memcpy(wrow[na..], rv);
+            try sinkJoined(&sink, wrow, proj.indices, sel, where_idx);
+            if (stop_at) |lim| if (sink.rows() >= lim) break :outer;
         }
     }
-    // 左表段损坏 ⇒ 宽行集会静默缺行
+    // 左表段损坏 ⇒ 行集会静默缺行
     if (it.corrupt) return error.SegmentCorrupt;
 
-    return try finishFromRows(left.table.io, &jschema, sel, alloc, wide.items);
+    if (narrow) {
+        var m = try sink.materialize();
+        sink_ready = false; // 所有权已转给 m
+        sink.deinit();
+        defer m.deinit();
+        proj_owned = false;
+        return assembleMaterialized(left.table.io, &jschema, sel, alloc, proj, &m, 0);
+    }
+
+    proj_owned = false;
+    return finishFromRowsCopy(left.table.io, &jschema, sel, alloc, proj, wide.items, 0);
+}
+
+/// 直写路径的「入结果集」：`WHERE` 先判（在宽行上），命中就按投影列写进 sink。
+fn sinkJoined(
+    sink: *JoinSink,
+    wrow: []const sql.Value,
+    proj_idx: []const usize,
+    sel: sql.Select,
+    where_idx: ?usize,
+) !void {
+    if (sel.where) |w| {
+        if (!evalWhere(wrow[where_idx.?], w.op, w.value)) return;
+    }
+    // 投影列逐个挑出来写进 flat（`ncols` 很小，栈上够用；超宽投影才走分配）
+    var buf: [24]sql.Value = undefined;
+    if (proj_idx.len <= buf.len) {
+        for (proj_idx, 0..) |ci, k| buf[k] = wrow[ci];
+        return sink.emit(buf[0..proj_idx.len]);
+    }
+    const tmp = try sink.alloc.alloc(sql.Value, proj_idx.len);
+    defer sink.alloc.free(tmp);
+    for (proj_idx, 0..) |ci, k| tmp[k] = wrow[ci];
+    try sink.emit(tmp);
 }
 
 /// 宽行入结果集前的过滤（`WHERE`）。NULL 参与比较时按 `valueCmp` 的语义走，
@@ -982,6 +1163,26 @@ fn pushJoined(
 
 /// 把「已解码的宽行」装配成 `Rows`：投影 / 排序 / 输出三段与 `finishFromValues` 同一套逻辑，
 /// 区别只在输入已经是值（JOIN 产出），不需要再从行编码解码。
+/// 把值深拷进 `buf`（text/blob 指向调用方的临时缓冲或 arena，出了这层就失效）。
+/// `off` 是 `buf` 的写游标，调用方保证总字节数已经预先统计好。
+inline fn copyValue(buf: []u8, off: *usize, v: sql.Value) sql.Value {
+    return switch (v) {
+        .text => |x| blk: {
+            @memcpy(buf[off.*..][0..x.len], x);
+            const sl = buf[off.*..][0..x.len];
+            off.* += x.len;
+            break :blk .{ .text = sl };
+        },
+        .blob => |x| blk: {
+            @memcpy(buf[off.*..][0..x.len], x);
+            const sl = buf[off.*..][0..x.len];
+            off.* += x.len;
+            break :blk .{ .blob = sl };
+        },
+        else => v,
+    };
+}
+
 fn finishFromRows(
     io: std.Io,
     s: *const schema_mod.Schema,
@@ -1003,17 +1204,51 @@ fn finishFromRows(
         alloc.free(proj.columns);
         alloc.free(proj.indices);
     }
+    return finishFromRowsCopy(io, s, sel, alloc, proj, rows, t0);
+}
 
-    // 深拷贝 text/blob：它们指向 JOIN 的 arena，出函数就失效
+/// 主体：把 `rows` 深拷成 `Materialized` 后交给 `assembleMaterialized`。
+/// `proj` 由调用方建好并交出所有权；`ORDER BY` 列校验由调用方先做。
+fn finishFromRowsCopy(
+    io: std.Io,
+    s: *const schema_mod.Schema,
+    sel: sql.Select,
+    alloc: std.mem.Allocator,
+    proj: Projection,
+    rows: []const []sql.Value,
+    t0_in: u64,
+) !Rows {
+    var t0 = t0_in;
+    errdefer {
+        for (proj.columns) |c| alloc.free(c);
+        alloc.free(proj.columns);
+        alloc.free(proj.indices);
+    }
+
+    // 深拷贝 text/blob：它们指向 JOIN 的 arena，出函数就失效。
+    //
+    // **无 `ORDER BY` 时只拷投影列**（`narrow`）：排序要按未投影的列比较，所以只有这一档能提前投影。
+    // 这一点直接决定 `buildOutput` 走哪条路 —— 窄 `flat` 会命中它的
+    // 「`m.ncols == 投影列数`」分支（所有权转移，零额外拷贝），
+    // 而全宽 `flat` 只会落到「另分配 pflat 再逐行挑列」那条老路（实测 10,000 行多花 ~400 µs）。
+    const narrow = sel.order_by.len == 0;
+    const ncols = if (narrow) proj.indices.len else s.columns.len;
     var total: usize = 0;
     for (rows) |r| {
-        for (r) |v| switch (v) {
-            .text => |x| total += x.len,
-            .blob => |x| total += x.len,
-            else => {},
-        };
+        if (narrow) {
+            for (proj.indices) |ci| switch (r[ci]) {
+                .text => |x| total += x.len,
+                .blob => |x| total += x.len,
+                else => {},
+            };
+        } else {
+            for (r) |v| switch (v) {
+                .text => |x| total += x.len,
+                .blob => |x| total += x.len,
+                else => {},
+            };
+        }
     }
-    const ncols = s.columns.len;
     const buf = try alloc.alloc(u8, total);
     errdefer alloc.free(buf);
     const flat = try alloc.alloc(sql.Value, rows.len * ncols);
@@ -1024,22 +1259,10 @@ fn finishFromRows(
     var off: usize = 0;
     for (rows, 0..) |src, i| {
         const dst = flat[i * ncols ..][0..ncols];
-        for (src, 0..) |v, c| {
-            dst[c] = switch (v) {
-                .text => |x| blk: {
-                    @memcpy(buf[off..][0..x.len], x);
-                    const sl = buf[off..][0..x.len];
-                    off += x.len;
-                    break :blk .{ .text = sl };
-                },
-                .blob => |x| blk: {
-                    @memcpy(buf[off..][0..x.len], x);
-                    const sl = buf[off..][0..x.len];
-                    off += x.len;
-                    break :blk .{ .blob = sl };
-                },
-                else => v,
-            };
+        if (narrow) {
+            for (proj.indices, 0..) |ci, k| dst[k] = copyValue(buf, &off, src[ci]);
+        } else {
+            for (src, 0..) |v, c| dst[c] = copyValue(buf, &off, v);
         }
         hdrs[i] = dst;
     }
@@ -1050,7 +1273,23 @@ fn finishFromRows(
         timing.decode += t1 - t0;
         t0 = t1;
     }
+    return assembleMaterialized(io, s, sel, alloc, proj, &m, t0);
+}
 
+/// 装配尾部：排序 → OFFSET/LIMIT 切片 → 按投影产出 `Rows`。
+///
+/// 拆出来是为了让「已经处在最终布局」的调用方（JOIN 的直写路径）**跳过整段拷贝**。
+/// `m` 的 `flat/buf/hdrs` 所有权在成功时转给 `Rows`；失败时由调用方的 `defer m.deinit()` 收。
+fn assembleMaterialized(
+    io: std.Io,
+    s: *const schema_mod.Schema,
+    sel: sql.Select,
+    alloc: std.mem.Allocator,
+    proj: Projection,
+    m: *Materialized,
+    t0_in: u64,
+) !Rows {
+    var t0 = t0_in;
     if (sel.order_by.len > 0) {
         const ctx = SortCtx{ .schema = s, .order = sel.order_by };
         std.mem.sort([]sql.Value, m.hdrs, ctx, rowLess);
@@ -1067,7 +1306,7 @@ fn finishFromRows(
         t0 = t1;
         timing.calls += 1;
     }
-    const out = try buildOutput(alloc, s, &m, proj, start, end);
+    const out = try buildOutput(alloc, s, m, proj, start, end);
     if (timing_enabled) timing.output += stamp(io) - t0;
     return out;
 }

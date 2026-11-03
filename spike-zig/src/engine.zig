@@ -1104,6 +1104,97 @@ test "JOIN：INNER/LEFT、ON 反向、索引路径、裸名歧义、不支持的
     try std.testing.expectError(error.UnexpectedToken, queryRows(&eng, alloc, "SELECT t.id FROM t JOIN u ON t.uid > u.id"));
 }
 
+// **`JOIN` 的两条装配路径**：有 `ORDER BY` 走「arena 宽行 → 深拷」老路，
+// 无 `ORDER BY` 走 `JoinSink` 直写最终布局。两者必须给出**同一组行、同一顺序**。
+//
+// 为什么顺序也必须一样：左表按主键升序流式扫，命中的右表行按右表扫描顺序串成链，
+// 所以「无 ORDER BY」的天然顺序就是 `(左主键, 右主键)` 升序 —— 正好等于那条带
+// `ORDER BY 左主键, 右主键` 的 SQL。用例把这个等价关系钉死，直写路径改错就会露。
+test "JOIN 直写路径（无 ORDER BY）与排序路径逐格一致，并保持左表顺序" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const root = "test-engine-join-direct";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    var eng = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    defer eng.deinit();
+
+    try run(&eng, alloc, "CREATE TABLE p (id INTEGER PRIMARY KEY, k TEXT NOT NULL)");
+    try run(&eng, alloc, "CREATE TABLE q (id INTEGER PRIMARY KEY, k TEXT NOT NULL, n INTEGER NOT NULL)");
+    try run(&eng, alloc, "CREATE INDEX idx_q_k ON q (k)");
+    try run(&eng, alloc, "INSERT INTO p (id, k) VALUES (1,'aa'), (2,'bb'), (3,'cc'), (4,'aa'), (5,'dd')");
+    try run(&eng, alloc, "INSERT INTO q (id, k, n) VALUES (10,'aa',1), (11,'aa',2), (12,'cc',3), (13,'zz',4)");
+
+    // 每对：直写路径（无 ORDER BY） vs 排序路径（有 ORDER BY，顺序应相同）
+    const pairs = [_][2][]const u8{
+        .{
+            "SELECT p.id, q.id, q.n FROM p JOIN q ON p.k = q.k",
+            "SELECT p.id, q.id, q.n FROM p JOIN q ON p.k = q.k ORDER BY p.id, q.id",
+        },
+        // 投影里带 text（走 JoinSink 的 text 回填分支）
+        .{
+            "SELECT p.k, q.n, p.id FROM p JOIN q ON p.k = q.k",
+            "SELECT p.k, q.n, p.id FROM p JOIN q ON p.k = q.k ORDER BY p.id, q.id",
+        },
+        // LEFT JOIN：补 NULL 的行也要一致
+        .{
+            "SELECT p.id, q.n FROM p LEFT JOIN q ON p.k = q.k",
+            "SELECT p.id, q.n FROM p LEFT JOIN q ON p.k = q.k ORDER BY p.id",
+        },
+        // WHERE 在直写路径上先判宽行
+        .{
+            "SELECT p.id, q.n FROM p JOIN q ON p.k = q.k WHERE q.n > 1",
+            "SELECT p.id, q.n FROM p JOIN q ON p.k = q.k WHERE q.n > 1 ORDER BY p.id, q.id",
+        },
+        // LIMIT：直写路径会「凑够就停」，结果必须与全量再截断一致
+        .{
+            "SELECT p.id, q.id FROM p JOIN q ON p.k = q.k LIMIT 3",
+            "SELECT p.id, q.id FROM p JOIN q ON p.k = q.k ORDER BY p.id, q.id LIMIT 3",
+        },
+        // OFFSET
+        .{
+            "SELECT p.id, q.id FROM p JOIN q ON p.k = q.k LIMIT 2 OFFSET 2",
+            "SELECT p.id, q.id FROM p JOIN q ON p.k = q.k ORDER BY p.id, q.id LIMIT 2 OFFSET 2",
+        },
+    };
+
+    for (pairs, 0..) |pr, ci| {
+        var direct = try queryRows(&eng, alloc, pr[0]);
+        defer direct.deinit();
+        var sorted = try queryRows(&eng, alloc, pr[1]);
+        defer sorted.deinit();
+        if (direct.rows.len != sorted.rows.len) {
+            std.debug.print("case {d}: 直写 {d} 行 != 排序 {d} 行\n", .{ ci, direct.rows.len, sorted.rows.len });
+            return error.JoinDirectRowCountMismatch;
+        }
+        for (direct.rows, sorted.rows, 0..) |dr, sr, ri| {
+            for (dr, sr) |a, b| {
+                if (schema_mod.valueCmp(a, b) != .eq) {
+                    std.debug.print("case {d} 第 {d} 行不一致\n", .{ ci, ri });
+                    return error.JoinDirectValueMismatch;
+                }
+            }
+        }
+    }
+
+    // 直写路径的顺序必须是「左主键升序、同左主键时右主键升序」
+    {
+        var rows = try queryRows(&eng, alloc, "SELECT p.id, q.id FROM p JOIN q ON p.k = q.k");
+        defer rows.deinit();
+        try std.testing.expectEqual(@as(usize, 5), rows.rows.len); // 1→{10,11}、4→{10,11}、3→{12}
+        const want = [_][2]i64{ .{ 1, 10 }, .{ 1, 11 }, .{ 3, 12 }, .{ 4, 10 }, .{ 4, 11 } };
+        for (rows.rows, want) |r, w| {
+            try std.testing.expectEqual(w[0], r[0].integer);
+            try std.testing.expectEqual(w[1], r[1].integer);
+        }
+    }
+}
+
 // 哈希连接与嵌套循环是**两条代码路径**，结果必须逐格相同。
 // 撤销这条用例的方式：把 `use_hash` 写死成 `false` ⇒ 只测嵌套循环；写死成 `true` ⇒ 只测哈希。
 test "JOIN：哈希连接与嵌套循环（索引前缀扫描）结果逐格一致" {
