@@ -622,7 +622,7 @@ pub const Engine = struct {
             defer self.alloc.free(path);
 
             // 1) 内存：schema 与索引表集合都摘掉（此后查询不再认为有索引）
-            _ = e.schema.removeIndex(self.alloc, key);
+            _ = try e.schema.removeIndex(self.alloc, key);
             if (e.idx_tables.fetchRemove(key)) |rm| {
                 var t = rm.value;
                 t.deinit();
@@ -2136,10 +2136,16 @@ const oom_queries = [_][]const u8{
     "SELECT a.id, b.n FROM a JOIN b ON a.g = b.k ORDER BY a.id, b.id", // JOIN 拷贝（有 ORDER BY）
     "SELECT a.id, b.n FROM a LEFT JOIN b ON a.g = b.k LIMIT 2 OFFSET 1", // LEFT + 提前终止
     "SELECT id FROM a ORDER BY id DESC LIMIT 3", // 反向 top-K
+    // ---- 写路径与 DDL 同样要过一遍：它们的「谁负责释放」与查询完全不同 ----
+    "INSERT INTO a (id, g, s) VALUES (9, 30, 'nine')", // 单行插入（含索引维护）
+    "INSERT INTO a (id, g, s) VALUES (10, 31, 'ten'), (11, 31, 'eleven')", // 多行
+    "UPDATE a SET g = 32 WHERE id = 9", // 更新（新索引项 → 行 → 删旧索引项）
+    "DELETE FROM a WHERE id = 9", // 删除（行 → 索引项）
+    "CREATE INDEX idx_a_s ON a (s)", // 建索引（回填 + .ready）
+    "DROP INDEX idx_a_s", // 删索引（schema → 落盘 → 删目录）
+    "DROP INDEX IF EXISTS idx_nope", // 幂等分支
 };
 
 test "任意分配失败：查询装配全路径不泄漏、不重复释放" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, oomProbeFn, .{ "test-oom-query", &oom_setup, &oom_queries });
 }
-
-

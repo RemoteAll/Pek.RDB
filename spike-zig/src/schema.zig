@@ -53,11 +53,11 @@ pub const Schema = struct {
         errdefer alloc.free(name_copy);
         const cols = try alloc.alloc(Column, columns.len);
         errdefer alloc.free(cols);
+        var duped: usize = 0;
+        errdefer for (cols[0..duped]) |c| alloc.free(c.name);
         // **已经 dupe 出来的列名也要在失败时释放**：`alloc.dupe` 在循环中途失败时，
         // 前面几列的名字已经分配了，只 free `cols` 数组会漏掉它们。
         // （2026-11-03 由 `checkAllAllocationFailures` 当场抓出：2 字节的列名 "id" 泄漏。）
-        var duped: usize = 0;
-        errdefer for (cols[0..duped]) |c| alloc.free(c.name);
         for (columns, 0..) |c, i| {
             cols[i] = c;
             cols[i].name = try alloc.dupe(u8, c.name);
@@ -100,25 +100,31 @@ pub const Schema = struct {
         return true;
     }
 
-    /// 移除一个索引（名字比较大小写不敏感）。返回是否真的移除了。
+    /// 移除一个索引（名字比较大小写不敏感）。返回**是否真的移除了**；
+    /// 分配失败返回 `error.OutOfMemory`（此时状态未变，调用方必须按失败处理）。
     ///
-    /// 数组**就地压缩**而不是重分配：`indexes` 上挂的是 `name` 的堆内存，
-    /// 重建数组还得逐项搬指针，收益为零。
-    pub fn removeIndex(self: *Schema, alloc: std.mem.Allocator, name: []const u8) bool {
+    /// **不能就地压缩数组**：`indexes` 是 `[]IndexDef`，长度即容量 —— 把长度改小而不
+    /// 告诉分配器，之后 `free(self.indexes)` 就是「释放长度不匹配」，SafeAllocator 直接
+    /// panic、GeneralPurposeAllocator 下是堆损坏。2026-11-03 由分配失败注入守卫连带抓出
+    /// （`CREATE INDEX` → `DROP INDEX` → `deinit` 的序列）。
+    /// 索引个数本来就是个位数量级，重建数组的代价可以忽略。
+    pub fn removeIndex(self: *Schema, alloc: std.mem.Allocator, name: []const u8) Error!bool {
         var i: usize = 0;
         while (i < self.indexes.len) : (i += 1) {
             if (!std.ascii.eqlIgnoreCase(self.indexes[i].name, name)) continue;
             const n = self.indexes.len;
-            alloc.free(self.indexes[i].name);
-            if (i + 1 < n) {
-                std.mem.copyForwards(IndexDef, self.indexes[i .. n - 1], self.indexes[i + 1 .. n]);
-            }
-            if (n > 1) {
-                self.indexes = self.indexes[0 .. n - 1];
-            } else {
+            if (n == 1) {
+                alloc.free(self.indexes[i].name);
                 alloc.free(self.indexes);
                 self.indexes = &[_]IndexDef{};
+                return true;
             }
+            const shrunken = try alloc.alloc(IndexDef, n - 1);
+            @memcpy(shrunken[0..i], self.indexes[0..i]);
+            @memcpy(shrunken[i..], self.indexes[i + 1 .. n]);
+            alloc.free(self.indexes[i].name);
+            alloc.free(self.indexes);
+            self.indexes = shrunken;
             return true;
         }
         return false;
