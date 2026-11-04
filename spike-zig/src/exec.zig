@@ -284,6 +284,13 @@ fn selectByIndexOrder(
     var vbuf: std.ArrayList(u8) = .empty;
     defer vbuf.deinit(t.alloc); // `t.get` 用它自己的分配器填充 ⇒ 同源释放
 
+    // **一次到位，不长式增长**：`LIMIT 10` 这种小结果集上，ArrayList 从 0 长到 10
+    // 要经历 8→16→32… 一串 realloc，实测这一项就吃掉小查询的相当比例
+    // （`sql_orderby_index10` 曾是唯一落后 SQLite 的指标：470ns vs 450ns）。
+    // 行宽按 96B 估：估小只是会再扩一次，估大也只是多占一点临时内存。
+    try spans.ensureTotalCapacity(alloc, want);
+    try store.ensureTotalCapacity(alloc, want * 96);
+
     // ------------------------------------------------------------------
     // WHERE：谓词在扫描循环里判（不匹配的行**不占** limit 名额）。
     // 若谓词正好作用在排序列上，索引键还给出整体下界 —— 直接 seek 过去，

@@ -637,6 +637,10 @@ pub const Table = struct {
     ns_prepare: u64 = 0,
     /// `applyPrepared()` 的累计纳秒：**只与段数成正比**的那一半（rename + 删旧文件 + 换数组）。
     ns_apply: u64 = 0,
+    /// 索引顺序扫描（`ORDER BY <索引列> LIMIT n`）的耗时拆分这次只做过**一次性**诊断：
+    /// 拆成「索引游标推进 + 逐行回表」与「装配成 `Rows`」两段，实测前者占 94%
+    /// （4.62 µs / 4.7 µs），定位完就把计时删掉了 —— 留着会白送约 75 ns/次
+    /// （`nowNs` 四处，占该指标 1.6%），反过来污染它要测的那个对象。
     /// 最近一次 apply 做了多少次文件系统操作（1 次 rename + 每个旧段 1 次删除）。
     /// **确定性指标**：用来证明「apply 的代价与行数无关」，不依赖计时。
     last_apply_ops: usize = 0,
@@ -879,7 +883,7 @@ pub const Table = struct {
     }
 
     /// 单调纳秒时钟（`Table` 内部计时用；不依赖外部注入）。
-    inline fn nowNs(self: *Table) u64 {
+    pub inline fn nowNs(self: *Table) u64 {
         const ts = std.Io.Timestamp.now(self.io, .awake);
         return @intCast(ts.nanoseconds);
     }
@@ -1120,7 +1124,8 @@ pub const Table = struct {
         std.mem.sort(TopCand, cand.items[0..mem_end], {}, candLess);
         var mem_groups: std.ArrayList(TopCand) = .empty; // key 升序
         defer mem_groups.deinit(alloc);
-        try collectGroups(cand.items[0..mem_end], alloc, &mem_groups);
+        var mem_edge: ?[]const u8 = null;
+        try collectGroups(cand.items[0..mem_end], alloc, &mem_groups, &mem_edge);
         // 门槛 = 第 k 大的组（升序数组的 len-k），它的 key 指向 arena ⇒ 稳定
         const floor_key: ?[]const u8 = if (mem_groups.items.len >= k) mem_groups.items[mem_groups.items.len - k].key else null;
 
@@ -1175,6 +1180,10 @@ pub const Table = struct {
         // ---- 3) 段全被剪掉 ⇒ memtable 自己就给出了答案，不必再排序 ----
         if (cand.items.len == mem_end) {
             if (mem_groups.items.len < k) return false;
+            // 被丢弃的「窗口边界组」如果比第 k 名还大，它可能就是可见行 ⇒ 答案不可信
+            if (mem_edge) |ek| {
+                if (segmod.keyCmp(ek, mem_groups.items[mem_groups.items.len - k].key) == .gt) return false;
+            }
             try out.ensureTotalCapacity(alloc, k);
             var gi = mem_groups.items.len;
             const gstop = mem_groups.items.len - k;
@@ -1189,8 +1198,16 @@ pub const Table = struct {
         std.mem.sort(TopCand, cand.items, {}, candLess);
         var picked: std.ArrayList(TopCand) = .empty; // key 升序
         defer picked.deinit(alloc);
-        try collectGroups(cand.items, alloc, &picked);
+        var picked_edge: ?[]const u8 = null;
+        try collectGroups(cand.items, alloc, &picked, &picked_edge);
         if (picked.items.len < k) return false; // 凑不够 ⇒ 让调用方走全量路径
+        // **不能只把边界组「丢掉就算了」**：`topKDesc` 是在**跨来源合并后**取最大的 k 个，
+        // 丢掉一个边界组之后，第 k 名会由「另一个来源里更小的 key」顶上，
+        // 而那个被丢掉的 key 完全可能是可见行 —— 用户看到的就是错值。
+        // 正确做法：只要被丢掉的最大边界 key 比第 k 名还大，就让调用方走全量归并。
+        if (picked_edge) |ek| {
+            if (segmod.keyCmp(ek, picked.items[picked.items.len - k].key) == .gt) return false;
+        }
         try out.ensureTotalCapacity(alloc, k); // 一次分配到位，别让 k 次 append 各自扩容
         var idx = picked.items.len;
         const stop = picked.items.len - k;
@@ -1203,7 +1220,15 @@ pub const Table = struct {
 
     /// 从「已按 `(key asc, seq desc)` 排序」的候选里归组：同 key 取**第一条**（最新可见版本），
     /// 最新是墓碑或整组不可信（`edge`）就丢掉。输出**组代表**（key 升序），调用方取 `.value`。
-    fn collectGroups(cand: []const TopCand, alloc: std.mem.Allocator, out: *std.ArrayList(TopCand)) !void {
+    ///
+    /// `edge_max` 回填「被丢掉的那类组里的最大 key」：调用方必须用它做**健全性检查** ——
+    /// 丢掉一个 key 后，第 k 名可能被另一个来源的更小 key 顶上，而那个 key 可能是可见行。
+    fn collectGroups(
+        cand: []const TopCand,
+        alloc: std.mem.Allocator,
+        out: *std.ArrayList(TopCand),
+        edge_max: *?[]const u8,
+    ) !void {
         var i: usize = 0;
         while (i < cand.len) {
             var j = i + 1;
@@ -1215,7 +1240,9 @@ pub const Table = struct {
                     break;
                 }
             }
-            if (!suspect and cand[i].flags == 0) try out.append(alloc, cand[i]);
+            if (suspect) {
+                if (edge_max.* == null or segmod.keyCmp(cand[i].key, edge_max.*.?) == .gt) edge_max.* = cand[i].key;
+            } else if (cand[i].flags == 0) try out.append(alloc, cand[i]);
             i = j;
         }
     }

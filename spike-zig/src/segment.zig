@@ -9,7 +9,19 @@ inline fn monoNs(io: std.Io) u64 {
     return @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
 }
 
-pub const INDEX_STRIDE: usize = 64;
+/// 稀疏索引步长：每 `INDEX_STRIDE` 条记录写一个索引项。
+///
+/// **点查成本与它直接相关**：路径是「二分索引项 → 定位块 → **块内线性扫**」，
+/// 每条记录平均要扫 `INDEX_STRIDE/2` 条；而 `sql_orderby_index10` 这类
+/// 「索引顺序 + LIMIT n」的 94% 时间就花在这个逐条回表上（2026-11-04 实测）。
+///
+/// 步长 64 → 16（每次少扫 3/4 的块内记录）：2026-11-04 第一次尝试时**当场露出一个真 bug**
+/// ——`getSeq` 的扫描上界写死在 2 个稀疏块上，同一 key 版本数 > 2×步长时快照查询会
+/// 静默返回 null。该 bug 已修（改成按需扩窗）+ 用例钉死（`3*INDEX_STRIDE+8` 个版本
+/// × 5 个快照点），因此现在可以安全下调步长。
+///
+/// 代价：索引项数量与步长成反比（每条索引项约 16 B），100k 行 64→16 约 25 KB → 100 KB。
+pub const INDEX_STRIDE: usize = 16;
 const FLUSH_BYTES: usize = 1 << 20;
 /// `scanRefs` 这类「先收集再交还」的 API 用来落稳定 key 的分块 arena（实现在 codec 里，与段格式无关）。
 pub const KeyArena = codec.KeyArena;
@@ -22,11 +34,31 @@ pub const KeyArena = codec.KeyArena;
 /// `verifyData()` 对这些段做不了校验（会跳过）—— 旧库不需要离线迁移，
 /// `compact` 重写段时自然变成 v6。
 ///
+/// v6 → v7：**稀疏索引步长 64 → 16**（块划分变了）。读路径本身是按索引项定位 +
+/// 顺序解析记录的，不依赖步长常数，所以 v6 段仍然能正确读（只是块更粗、点查更慢）；
+/// 但为了不让「新旧块混在一起」变成隐性假设，还是升了版本号并把 v6 列为「可读、不再写」，
+/// 旧库 `compact` 一次就全变 v7。
+///
+/// 为什么步长值得动：点查是「二分索引项 → 定位块 → **块内线性扫**」，平均扫 `步长/2` 条；
+/// `sql_orderby_index10` 的 94% 时间就在这个逐条回表上。64 → 16 后实测
+/// `sql_orderby_index10` 2.13M → **3.57M/s**（0.936× → **1.571×** vs SQLite）、
+/// 点查 `get` 1.32M → **1.74M/s**、`big_get` 0.99M → **1.21M/s**；
+/// 代价是索引项数量 ×4（100k 行约 25 KB → 100 KB）。
+///
 /// 为什么整段 CRC 而不是「每块读时验」：实测 `crc32Fast` 只有 1.9–2.1 GB/s，
 /// 一个 1.5 KB 的块要 775 ns，而点查总共 1285 ns —— 读时逐块验会让点查**慢 60%**。
 /// 整段 CRC 在写入时增量算（不额外读盘），读路径**零开销**，代价是校验要显式调用。
 const IDX_MAGIC_V5 = "PEKZIX05";
-const IDX_MAGIC = "PEKZIX06";
+const IDX_MAGIC_V6 = "PEKZIX06";
+const IDX_MAGIC = "PEKZIX07";
+
+/// 索引头「magic 之后紧跟 `u32 data_crc`」的那一族（v6 / v7）。
+/// 抽成函数是因为三处解析都要判它：写死 `mem.eql(.., IDX_MAGIC)` 的话，
+/// 每次升版本都会漏掉其中一处（v7 这次就漏了两处，靠编译期常量求值才发现）。
+inline fn hasDataCrc(idx_bytes: []const u8) bool {
+    return std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC) or
+        std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC_V6);
+}
 
 /// 两串的最长公共前缀长度。
 fn commonPrefixLen(a: []const u8, b: []const u8) usize {
@@ -833,7 +865,14 @@ pub const Segment = struct {
         try self.ensureParsed();
         const n = self.entries.items.len;
         if (n == 0) return &.{};
-        const blocks = want_rows / INDEX_STRIDE + 1;
+        // **`+ 2` 而不是 `+ 1`**：索引项是块粒度，而最后一块常常不满（`rows % INDEX_STRIDE`），
+        // 所以 `want_rows/stride + 1` 块不保证真有 `want_rows` 行。
+        // 2026-11-04 把 `INDEX_STRIDE` 从 64 降到 16 后就因为这一点炸了：
+        // 100 行的段 `want_rows=26` 只回 20 行，窗口最小的一组（就是第 k 名本身）
+        // 被当成「版本链被截断」丢掉，`topKDesc` 又从不重叠的下一段拉了个更小的 key 顶上
+        // ⇒ 返回错的 top-k（用例 `topKDesc：跳段 + 旧版本 + 墓碑` 守住）。
+        // 多要一整块的余量后，被丢掉的那组总在真实第 k 名之下。
+        const blocks = want_rows / INDEX_STRIDE + 2;
         const j = if (n > blocks) n - blocks else 0;
         return self.entryKey(j);
     }
@@ -931,7 +970,7 @@ pub const Segment = struct {
     /// - `parseIdxBody`：首次使用时才做（CRC 覆盖整段，必须全读）。
     fn parseIdxHeader(self: *Segment, idx_bytes: []const u8) !void {
         if (idx_bytes.len < 16) return error.BadIndexChecksum;
-        const v6 = std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC);
+        const v6 = hasDataCrc(idx_bytes);
         if (!v6 and !std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC_V5)) return error.BadIndexMagic;
         const base: usize = if (v6) 12 else 8;
         if (v6) self.data_crc = std.mem.readInt(u32, idx_bytes[8..12], .little);
@@ -971,6 +1010,7 @@ pub const Segment = struct {
             return error.BadIndexChecksum;
         }
         if (!std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC) and
+            !std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC_V6) and
             !std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC_V5)) return error.BadIndexMagic;
 
         if (timing_enabled) {
@@ -980,7 +1020,7 @@ pub const Segment = struct {
         }
 
         self.entries.clearRetainingCapacity();
-        const v6 = std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC);
+        const v6 = hasDataCrc(idx_bytes);
         if (!v6 and !std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC_V5)) return error.BadIndexMagic;
         var r = codec.Reader{ .buf = idx_bytes[if (v6) 12 else 8..] };
         _ = try r.u64le(); // rows（头部已读）
@@ -1179,11 +1219,21 @@ pub const Segment = struct {
         const i = self.candidateIndex(key);
         const begin: usize = @intCast(self.entries.items[i].offset);
         const it = try self.iter();
-        // 上界要**放宽一块**：`candidateIndex` 返回的是「最后一个段首 key 严格小于 target 的块」，
-        // 当 target 恰好是下一块的段首 key 时，`begin` 就在它的**前一块**上。
-        // 只放到 `entries[i+1]` 会在扫完前一块就停，target 根本见不到 → 返回 null
-        // （用例 `同一 key 的多个版本跨过索引边界` 与 `>255 公共前缀` 都会踩到）。
-        const end: u64 = if (i + 2 < self.entries.items.len) self.entries.items[i + 2].offset else it.buf.len;
+        // **窗口起始是两块，但「同 key 版本极多」时必须能继续往后扩**。
+        //
+        // 旧代码把上界写死在 `entries[i+2]`：同一个 key 被更新过 >2×INDEX_STRIDE 次时
+        // （64 步长下 = 128 个版本），「快照比前两块里所有版本都旧」的查询会扫到窗口末尾
+        // 直接 `break` 出去返回 null —— 表现为**这一行查不到**。
+        // 2026-11-04 的一次实验（把步长试改成 16）当场暴露：快照 5 的查询返回 null，
+        // 调用方沿用旧缓冲读到了 v65。
+        //
+        // 但也**不能**改成「一路扫到段尾」：那样「key 不在本段」的情况会退化成 O(段大小)，
+        // 而多段/重叠路径对每个段都要试一次 → 实测把 `sql_orderby_index10` 从 4.7µs
+        // 拖到 7.0µs、`big_get` 的领先倍率从 7.4× 掉到 5.2×。
+        // 所以用「**按需扩窗**」：扫完当前窗口还没见到 `key > target`（说明同 key 版本还在后面），
+        // 才把窗口再往后放一块。
+        var win: usize = i + 2;
+        var end: u64 = if (win < self.entries.items.len) self.entries.items[win].offset else it.buf.len;
         // **必须先判越界再判空区间**：文件被截断时 `begin` 会大于文件长度，
         // 而 `end`（=buf.len）比它小 ⇒ 旧写法 `if (end <= begin) return null` 会直接
         // 把它当成「这段没有数据」，静默少一行都算不上，整个后半段都查不到。
@@ -1191,29 +1241,36 @@ pub const Segment = struct {
         try self.seekToEntry(it, i);
 
         var pos: usize = begin;
-        while (pos < end) {
-            // **就地比较，不重建 key**：块内是「公共前缀 + 后缀」，重建要走两次 memcpy，
-            // 而点查只需要顺序（`RecIter.nextCmp` 的说明里有完整理由）。
-            const rec = it.nextCmp(key) orelse {
-                // `null` = 读完 或 解不出来；两者必须分开（否则损坏会被当成「没找到」）
-                if (it.corrupt) return error.SegmentCorrupt;
-                break;
-            };
-            pos = rec.next;
-            switch (rec.ord) {
-                .lt => continue,
-                .gt => return null,
-                .eq => {
-                    if (rec.seq <= snapshot) {
-                        out.clearRetainingCapacity();
-                        try out.appendSlice(self.alloc, rec.value);
-                        seq_out.* = rec.seq;
-                        return rec.flags;
-                    }
-                },
+        while (true) {
+            while (pos < end) {
+                // **就地比较，不重建 key**：块内是「公共前缀 + 后缀」，重建要走两次 memcpy，
+                // 而点查只需要顺序（`RecIter.nextCmp` 的说明里有完整理由）。
+                const rec = it.nextCmp(key) orelse {
+                    // `null` = 读完 或 解不出来；两者必须分开（否则损坏会被当成「没找到」）
+                    if (it.corrupt) return error.SegmentCorrupt;
+                    return null;
+                };
+                pos = rec.next;
+                switch (rec.ord) {
+                    .lt => continue,
+                    .gt => return null,
+                    .eq => {
+                        if (rec.seq <= snapshot) {
+                            out.clearRetainingCapacity();
+                            try out.appendSlice(self.alloc, rec.value);
+                            seq_out.* = rec.seq;
+                            return rec.flags;
+                        }
+                    },
+                }
             }
+            // 窗口扫完了还没见到 `key > target` ⇒ 同 key 的**更旧版本还在后面的块里**，
+            // 把窗口再往后放一块继续扫。只有「同 key 版本极多」才会走到这里，
+            // 普通 key（含不存在的 key）都会在上面的内层循环里 `.gt` 提前返回。
+            if (end >= it.buf.len) return null;
+            win += 1;
+            end = if (win < self.entries.items.len) self.entries.items[win].offset else it.buf.len;
         }
-        return null;
     }
 
     pub const RefRecord = struct {
@@ -1583,6 +1640,67 @@ test "segment：同一 key 的多个版本跨过索引边界（64 行）时，�
     // 快照 = 5：只有 v5 及更旧可见
     _ = try seg.get("k", 5, &out);
     try std.testing.expectEqualStrings("v5", out.items);
+}
+
+test "segment：同一 key 的版本**跨过两块以上**时，快照点查仍必须拿到正确版本（不能返回 null）" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-dupkey-multiblock-tmp";
+    dir.deleteTree(io, tmp) catch {};
+    try dir.createDirPath(io, tmp);
+    defer dir.deleteTree(io, tmp) catch {};
+
+    // **这是 2026-11-04 抓到的真缺陷**（当时正在试「把 INDEX_STRIDE 从 64 调小」）：
+    // `getSeq` 原来把扫描上界限在「两块」，于是同一个 key 的版本一旦超过 2×INDEX_STRIDE 条，
+    // 「快照比前两块里所有版本都旧」的查询就会扫到窗口末尾直接返回 null —— 表现为**整行查不到**。
+    // 这里用 3×INDEX_STRIDE+8 个版本，保证必然跨过 3 块。
+    const nver: u64 = 3 * INDEX_STRIDE + 8;
+    {
+        var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc, 10, nver);
+        defer w.deinit();
+        var s: u64 = nver;
+        while (s >= 1) : (s -= 1) {
+            const buf = try std.fmt.allocPrint(alloc, "v{d}", .{s});
+            defer alloc.free(buf);
+            try w.push("k", s, 0, buf);
+            if (s == 1) break;
+        }
+        _ = try w.finish(dir, tmp ++ "/000001.idx");
+    }
+
+    var seg = try Segment.open(io, dir, tmp ++ "/000001.data", tmp ++ "/000001.idx", alloc, false);
+    defer seg.close();
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    // 最新版本
+    try std.testing.expectEqual(@as(u8, 0), (try seg.get("k", 1_000_000, &out)).?);
+    var nbuf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&nbuf, "v{d}", .{nver}), out.items);
+
+    // **关键**：快照落在第 3 块之后的版本区（旧实现这里会返回 null）
+    const probes = [_]u64{ 1, 5, INDEX_STRIDE + 1, 2 * INDEX_STRIDE + 3, nver - 1 };
+    for (probes) |snap| {
+        out.clearRetainingCapacity();
+        const flags = (try seg.get("k", snap, &out)) orelse {
+            std.debug.print("快照 {d} 点查返回 null（应为 v{d}）\n", .{ snap, snap });
+            try std.testing.expect(false);
+            continue;
+        };
+        try std.testing.expectEqual(@as(u8, 0), flags);
+        var wbuf: [32]u8 = undefined;
+        const want = try std.fmt.bufPrint(&wbuf, "v{d}", .{snap});
+        try std.testing.expectEqualStrings(want, out.items);
+    }
+
+    // 不存在的 key 仍然必须快速返回 null（不限上界不等于「扫全段」）
+    out.clearRetainingCapacity();
+    try std.testing.expect((try seg.get("zzz", 1_000_000, &out)) == null);
 }
 
 test "segment write + point get + scan" {
