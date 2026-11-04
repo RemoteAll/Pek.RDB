@@ -2,6 +2,7 @@
 // 个人使用免费；商业使用需商业授权，或同样以 AGPL-3.0 开源（见 LICENSE）。
 const std = @import("std");
 const codec = @import("codec.zig");
+const build_options = @import("build_options");
 
 /// 单调纳秒时钟（`Writer` 内部计时用）。
 inline fn monoNs(io: std.Io) u64 {
@@ -103,19 +104,24 @@ fn hashPair(key: []const u8) [2]u64 {
 /// 这就是 SQLite `sqlite3BtreeOpen` 的做法：open 只读第 1 页（`pPage1`），其余页按需缺页。
 pub const IndexMap = struct {
     io: std.Io,
-    file: std.Io.File,
-    mm: std.Io.File.MemoryMap,
+    /// 只有 mmap 后端才持有文件句柄（读入缓冲不需要，文件已关闭）
+    file: ?std.Io.File = null,
+    mm: ?std.Io.File.MemoryMap = null,
+    /// `-Dmmap=false`（无 MMU 目标）时的后备：整文件读进堆内存
+    owned: []u8 = &.{},
+    alloc: std.mem.Allocator = undefined,
 
     pub fn bytes(self: *const IndexMap) []const u8 {
-        return self.mm.memory;
+        return if (self.mm) |m| m.memory else self.owned;
     }
 
     /// 释放映射与文件句柄。**必须在 Table 生命周期结束前、或归档被 rename 覆盖后调用**
     /// （rename 本身不会被拒，见 `test "mmap 存活时 rename 覆盖同路径"`，但映射
     /// 仍指向旧 inode，内容会过期，所以之后必须不再使用）。
     pub fn destroy(self: *IndexMap) void {
-        self.mm.destroy(self.io);
-        self.file.close(self.io);
+        if (self.mm) |*m| m.destroy(self.io);
+        if (self.owned.len > 0) self.alloc.free(self.owned);
+        if (self.file) |f| f.close(self.io);
         self.* = undefined;
     }
 };
@@ -129,7 +135,7 @@ pub const IndexMap = struct {
 /// `NtSetInformationVirtualMemory(Prefetch)` 把**整段**拉进工作集（`std/Io/Threaded.zig`
 /// `createFileMap` 里对 `[ptr, len)` 一次性预取）。3 MB 的归档预取是好事（冷重开 0.6 ms 有它一份），
 /// 但 100 GB 的归档预取 = 打开时读 100 GB，所以必须按大小关掉。
-pub fn mapWholeFile(io: std.Io, dir: std.Io.Dir, path: []const u8, max: u64, prefault_max: u64) !IndexMap {
+pub fn mapWholeFile(io: std.Io, dir: std.Io.Dir, path: []const u8, alloc: std.mem.Allocator, max: u64, prefault_max: u64) !IndexMap {
     const f = try dir.openFile(io, path, .{});
     errdefer f.close(io);
     const size = (try f.stat(io)).size;
@@ -139,12 +145,24 @@ pub fn mapWholeFile(io: std.Io, dir: std.Io.Dir, path: []const u8, max: u64, pre
     // `@intCast(size)` 到 `usize` 在越界时是安全模式 panic / ReleaseFast UB，
     // 所以必须显式拒绝（而不是让下标宽度静默截断）。
     if (size > std.math.maxInt(usize)) return error.FileTooBig;
+
+    // **§16.5 的 `-Dmmap=false`**：无 MMU 目标上没有虚拟内存，只能整段读进堆内存。
+    // 代价是常驻内存 = 文件大小（调用方的 `max` 参数就是这里的上限阀）。
+    if (!build_options.mmap) {
+        const buf = try alloc.alloc(u8, @intCast(size));
+        errdefer alloc.free(buf);
+        const n = try f.readPositionalAll(io, buf, 0);
+        if (n != buf.len) return error.UnexpectedEof;
+        f.close(io);
+        return .{ .io = io, .alloc = alloc, .owned = buf };
+    }
+
     const mm = try std.Io.File.MemoryMap.create(io, f, .{
         .len = @intCast(size),
         .protection = .{ .read = true, .write = false },
         .populate = size <= prefault_max,
     });
-    return .{ .io = io, .file = f, .mm = mm };
+    return .{ .io = io, .file = f, .mm = mm, .alloc = alloc };
 }
 
 pub fn readWholeFile(io: std.Io, dir: std.Io.Dir, path: []const u8, alloc: std.mem.Allocator, max: u64) ![]u8 {
@@ -754,6 +772,8 @@ pub const Segment = struct {
     mapped: bool = false,
     data: []const u8 = &.{},
     mm: ?std.Io.File.MemoryMap = null,
+    /// `-Dmmap=false` 时数据文件被读进这里（`mm` 为 null）。
+    owned_data: []u8 = &.{},
     file: ?std.Io.File = null,
     /// 索引字节：单段 `.idx` 文件内容，或聚合 `index.bin` 里本段的切片。
     /// `owns_idx=true` 时由本段负责释放（单文件模式 / flush 后接管）；
@@ -1032,17 +1052,27 @@ pub const Segment = struct {
             t0 = t1;
         }
         if (self.file_size > 0) {
-            var mm = try std.Io.File.MemoryMap.create(self.io, f, .{
-                .len = @intCast(self.file_size),
-                .protection = .{ .read = true, .write = false },
-                // **必须显式给 `populate`**：默认 true 会在映射建立时预取整段，
-                // 对随机点查是纯浪费（见 `data_prefault_max` 的注释）。
-                .populate = self.data_prefault_max != 0 and self.file_size <= self.data_prefault_max,
-            });
-            errdefer mm.destroy(self.io);
-            if (self.preheat) try mm.read(self.io);
-            self.mm = mm;
-            self.data = mm.memory;
+            if (build_options.mmap) {
+                var mm = try std.Io.File.MemoryMap.create(self.io, f, .{
+                    .len = @intCast(self.file_size),
+                    .protection = .{ .read = true, .write = false },
+                    // **必须显式给 `populate`**：默认 true 会在映射建立时预取整段，
+                    // 对随机点查是纯浪费（见 `data_prefault_max` 的注释）。
+                    .populate = self.data_prefault_max != 0 and self.file_size <= self.data_prefault_max,
+                });
+                errdefer mm.destroy(self.io);
+                if (self.preheat) try mm.read(self.io);
+                self.mm = mm;
+                self.data = mm.memory;
+            } else {
+                // `-Dmmap=false`：无虚拟内存的目标上只能整文件读入堆内存。
+                const buf = try self.alloc.alloc(u8, @intCast(self.file_size));
+                errdefer self.alloc.free(buf);
+                const n = try f.readPositionalAll(self.io, buf, 0);
+                if (n != buf.len) return error.UnexpectedEof;
+                self.owned_data = buf;
+                self.data = buf;
+            }
         }
         if (timing_enabled) timing.mmap += tick(self.io) - t0;
         // 只有全邨成功才标记，失败的调用可以被重试
@@ -1056,6 +1086,7 @@ pub const Segment = struct {
         self.key_arena.deinit(self.alloc);
         if (self.owns_idx and self.idx.len > 0) self.alloc.free(@constCast(self.idx));
         if (self.mm) |*m| m.destroy(self.io);
+        if (self.owned_data.len > 0) self.alloc.free(self.owned_data);
         if (self.file) |f| f.close(self.io);
         self.* = undefined;
     }
@@ -1376,11 +1407,24 @@ test "ArchiveWriter 流式写入与 archiveRewrite 一次性写入逐字节相�
         _ = try w.finish();
     }
 
-    var m1 = try mapWholeFile(io, dir, p_batch, 0, 0);
+    var m1 = try mapWholeFile(io, dir, p_batch, std.testing.allocator, 0, 0);
     defer m1.destroy();
-    var m2 = try mapWholeFile(io, dir, p_stream, 0, 0);
+    var m2 = try mapWholeFile(io, dir, p_stream, std.testing.allocator, 0, 0);
     defer m2.destroy();
     try std.testing.expectEqualSlices(u8, m1.bytes(), m2.bytes());
+
+    // **开关真的切了后端**：`-Dmmap=false` 必须走堆缓冲，而不是悄悄退回映射。
+    // 没有这条断言，`-Dmmap=false` 的全量绿可能是假绿（两个分支写反了也照样绿）。
+    if (build_options.mmap) {
+        try std.testing.expect(m1.mm != null);
+        try std.testing.expectEqual(@as(usize, 0), m1.owned.len);
+        try std.testing.expect(m1.file != null);
+    } else {
+        try std.testing.expect(m1.mm == null);
+        try std.testing.expect(m1.owned.len > 0);
+        try std.testing.expect(m1.file == null); // 文件已关闭，不占句柄
+        try std.testing.expectEqual(m1.owned.len, m1.bytes().len);
+    }
 
     // 顺带确认读回顺序/内容与写入一致（含空 payload 这种边界）
     var it = ArchiveIter{ .buf = m2.bytes() };

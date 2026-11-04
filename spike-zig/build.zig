@@ -12,6 +12,7 @@ pub fn build(b: *std.Build) void {
     //                    （无 OS / 无 MMU 的 C 档目标上它是 `@compileError`）。
     const has_sql = b.option(bool, "sql", "Include the SQL layer (sql/schema/exec/engine/catalog)") orelse true;
     const has_threads = b.option(bool, "threads", "Enable single-thread assertions (needs std.Thread.getCurrentId)") orelse true;
+    const has_mmap = b.option(bool, "mmap", "Use mmap for segment/archive files (false = read into heap, for no-MMU targets)") orelse true;
 
     // **lite 模式**（`-Dlite=true`）：跳过重型诊断探针，只跑与 SQLite 对比的指标。
     // 为什么要它：加上 strong/fb32/fb64/walab 四组后，一次基准的写入量从约 1.0GB 涨到约 2.5GB，
@@ -24,6 +25,7 @@ pub fn build(b: *std.Build) void {
     opts.addOption(bool, "lite", lite);
     opts.addOption(bool, "sql", has_sql);
     opts.addOption(bool, "threads", has_threads);
+    opts.addOption(bool, "mmap", has_mmap);
     const build_options = opts.createModule();
 
     const mod = b.addModule("pek_rdb_spike", .{

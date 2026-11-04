@@ -2198,8 +2198,50 @@ const oom_queries = [_][]const u8{
     "DROP INDEX IF EXISTS idx_nope", // 幂等分支
 };
 
+// **为什么不用 `std.testing.checkAllAllocationFailures`**（实测，2026-11-03）：
+// 它要求「同一个被测函数每次运行时分配序列完全相同」——先跑一遍记下 `alloc_index = N`，
+// 再用 `fail_index = 0..N-1` 各跑一遍，若某轮**一次分配都没被触发**却正常返回，就报
+// `NondeterministicMemoryUsage`。本用例不满足该前提：连跑四轮实测计数为
+// `-Dmmap=true` → 235 / 235 / 234 / 235，`-Dmmap=false` → 235 / 233 / 233 / 233
+// （浮动来自装配路径上的容量复用与段视图缓存，属正常行为，不是泄漏）。
+// 于是标准库那套会**偶发假红**（默认配置能过纯属运气）。
+//
+// 改成自驱扫描，判据只看真正关心的三件事，且不依赖计数稳定：
+//   ① 任何注入点都不许泄漏 / 重复释放（`allocated_bytes == freed_bytes`）；
+//   ② 不许把 OOM 吞掉（真的注入了却正常返回 = 吞错）；
+//   ③ 不许把 OOM 变成别的错误（区分「内存不足」与「逻辑错误」）。
+// 另外加两条防空跑断言：注入真的发生过（`induced > 20`），且每轮分配数不超过扫描上限。
 test "任意分配失败：查询装配全路径不泄漏、不重复释放" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, oomProbeFn, .{ "test-oom-query", &oom_setup, &oom_queries });
+    const alloc = std.testing.allocator;
+    // 基准轮：确定扫描上限 N（取首轮值，实测为各轮最大值）
+    const limit = x: {
+        var fa = std.testing.FailingAllocator.init(alloc, .{});
+        try oomProbeFn(fa.allocator(), "test-oom-query", &oom_setup, &oom_queries);
+        break :x fa.alloc_index;
+    };
+    try std.testing.expect(limit > 100); // 防空跑：扫描点不能少得可怜
+
+    var induced: usize = 0;
+    for (0..limit) |i| {
+        var fa = std.testing.FailingAllocator.init(alloc, .{ .fail_index = i });
+        const r = oomProbeFn(fa.allocator(), "test-oom-query", &oom_setup, &oom_queries);
+        // ①②：无论成败，注入式分配器都必须收支平衡
+        try std.testing.expectEqual(fa.allocated_bytes, fa.freed_bytes);
+        if (r) |_| {
+            // ②：注入了却正常返回，说明某处把 OOM 吞了
+            try std.testing.expect(!fa.has_induced_failure);
+            // 该轮没用满 i 次分配（计数漂移的正常表现），不算失败；
+            // 但若某轮需要超过基准上限，说明上限取小了，必须报出来。
+            try std.testing.expect(fa.alloc_index <= limit);
+            continue;
+        } else |e| {
+            // ③：只允许 OOM，其它错误都是这条路径上的真缺陷
+            try std.testing.expect(e == error.OutOfMemory);
+            if (fa.has_induced_failure) induced += 1;
+        }
+    }
+    // 防空跑：绝大多数注入点必须真的注入到（否则这个用例什么都没测）
+    try std.testing.expect(induced > 100);
 }
 
 // ---------------------------------------------------------------------------

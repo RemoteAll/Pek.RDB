@@ -380,7 +380,7 @@ fn rebuildArchive(
         // 0 字节 `.data` = 崩溃残留（`flushImpl` 就是这以后再覆盖同一路径），跳过即可。
         // 这就是为什么用 `mapWholeFile` 而不是 `openFile`+`stat`：它顺带把
         // 「空文件」变成 `FileNotFound`，不依赖 caller 自己判 size。
-        const m = segmod.mapWholeFile(io, dir, data_path, 0, 0) catch |e| switch (e) {
+        const m = segmod.mapWholeFile(io, dir, data_path, alloc, 0, 0) catch |e| switch (e) {
             error.FileNotFound => continue, // 枚举后被删了 / 0 字节残留
             else => return e,
         };
@@ -678,7 +678,7 @@ pub const Table = struct {
             // 而 mmap 建映射 ~0.3ms，且只访问段头部时只缺页 25 页（~0.02ms）。
             // 这是 SQLite `sqlite3BtreeOpen` 只读第 1 页的同款做法。
             // 上限/预缺页都由 Options 控制：0 = 不限制（64 位默认），预缺页只对小归档开。
-            if (segmod.mapWholeFile(io, dir, index_path, opts.index_max_bytes, opts.index_prefault_max_bytes)) |m| {
+            if (segmod.mapWholeFile(io, dir, index_path, alloc, opts.index_max_bytes, opts.index_prefault_max_bytes)) |m| {
                 idx_map = m;
                 arch = m.bytes();
                 break :blk true;
@@ -705,7 +705,7 @@ pub const Table = struct {
                 // 现在只有「确实没有 .data」才是那个错误（由 `rebuildArchive` 自己返回），
                 // 损坏一律原样抛 `SegmentCorrupt` / IO 错误。
                 _ = try rebuildArchive(io, dir, path, alloc, opts.bloom_bits);
-                idx_map = try segmod.mapWholeFile(io, dir, index_path, opts.index_max_bytes, opts.index_prefault_max_bytes);
+                idx_map = try segmod.mapWholeFile(io, dir, index_path, alloc, opts.index_max_bytes, opts.index_prefault_max_bytes);
                 arch = idx_map.?.bytes();
                 try segmod.archiveCheckMagic(arch);
             } else {
@@ -1702,7 +1702,7 @@ pub const Table = struct {
         self.idx_archive = &.{};
 
         // 先落字段再做事：后面任何一步失败，`deinit` 都能把已建立的东西收干净
-        self.idx_map = try segmod.mapWholeFile(self.io, self.dir, self.index_path, self.opts.index_max_bytes, self.opts.index_prefault_max_bytes);
+        self.idx_map = try segmod.mapWholeFile(self.io, self.dir, self.index_path, self.alloc, self.opts.index_max_bytes, self.opts.index_prefault_max_bytes);
         self.idx_archive = self.idx_map.?.bytes();
         try segmod.archiveCheckMagic(self.idx_archive);
         const opened = try openSegmentsFromArchive(
