@@ -112,10 +112,14 @@ fn indexCollect(
         break :blk &local_it;
     };
 
+    // 复合索引：前缀只吃掉**首列**那一段，剩下的还有 (n-1) 个值分量，必须按索引定义继续跳过
+    // —— 直接 `rec.key[prefix.len..]` 当主键会在多列索引上取到「第二列 ++ 主键」，回表全错。
+    const ix = s.indexOnColumn(column_idx) orelse return error.ColumnNotFound;
     while (it.next()) |rec| {
         // 前缀不匹配就停：脏项、以及上界为「无上界」时的越界都靠这一句兜住
         if (!std.mem.startsWith(u8, rec.key, prefix)) break;
-        const raw = (try t.get(rec.key[prefix.len..], &vbuf)) orelse continue; // 行已删 → 脏项
+        const pk = try indexPkSlice(s, .{ .name = ix.name, .columns = ix.columns[1..] }, rec.key[prefix.len..]);
+        const raw = (try t.get(pk, &vbuf)) orelse continue; // 行已删 → 脏项
         try s.decodeRowInto(row_vals, raw);
         // **回表复核**：索引项可能过期（更新/删除的中间态），必须重判谓词
         if (!evalWhere(row_vals[column_idx], .eq, want)) continue;
@@ -184,8 +188,9 @@ fn indexCollectRange(
     try it.init(itbl, start, end);
     defer it.deinit();
 
+    const ix = s.indexOnColumn(column_idx) orelse return error.ColumnNotFound;
     while (it.next()) |rec| {
-        const pk = try indexPkSlice(s, column_idx, rec.key);
+        const pk = try indexPkSlice(s, ix, rec.key);
         const raw = (try t.get(pk, &vbuf)) orelse continue; // 行已删 → 脏项
         try s.decodeRowInto(row_vals, raw);
         // **回表复核**：索引项可能过期（更新/删除的中间态），必须重判谓词
@@ -201,14 +206,18 @@ fn indexCollectRange(
     if (it.corrupt) return error.SegmentCorrupt;
 }
 
-/// 维护索引项：`vals` 为行值，`skip_if_present` 用于「更新时新旧值相同就不动」。
+/// 维护索引项：`vals` 为行值。**任一索引列为 NULL 就不收录**（索引对 NULL 无意义，
+/// 且 `=` 永远匹配不到 NULL）。
 fn putIndexEntries(host: ?*const IndexHost, s: *const schema_mod.Schema, vals: []const sql.Value, alloc: std.mem.Allocator) !void {
     const h = host orelse return;
     for (h.schema.indexes) |ix| {
-        const v = vals[ix.column_idx];
-        if (isNullValue(v)) continue; // NULL 不入索引
+        var any_null = false;
+        for (ix.columns) |ci| {
+            if (isNullValue(vals[ci])) any_null = true;
+        }
+        if (any_null) continue;
         const itbl = h.tables.getPtr(ix.name) orelse continue;
-        const key = try s.encodeIndexKey(alloc, ix.column_idx, v, vals[s.pk_index]);
+        const key = try s.encodeIndexKey(alloc, ix.columns, vals, vals[s.pk_index]);
         defer alloc.free(key);
         try itbl.put(key, &.{});
     }
@@ -217,36 +226,23 @@ fn putIndexEntries(host: ?*const IndexHost, s: *const schema_mod.Schema, vals: [
 fn delIndexEntries(host: ?*const IndexHost, s: *const schema_mod.Schema, vals: []const sql.Value, alloc: std.mem.Allocator) !void {
     const h = host orelse return;
     for (h.schema.indexes) |ix| {
-        const v = vals[ix.column_idx];
-        if (isNullValue(v)) continue;
+        var any_null = false;
+        for (ix.columns) |ci| {
+            if (isNullValue(vals[ci])) any_null = true;
+        }
+        if (any_null) continue;
         const itbl = h.tables.getPtr(ix.name) orelse continue;
-        const key = try s.encodeIndexKey(alloc, ix.column_idx, v, vals[s.pk_index]);
+        const key = try s.encodeIndexKey(alloc, ix.columns, vals, vals[s.pk_index]);
         defer alloc.free(key);
         try itbl.delete(key);
     }
 }
 
-/// 从索引键（`值分量 ++ 主键分量`，两段都自定界）里切出**主键分量**。
-///
-/// 数值型值分量是 8 字节定长（`codec.encodeI64Key` / IEEE 位变换），text/blob 则是
-/// 「转义后以 `0x00 0x01` 收尾」（原文里的 `0x00` 被写成 `0x00 0xFF`）。
-/// **必须按列的存储类型判定**：两种编码都不带类型 tag，光看字节区分不开。
-fn indexPkSlice(s: *const schema_mod.Schema, ci: usize, key: []const u8) ![]const u8 {
-    if (schema_mod.columnComponentIsFixed(s.columns[ci].col_type)) {
-        if (key.len < 8) return error.Truncated;
-        return key[8..];
-    }
-    var i: usize = 0;
-    while (i + 1 < key.len) : (i += 1) {
-        if (key[i] != 0) continue;
-        if (key[i + 1] == 0xFF) {
-            i += 1; // 转义：这个 0 是原文的一部分
-            continue;
-        }
-        if (key[i + 1] == 0x01) return key[i + 2 ..];
-        return error.Truncated; // `0x00` 后面只能是 0xFF（转义）或 0x01（终止符）
-    }
-    return error.Truncated;
+/// 从索引键里切出**主键分量**（把前 N 个值分量依次跳过）。实现已下沉到 `schema`：
+/// 建索引回填、查询、维护三处必须用同一套切分规则，否则“建的时候按 1 段、查的时候按 2 段”
+/// 这类不一致会直接表现为漏行。
+fn indexPkSlice(s: *const schema_mod.Schema, ix: schema_mod.IndexDef, key: []const u8) ![]const u8 {
+    return s.indexPkSlice(ix.columns, key);
 }
 
 /// `ORDER BY <已建索引的非主键列> ASC`（无 WHERE）⇒ 直接扫索引表，凑够 `offset+limit` 就停。
@@ -270,10 +266,12 @@ fn selectByIndexOrder(
     t: *tablemod.Table,
     s: *const schema_mod.Schema,
     sel: sql.Select,
-    ci: usize,
+    ix: schema_mod.IndexDef,
     alloc: std.mem.Allocator,
 ) !?Rows {
-    const itbl = host.onColumn(ci) orelse return null;
+    const itbl = host.tables.getPtr(ix.name) orelse return null;
+    // 谓词剪枝只能用**首列**（只有首列在索引键里是全局有序的）
+    const ci = ix.firstColumn();
     const limit = sel.limit orelse return null;
     const want = @as(usize, sel.offset orelse 0) + @as(usize, limit);
 
@@ -332,7 +330,7 @@ fn selectByIndexOrder(
     defer it.deinit();
     while (it.next()) |rec| {
         if (spans.items.len >= want) break;
-        const pk = try indexPkSlice(s, ci, rec.key);
+        const pk = try indexPkSlice(s, ix, rec.key);
         const raw = (try t.get(pk, &vbuf)) orelse continue; // 脏项
         if (where_col) |wci| {
             try s.decodeRowInto(row_vals.?, raw);
@@ -357,6 +355,43 @@ fn selectByIndexOrder(
     sel2.order_by = &[_]sql.OrderItem{};
     sel2.where = null;
     return try finishFromValues(t.io, s, sel2, alloc, rows);
+}
+
+/// 找一个能**直接满足 `ORDER BY`** 的索引：索引列序必须与排序列表**完全一致**且全为 `ASC`。
+///
+/// 为什么必须完全一致：索引顺序是 `(c1, c2, …, pk)`。若只匹配前两列而索引还有第三列，
+/// 那「c1 相同、c2 相同」的行是按 c3 排的，而全量路径按主键稳定排序 —— 两条路径结果不同。
+/// 只有「索引列数与排序列表长度相等」时，并列处的顺序才统一落到主键上。
+///
+/// 三条降级条件（与单列时代同一口径）：`DESC` 不用（并列次序会反）、
+/// 可空列不用（NULL 不入索引，升序里 NULL 本应排最前）、索引列不能是主键。
+fn findIndexMatchingOrder(s: *const schema_mod.Schema, h: *const IndexHost, order: []const sql.OrderItem) ?schema_mod.IndexDef {
+    for (s.indexes) |ix| {
+        if (ix.columns.len != order.len) continue;
+        if (h.tables.getPtr(ix.name) == null) continue;
+        var ok = true;
+        for (order, ix.columns) |o, ci| {
+            if (o.desc) {
+                ok = false;
+                break;
+            }
+            if (ci == s.pk_index or !s.columns[ci].not_null) {
+                ok = false;
+                break;
+            }
+            const oc = s.indexOf(o.column) orelse {
+                ok = false;
+                break;
+            };
+            // 列序必须**逐位相同**：索引是 (g,h) 就不能拿来回答 `ORDER BY h,g`
+            if (oc != ci) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return ix;
+    }
+    return null;
 }
 
 fn evalWhere(a: sql.Value, op: sql.CmpOp, b: sql.Value) bool {
@@ -1558,17 +1593,23 @@ fn delIndexEntriesIfChanged(
 ) !void {
     const h = host orelse return;
     for (h.schema.indexes) |ix| {
-        const ov = old_vals[ix.column_idx];
-        if (isNullValue(ov)) continue;
+        var old_null = false;
+        for (ix.columns) |ci| {
+            if (isNullValue(old_vals[ci])) old_null = true;
+        }
+        if (old_null) continue; // 旧值本就未收录
         const itbl = h.tables.getPtr(ix.name) orelse continue;
-        const okey = try s.encodeIndexKey(alloc, ix.column_idx, ov, old_vals[s.pk_index]);
+        const okey = try s.encodeIndexKey(alloc, ix.columns, old_vals, old_vals[s.pk_index]);
         defer alloc.free(okey);
-        const nv = new_vals[ix.column_idx];
-        if (isNullValue(nv)) {
+        var new_null = false;
+        for (ix.columns) |ci| {
+            if (isNullValue(new_vals[ci])) new_null = true;
+        }
+        if (new_null) {
             try itbl.delete(okey); // 新值为 NULL → 索引里不该有它
             continue;
         }
-        const nkey = try s.encodeIndexKey(alloc, ix.column_idx, nv, new_vals[s.pk_index]);
+        const nkey = try s.encodeIndexKey(alloc, ix.columns, new_vals, new_vals[s.pk_index]);
         defer alloc.free(nkey);
         if (std.mem.eql(u8, okey, nkey)) continue;
         try itbl.delete(okey);
@@ -1707,12 +1748,9 @@ pub fn selectRowsHost(
     // 可空列走索引会把 NULL 行整批漏掉 —— 而升序里 NULL 恰恰排在最前面。
     // （把 NULL 也编进索引、按「比任何值都小」排序是后续项；在那之前宁可走全表。）
     if (host) |h| {
-        if (sel.order_by.len == 1 and sel.limit != null and !sel.order_by[0].desc) {
-            const o = sel.order_by[0];
-            if (s.indexOf(o.column)) |ci| {
-                if (ci != s.pk_index and s.columns[ci].not_null and h.onColumn(ci) != null) {
-                    if (try selectByIndexOrder(h, t, s, sel, ci, alloc)) |rows| return rows;
-                }
+        if (sel.order_by.len >= 1 and sel.limit != null) {
+            if (findIndexMatchingOrder(s, h, sel.order_by)) |ix| {
+                if (try selectByIndexOrder(h, t, s, sel, ix, alloc)) |rows| return rows;
             }
         }
     }

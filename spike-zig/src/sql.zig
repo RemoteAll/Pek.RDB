@@ -224,12 +224,15 @@ pub const CreateTable = struct {
     columns: []ColumnDef,
 };
 
-/// `CREATE INDEX name ON table (column)` —— 单列等值索引（最小闭环）。
+/// `CREATE INDEX name ON table (col [, col]...)`。
+///
+/// 列序有意义：索引键按这个顺序拼接值分量 ⇒ 首列能用于等值/范围前缀扫描，
+/// 全部列与 `ORDER BY` 完全一致时能省掉排序。
 pub const CreateIndex = struct {
     if_not_exists: bool = false,
     name: []const u8,
     table: []const u8,
-    column: []const u8,
+    columns: []const []const u8,
 };
 
 /// `DROP INDEX [IF EXISTS] name` —— 删除已建索引（不写表名，与 SQLite 一致）。
@@ -930,13 +933,19 @@ const Parser = struct {
         try self.expectKw("on");
         const table = try self.parseIdent();
         _ = try self.expectTag(.lparen);
-        const column = try self.parseIdent();
+        var cols: std.ArrayList([]const u8) = .empty;
+        errdefer cols.deinit(self.arena);
+        while (true) {
+            try cols.append(self.arena, try self.parseIdent());
+            if (self.tok.tag != .comma) break;
+            _ = try self.expectTag(.comma);
+        }
         _ = try self.expectTag(.rparen);
         return .{ .create_index = .{
             .if_not_exists = if_not_exists,
             .name = name,
             .table = table,
-            .column = column,
+            .columns = try cols.toOwnedSlice(self.arena),
         } };
     }
 };

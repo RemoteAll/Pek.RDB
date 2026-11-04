@@ -14,6 +14,8 @@ pub const Error = error{
     CorruptRow,
     Truncated,
     Overflow,
+    /// 索引列号越界（catalog 读到坏列号、或 `CREATE INDEX` 指着不存在的列）
+    ColumnNotFound,
 } || std.mem.Allocator.Error;
 
 pub const Column = struct {
@@ -24,10 +26,17 @@ pub const Column = struct {
     not_null: bool = false,
 };
 
-/// 单列二级索引定义。
+/// 二级索引定义。**列序有意义**：索引键按 `columns` 的顺序拼接值分量，
+/// 所以「首列」决定了等值前缀扫描能不能用，「全部列」决定了 `ORDER BY` 能不能省排序。
 pub const IndexDef = struct {
     name: []const u8,
-    column_idx: usize,
+    /// 索引列号（至少 1 个，顺序即键序）；**所有权在本定义**，`alloc` 分配
+    columns: []const usize,
+
+    /// 首列号（等值/范围前缀扫描的入口列）
+    pub fn firstColumn(self: IndexDef) usize {
+        return self.columns[0];
+    }
 };
 
 pub const Schema = struct {
@@ -76,7 +85,10 @@ pub const Schema = struct {
         for (self.columns) |c| alloc.free(c.name);
         alloc.free(self.columns);
         if (self.indexes.len != 0) {
-            for (self.indexes) |ix| alloc.free(ix.name);
+            for (self.indexes) |ix| {
+                alloc.free(ix.name);
+                alloc.free(ix.columns);
+            }
             alloc.free(self.indexes);
         }
         self.* = undefined;
@@ -87,15 +99,28 @@ pub const Schema = struct {
     /// 名字**不得含空白**：catalog 的 `#idx <名字> <列号>` 是单行空格分隔的格式，
     /// 名字带空格会让它下次加载时被拆成两段（索引静默消失 = 查询退回全扫，还看不出错）。
     /// 词法层本来也只认 `[A-Za-z0-9_]` 标识符（没有引号/方括号），这个限制与全局一致。
-    pub fn addIndex(self: *Schema, alloc: std.mem.Allocator, name: []const u8, column_idx: usize) Error!bool {
+    pub fn addIndex(self: *Schema, alloc: std.mem.Allocator, name: []const u8, columns: []const usize) Error!bool {
         if (name.len == 0 or std.mem.indexOfAny(u8, name, " \t\r\n") != null) return error.InvalidIdentifier;
+        if (columns.len == 0) return error.InvalidIdentifier;
+        for (columns) |ci| {
+            if (ci >= self.columns.len) return error.ColumnNotFound;
+        }
+        // 重复列没有意义，而且会让「索引列数 = 键里的值分量数」这个不变量变得模糊
+        for (columns, 0..) |ci, i| {
+            for (columns[0..i]) |prev| {
+                if (prev == ci) return error.InvalidIdentifier;
+            }
+        }
         for (self.indexes) |ix| {
             if (std.ascii.eqlIgnoreCase(ix.name, name)) return false;
         }
         const grown = try alloc.alloc(IndexDef, self.indexes.len + 1);
         errdefer alloc.free(grown);
         @memcpy(grown[0..self.indexes.len], self.indexes);
-        grown[self.indexes.len] = .{ .name = try alloc.dupe(u8, name), .column_idx = column_idx };
+        const name_copy = try alloc.dupe(u8, name);
+        errdefer alloc.free(name_copy);
+        const cols_copy = try alloc.dupe(usize, columns);
+        grown[self.indexes.len] = .{ .name = name_copy, .columns = cols_copy };
         if (self.indexes.len != 0) alloc.free(self.indexes);
         self.indexes = grown;
         return true;
@@ -116,6 +141,7 @@ pub const Schema = struct {
             const n = self.indexes.len;
             if (n == 1) {
                 alloc.free(self.indexes[i].name);
+                alloc.free(self.indexes[i].columns);
                 alloc.free(self.indexes);
                 self.indexes = &[_]IndexDef{};
                 return true;
@@ -124,6 +150,7 @@ pub const Schema = struct {
             @memcpy(shrunken[0..i], self.indexes[0..i]);
             @memcpy(shrunken[i..], self.indexes[i + 1 .. n]);
             alloc.free(self.indexes[i].name);
+            alloc.free(self.indexes[i].columns);
             alloc.free(self.indexes);
             self.indexes = shrunken;
             return true;
@@ -131,10 +158,10 @@ pub const Schema = struct {
         return false;
     }
 
-    /// 哪些索引建在这一列上（单列索引最多一个，返回第一个）。
+    /// 哪些索引**以这一列开头**（等值/范围前缀扫描只能走首列；多列索引依然能用来做前缀查询）。
     pub fn indexOnColumn(self: *const Schema, column_idx: usize) ?IndexDef {
         for (self.indexes) |ix| {
-            if (ix.column_idx == column_idx) return ix;
+            if (ix.columns[0] == column_idx) return ix;
         }
         return null;
     }
@@ -188,24 +215,73 @@ pub const Schema = struct {
         return out.toOwnedSlice(alloc);
     }
 
-    /// 二级索引键 = `值分量 ++ 主键分量`。
+    /// 二级索引键 = `各索引列的值分量（按索引列序）++ 主键分量`。
     ///
-    /// 两段都自定界，所以查询时把前缀长度切掉就得到**行的主键键**（无需解码主键）；
-    /// 顺序保持，所以等值查询等价于一次键前缀范围扫描。
+    /// 每一段都自定界，所以查询时把前 N 段切掉就得到**行的主键键**（无需解码主键）；
+    /// 顺序保持，所以「首列等值」等价于一次键前缀范围扫描，
+    /// 「`ORDER BY` 与索引列序完全一致」等价于顺序扫描。
     pub fn encodeIndexKey(
         self: *const Schema,
         alloc: std.mem.Allocator,
-        column_idx: usize,
-        col_value: sql.Value,
+        columns: []const usize,
+        values: []const sql.Value,
         pk_value: sql.Value,
     ) Error![]u8 {
-        _ = self;
-        _ = column_idx;
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(alloc);
-        try appendValueComponent(&out, alloc, col_value);
+        for (columns) |ci| {
+            if (ci >= values.len) return error.TypeMismatch;
+            try appendValueComponent(&out, alloc, values[ci]);
+        }
+        _ = self;
         try appendValueComponent(&out, alloc, pk_value);
         return out.toOwnedSlice(alloc);
+    }
+
+    /// 按**给定顺序**拼索引键：`parts` 已经是索引列的值（按索引列序），最后接主键。
+    /// 回填时行值是按投影顺序解出来的，与列号不同序，所以需要这个「已排好序」的入口。
+    pub fn encodeIndexKeyParts(
+        alloc: std.mem.Allocator,
+        parts: []const sql.Value,
+        pk_value: sql.Value,
+    ) Error![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(alloc);
+        for (parts) |v| try appendValueComponent(&out, alloc, v);
+        try appendValueComponent(&out, alloc, pk_value);
+        return out.toOwnedSlice(alloc);
+    }
+
+    /// 一个索引键里第 `off` 字节处那个值分量的**结束位置**。
+    ///
+    /// 数值型定长 8 字节；text/blob 以 `0x00 0x01` 收尾（原文的 `0x00` 被写成 `0x00 0xFF`）。
+    /// 两种编码都不带类型 tag，**只能按列的存储类型判定**。
+    fn componentEnd(col_type: sql.ColumnType, key: []const u8, off: usize) Error!usize {
+        if (columnComponentIsFixed(col_type)) {
+            if (off + 8 > key.len) return error.Truncated;
+            return off + 8;
+        }
+        var i = off;
+        while (i + 1 < key.len) : (i += 1) {
+            if (key[i] != 0) continue;
+            if (key[i + 1] == 0xFF) {
+                i += 1; // 转义：这个 0 是原文的一部分
+                continue;
+            }
+            if (key[i + 1] == 0x01) return i + 2;
+            return error.Truncated; // `0x00` 后面只能是 0xFF（转义）或 0x01（终止符）
+        }
+        return error.Truncated;
+    }
+
+    /// 从索引键里切出**主键分量**（把 `columns.len` 个值分量依次跳过）。
+    pub fn indexPkSlice(self: *const Schema, columns: []const usize, key: []const u8) Error![]const u8 {
+        var off: usize = 0;
+        for (columns) |ci| {
+            if (ci >= self.columns.len) return error.ColumnNotFound;
+            off = try componentEnd(self.columns[ci].col_type, key, off);
+        }
+        return key[off..];
     }
 
     pub fn encodeRow(self: *const Schema, alloc: std.mem.Allocator, values: []const sql.Value) Error![]u8 {
@@ -462,6 +538,38 @@ test "schema key encode order" {
     try std.testing.expect(std.mem.order(u8, k1, k2) == .lt);
 }
 
+test "复合索引键：定长与变长列混排时，切主键必须逐段跳（不能按长度猜）" {
+    const alloc = std.testing.allocator;
+    const cols = [_]Column{
+        .{ .name = "id", .col_type = .integer, .primary_key = true },
+        .{ .name = "t", .col_type = .text }, // 变长
+        .{ .name = "n", .col_type = .integer }, // 定长
+    };
+    var s = try Schema.init(alloc, "t", &cols);
+    defer s.deinit(alloc);
+
+    const vals = [_]sql.Value{ .{ .integer = 42 }, .{ .text = "ab" }, .{ .integer = -7 } };
+    const cols_list = [_]usize{ 1, 2 }; // (t, n)
+    const key = try s.encodeIndexKey(alloc, &cols_list, &vals, vals[0]);
+    defer alloc.free(key);
+
+    // 键 = text 分量（`a b 00 01`，4 字节）++ int 分量（8 字节）++ 主键（8 字节）
+    try std.testing.expectEqual(@as(usize, 4 + 8 + 8), key.len);
+    const pk = try s.indexPkSlice(&cols_list, key);
+    try std.testing.expectEqualSlices(u8, key[12..], pk);
+
+    // 只跳过首列时，剩下的应当是「第二列分量 ++ 主键」
+    const rest = try s.indexPkSlice(cols_list[1..], key[4..]);
+    try std.testing.expectEqualSlices(u8, key[12..], rest);
+
+    // 原文里含 0x00 时必须靠 0xFF 转义区分终止符（切错就会把主键切到半截）
+    const vals_zero = [_]sql.Value{ .{ .integer = 7 }, .{ .text = "a\x00b" }, .{ .integer = 1 } };
+    const key0 = try s.encodeIndexKey(alloc, &cols_list, &vals_zero, vals_zero[0]);
+    defer alloc.free(key0);
+    const pk0 = try s.indexPkSlice(&cols_list, key0);
+    try std.testing.expectEqualSlices(u8, key0[key0.len - 8 ..], pk0);
+}
+
 test "二级索引：名字不许含空白（catalog 行是空格分隔的），重复名字返回 false" {
     const alloc = std.testing.allocator;
     const cols = [_]Column{
@@ -472,15 +580,18 @@ test "二级索引：名字不许含空白（catalog 行是空格分隔的），
     defer s.deinit(alloc);
 
     // 名字带空格 → 拒绝：写进 `schema.txt` 后下次加载会被拆成两段，索引静默消失
-    try std.testing.expectError(error.InvalidIdentifier, s.addIndex(alloc, "my idx", 1));
-    try std.testing.expectError(error.InvalidIdentifier, s.addIndex(alloc, "", 1));
+    try std.testing.expectError(error.InvalidIdentifier, s.addIndex(alloc, "my idx", &[_]usize{1}));
+    try std.testing.expectError(error.InvalidIdentifier, s.addIndex(alloc, "", &[_]usize{1}));
+    // 重复列 / 越界列号：都是「写进去就再读不回来」或「键里分量数对不上」的形态
+    try std.testing.expectError(error.InvalidIdentifier, s.addIndex(alloc, "idx_dup", &[_]usize{ 1, 1 }));
+    try std.testing.expectError(error.ColumnNotFound, s.addIndex(alloc, "idx_bad", &[_]usize{9}));
     try std.testing.expectEqual(@as(usize, 0), s.indexes.len);
 
-    try std.testing.expect(try s.addIndex(alloc, "idx_g", 1));
+    try std.testing.expect(try s.addIndex(alloc, "idx_g", &[_]usize{1}));
     // 同名（大小写不敏感）→ false，不重复登记
-    try std.testing.expect(!try s.addIndex(alloc, "IDX_G", 1));
+    try std.testing.expect(!try s.addIndex(alloc, "IDX_G", &[_]usize{1}));
     try std.testing.expectEqual(@as(usize, 1), s.indexes.len);
-    try std.testing.expectEqual(@as(usize, 1), s.indexOnColumn(1).?.column_idx);
+    try std.testing.expectEqual(@as(usize, 1), s.indexOnColumn(1).?.firstColumn());
     try std.testing.expect(s.indexOnColumn(0) == null);
 }
 

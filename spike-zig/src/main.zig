@@ -895,7 +895,7 @@ fn benchMain() !void {
             {
                 const idx_path = try alloc.print("{s}/idx/idx_g", .{path5});
                 defer alloc.free(idx_path);
-                _ = try s5.addIndex(alloc, "idx_g", 1); // 列 1 = g
+                _ = try s5.addIndex(alloc, "idx_g", &[_]usize{1}); // 列 1 = g
 
                 var idx_tables = std.StringHashMap(tablemod.Table).init(alloc);
                 defer {

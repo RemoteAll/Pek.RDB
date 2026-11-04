@@ -384,12 +384,15 @@ test "差分随机：单表查询与朴素参考实现逐格一致" {
 
     const ins = try buildTInsert(alloc);
     defer alloc.free(ins);
-    // 索引路径与全扫路径必须给一样的结果 —— 两个二级索引都建上
+    // 索引路径与全扫路径必须给一样的结果 —— 两个二级索引都建上；
+    // 另加一个**复合索引**（(g,s) 混合 INTEGER/TEXT）：写路径得同时维护它，
+    // 而任何查询一旦选错索引路径，差分立即报错。
     for ([_][]const u8{
         "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, s TEXT)",
         ins,
         "CREATE INDEX idx_t_g ON t (g)",
         "CREATE INDEX idx_t_s ON t (s)",
+        "CREATE INDEX idx_t_gs ON t (g, s)",
     }) |st| try execSilent(&eng, alloc, st);
 
     const rows = buildT();

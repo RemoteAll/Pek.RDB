@@ -50,7 +50,17 @@ pub fn saveSchema(io: std.Io, dir: std.Io.Dir, table_path: []const u8, s: *const
         // 名字带空格会把下一行加载拆成两段（索引静默消失）。`addIndex` 已拦，这里是
         // 第二道闸：写盘前再确认一次，宁可报错也不写出一个下次读不回来的 catalog。
         if (std.mem.indexOfAny(u8, ix.name, " \t\r\n") != null) return error.BadCatalog;
-        const line = try alloc.print("#idx {s} {d}\n", .{ ix.name, ix.column_idx });
+        // 列号写成逗号分隔：单列时形如 `#idx idx_g 1`，与**旧格式逐字节一致**，
+        // 所以旧库不用迁移、旧版本也能读新库的单列索引。
+        var cols_text: std.ArrayList(u8) = .empty;
+        defer cols_text.deinit(alloc);
+        for (ix.columns, 0..) |ci, k| {
+            if (k != 0) try cols_text.append(alloc, ',');
+            var nb: [24]u8 = undefined;
+            const nt = try std.fmt.bufPrint(&nb, "{d}", .{ci});
+            try cols_text.appendSlice(alloc, nt);
+        }
+        const line = try alloc.print("#idx {s} {s}\n", .{ ix.name, cols_text.items });
         defer alloc.free(line);
         try out.appendSlice(alloc, line);
     }
@@ -58,6 +68,12 @@ pub fn saveSchema(io: std.Io, dir: std.Io.Dir, table_path: []const u8, s: *const
     defer alloc.free(path);
     try writeText(io, dir, path, out.items);
 }
+
+/// 解析中途的索引行：列号列表要自己持有（`Schema` 还没建好，没法调 `addIndex`）。
+const PendingIdx = struct {
+    name: []const u8,
+    cols: std.ArrayList(usize),
+};
 
 pub fn loadSchema(io: std.Io, dir: std.Io.Dir, table_path: []const u8, alloc: std.mem.Allocator) !schema_mod.Schema {
     const path = try alloc.print("{s}/schema.txt", .{table_path});
@@ -72,18 +88,29 @@ pub fn loadSchema(io: std.Io, dir: std.Io.Dir, table_path: []const u8, alloc: st
 
     var cols: std.ArrayList(schema_mod.Column) = .empty;
     defer cols.deinit(alloc);
-    var idxs: std.ArrayList(schema_mod.IndexDef) = .empty;
-    defer idxs.deinit(alloc);
+    var idxs: std.ArrayList(PendingIdx) = .empty;
+    defer {
+        for (idxs.items) |*p| p.cols.deinit(alloc);
+        idxs.deinit(alloc);
+    }
     while (it.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \r\t");
         if (line.len == 0) continue;
         if (std.mem.startsWith(u8, line, "#idx ")) {
             var tok = std.mem.tokenizeScalar(u8, line[5..], ' ');
             const iname = tok.next() orelse return error.BadCatalog;
-            const icol = tok.next() orelse return error.BadCatalog;
-            const ci = std.fmt.parseInt(usize, icol, 10) catch return error.BadCatalog;
+            const icols = tok.next() orelse return error.BadCatalog;
+            var icols_list: std.ArrayList(usize) = .empty;
+            errdefer icols_list.deinit(alloc);
+            var cit = std.mem.splitScalar(u8, icols, ',');
+            while (cit.next()) |one| {
+                if (one.len == 0) return error.BadCatalog;
+                const ci = std.fmt.parseInt(usize, one, 10) catch return error.BadCatalog;
+                try icols_list.append(alloc, ci);
+            }
+            if (icols_list.items.len == 0) return error.BadCatalog;
             // 名字先借 text 的切片，等 Schema.init 之后再统一 dupe 进 Schema
-            try idxs.append(alloc, .{ .name = iname, .column_idx = ci });
+            try idxs.append(alloc, .{ .name = iname, .cols = icols_list });
             continue;
         }
         var tok = std.mem.tokenizeScalar(u8, line, ' ');
@@ -104,9 +131,11 @@ pub fn loadSchema(io: std.Io, dir: std.Io.Dir, table_path: []const u8, alloc: st
     var sch = try schema_mod.Schema.init(alloc, tname, cols.items);
     errdefer sch.deinit(alloc);
     for (idxs.items) |ix| {
-        if (ix.column_idx >= sch.columns.len) return error.BadCatalog;
-        // addIndex 内部会 dupe 名字：这里传的是 text 的借用，函数返回前 text 就释放了
-        _ = try sch.addIndex(alloc, ix.name, ix.column_idx);
+        for (ix.cols.items) |ci| {
+            if (ci >= sch.columns.len) return error.BadCatalog;
+        }
+        // addIndex 内部会 dupe 名字与列号：这里传的是 text 的借用，函数返回前 text 就释放了
+        _ = try sch.addIndex(alloc, ix.name, ix.cols.items);
     }
     return sch;
 }

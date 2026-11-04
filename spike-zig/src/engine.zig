@@ -125,30 +125,53 @@ pub fn fillIndexTimedChunks(
     var keys: std.ArrayList([]const u8) = .empty;
     defer keys.deinit(alloc);
 
-    // **只解码「索引列 + 主键」两列**（对齐 SQLite `OP_Column` 的惰性取值）：
-    // `decodeRowInto` 会把整行所有列都解出来，而我们只需要这两个；
+    // **只解码「索引列 + 主键」**（对齐 SQLite `OP_Column` 的惰性取值）：
+    // `decodeRowInto` 会把整行所有列都解出来，而我们只需要这几列；
     // `decodeRowProjected` 对其余列只读长度 varint、不碰内容。
-    var want: [2]usize = undefined;
-    var want_len: usize = 2;
-    if (ix.column_idx == s.pk_index) {
-        want[0] = ix.column_idx;
-        want_len = 1;
-    } else if (ix.column_idx < s.pk_index) {
-        want[0] = ix.column_idx;
-        want[1] = s.pk_index;
-    } else {
-        want[0] = s.pk_index;
-        want[1] = ix.column_idx;
+    const ncols = ix.columns.len;
+    const want = try alloc.alloc(usize, ncols + 1);
+    defer alloc.free(want);
+    var want_len: usize = 0;
+    {
+        // 插入排序 + 去重（列数是个位数量级）：`decodeRowProjected` 要求 want **严格升序**
+        for (ix.columns) |ci| {
+            var pos: usize = 0;
+            while (pos < want_len and want[pos] < ci) : (pos += 1) {}
+            if (pos < want_len and want[pos] == ci) continue;
+            var k = want_len;
+            while (k > pos) : (k -= 1) want[k] = want[k - 1];
+            want[pos] = ci;
+            want_len += 1;
+        }
+        const pk = s.pk_index;
+        var pos: usize = 0;
+        while (pos < want_len and want[pos] < pk) : (pos += 1) {}
+        if (!(pos < want_len and want[pos] == pk)) {
+            var k = want_len;
+            while (k > pos) : (k -= 1) want[k] = want[k - 1];
+            want[pos] = pk;
+            want_len += 1;
+        }
     }
-    const col_pos: usize = if (want[0] == ix.column_idx) 0 else 1;
-    const pk_pos: usize = if (want[0] == s.pk_index) 0 else 1;
+    const idx_pos = try alloc.alloc(usize, ncols);
+    defer alloc.free(idx_pos);
+    for (ix.columns, 0..) |ci, k| {
+        var pos: usize = 0;
+        while (want[pos] != ci) : (pos += 1) {}
+        idx_pos[k] = pos;
+    }
+    var pk_pos: usize = 0;
+    while (want[pk_pos] != s.pk_index) : (pk_pos += 1) {}
+    const parts = try alloc.alloc(sql.Value, ncols);
+    defer alloc.free(parts);
 
     const row_vals = try alloc.alloc(sql.Value, want_len);
     defer alloc.free(row_vals);
 
-    // 索引列是数值型时，键的前 8 字节就是完整的值分量（见 `schema.writeFixedComponent`），
+    // 单列 + 数值型时，键的前 8 字节就是完整的值分量（见 `schema.writeFixedComponent`），
     // 于是「按前 8 字节稳定排序」= 完全正确且不需要全键比较（主键部分天然已升序）。
-    const numeric_col = switch (s.columns[ix.column_idx].col_type) {
+    // 多列时不启用（第一列相同但第二列不同，按前 8 字节会排错）⇒ 走全键比较。
+    const numeric_col = ncols == 1 and switch (s.columns[ix.columns[0]].col_type) {
         .integer, .bigint, .datetime, .real, .double => true,
         else => false,
     };
@@ -176,20 +199,22 @@ pub fn fillIndexTimedChunks(
         if (chunk_arena == null) chunk_arena = std.heap.ArenaAllocator.init(alloc);
         const aa = chunk_arena.?.allocator();
         try s.decodeRowProjected(row_vals, want[0..want_len], rec.value);
-        const v = row_vals[col_pos];
-        switch (v) {
-            .null => continue, // NULL 不入索引
-            else => {},
+        var any_null = false;
+        for (idx_pos, 0..) |p, k| {
+            parts[k] = row_vals[p];
+            if (parts[k] == .null) any_null = true;
         }
-        const pk = row_vals[if (want_len == 1) 0 else pk_pos];
-        // 数值 + 数值：键恰好 16 字节定长，直接在栈上拼（省掉 encodeIndexKey 里
-        // 两次 ArrayList 分配/拼接）；其余情形走通用编码。
+        if (any_null) continue; // 任一索引列是 NULL ⇒ 不入索引（与等值匹配语义一致）
+        const pk = row_vals[pk_pos];
+        // 单列 + 数值 + 数值主键：键恰好 16 字节定长，直接在栈上拼（省掉两次 ArrayList 分配/拼接）；
+        // 其余情形走通用编码（多列索引必须如此：值分量有多个）。
         var fixed: [16]u8 = undefined;
-        const key: []const u8 = if (@import("schema.zig").writeFixedComponent(fixed[0..8], v) and
+        const key: []const u8 = if (ncols == 1 and
+            @import("schema.zig").writeFixedComponent(fixed[0..8], parts[0]) and
             @import("schema.zig").writeFixedComponent(fixed[8..16], pk))
             try aa.dupe(u8, &fixed)
         else
-            try s.encodeIndexKey(aa, ix.column_idx, v, pk);
+            try @import("schema.zig").Schema.encodeIndexKeyParts(aa, parts, pk);
         try keys.append(alloc, key);
         ph.rows += 1;
         if (keys.items.len >= CHUNK_ROWS) {
@@ -624,7 +649,13 @@ pub const Engine = struct {
             if (def.if_not_exists) return false;
             return error.IndexExists;
         }
-        const ci = e.schema.indexOf(def.column) orelse return error.ColumnNotFound;
+        if (def.columns.len == 0) return error.ColumnNotFound;
+        // 列名 → 列号（顺序保留：索引键就是按这个顺序拼的）
+        const ci_list = try self.alloc.alloc(usize, def.columns.len);
+        defer self.alloc.free(ci_list);
+        for (def.columns, 0..) |cname, k| {
+            ci_list[k] = e.schema.indexOf(cname) orelse return error.ColumnNotFound;
+        }
 
         const path = try self.alloc.print("{s}/{s}", .{ self.root, def.table });
         defer self.alloc.free(path);
@@ -637,7 +668,7 @@ pub const Engine = struct {
             path,
             &e.schema,
             &e.table,
-            .{ .name = def.name, .column_idx = ci },
+            .{ .name = def.name, .columns = ci_list },
         );
         var itbl_owned = true;
         errdefer if (itbl_owned) itbl.deinit();
@@ -649,7 +680,7 @@ pub const Engine = struct {
         itbl_owned = false; // 已进 map，再释放就是二次释放
         key_owned = false; // key 也已交给 map
 
-        _ = try e.schema.addIndex(self.alloc, def.name, ci);
+        _ = try e.schema.addIndex(self.alloc, def.name, ci_list);
         try catalog.saveSchema(self.io, self.dir, path, &e.schema, self.alloc);
         return true;
     }
@@ -933,7 +964,7 @@ test "二级索引：插入/更新/删除都维护索引，且脏项被回表复
     {
         const e = eng.get("t").?;
         const itbl = e.idx_tables.getPtr("idx_g").?;
-        const bogus = try e.schema.encodeIndexKey(alloc, 1, .{ .integer = 99 }, .{ .integer = 12345 });
+        const bogus = try e.schema.encodeIndexKey(alloc, &[_]usize{1}, &[_]sql.Value{ .{ .integer = 0 }, .{ .integer = 99 } }, .{ .integer = 12345 });
         defer alloc.free(bogus);
         try itbl.put(bogus, &[_]u8{});
         try itbl.flush();
@@ -2016,6 +2047,120 @@ test "ORDER BY NOT NULL 的 text 索引列：走索引且结果与全表一致" 
 // boolean 索引列：**值分量是 8 字节定长**（走 `.integer` 分支），而它在行编码里只占 1 字节 ——
 // 「切主键」必须按**值分量**的实际长度算，不能按行编码的长度算。
 // 这条用例能抓到那个 bug：0/1 的 `encodeI64Key` 尾部恰好有 `00 01`，按 text 分支切会错位。
+test "复合索引：WHERE 首列走前缀、ORDER BY 两列免排序、更新/删除/重开后与全表路径逐格一致" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const root = "test-engine-composite-idx";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    var eng = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    var eng_live = true;
+    defer if (eng_live) eng.deinit();
+
+    // `t` 有复合索引，`u` 是**逐字节相同的无索引对照表**：
+    // 两条路径（索引顺序扫描 / 全表扫描 + 内存排序）必须给出一样的结果。
+    try run(&eng, alloc, "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER NOT NULL, h INTEGER NOT NULL)");
+    try run(&eng, alloc, "CREATE TABLE u (id INTEGER PRIMARY KEY, g INTEGER NOT NULL, h INTEGER NOT NULL)");
+    {
+        var i: usize = 1;
+        while (i <= 30) : (i += 1) {
+            // g、h 都取模 ⇒ 大量并列（只按首列排会错序的那种数据形状）
+            const gv: usize = (i * 7) % 5;
+            const hv: usize = (i * 3) % 4;
+            var q1: [160]u8 = undefined;
+            var q2: [160]u8 = undefined;
+            try run(&eng, alloc, try std.fmt.bufPrint(&q1, "INSERT INTO t (id, g, h) VALUES ({d}, {d}, {d})", .{ i, gv, hv }));
+            try run(&eng, alloc, try std.fmt.bufPrint(&q2, "INSERT INTO u (id, g, h) VALUES ({d}, {d}, {d})", .{ i, gv, hv }));
+        }
+    }
+    try run(&eng, alloc, "CREATE INDEX idx_gh ON t (g, h)");
+
+    // ① ORDER BY 两列：索引顺序即结果顺序，且**基表一行都不用扫**
+    eng.get("t").?.table.scan_rows_read = 0;
+    var got = try queryRows(&eng, alloc, "SELECT id, g, h FROM t ORDER BY g ASC, h ASC LIMIT 10");
+    defer got.deinit();
+    const scanned = eng.get("t").?.table.scan_rows_read;
+    var want = try queryRows(&eng, alloc, "SELECT id, g, h FROM u ORDER BY g ASC, h ASC LIMIT 10");
+    defer want.deinit();
+    try std.testing.expectEqual(@as(usize, 0), scanned); // 真走了索引（不是全表 + 排序）
+    try std.testing.expectEqual(want.rows.len, got.rows.len);
+    for (got.rows, want.rows) |gr, wr| {
+        try std.testing.expectEqual(wr.len, gr.len);
+        for (wr, gr) |wv, gv| try std.testing.expectEqual(wv.integer, gv.integer);
+    }
+
+    // ② WHERE 首列 = 常量：走复合索引的前缀，再回表复核
+    var got2 = try queryRows(&eng, alloc, "SELECT id FROM t WHERE g = 2");
+    defer got2.deinit();
+    var want2 = try queryRows(&eng, alloc, "SELECT id FROM u WHERE g = 2");
+    defer want2.deinit();
+    try std.testing.expect(want2.rows.len > 0); // 防空跑：这个谓词真的命中行
+    try std.testing.expectEqual(want2.rows.len, got2.rows.len);
+    {
+        var ids_got = std.ArrayList(i64).empty;
+        defer ids_got.deinit(alloc);
+        for (got2.rows) |r| try ids_got.append(alloc, r[0].integer);
+        std.mem.sort(i64, ids_got.items, {}, std.sort.asc(i64));
+        var ids_want = std.ArrayList(i64).empty;
+        defer ids_want.deinit(alloc);
+        for (want2.rows) |r| try ids_want.append(alloc, r[0].integer);
+        std.mem.sort(i64, ids_want.items, {}, std.sort.asc(i64));
+        try std.testing.expectEqualSlices(i64, ids_want.items, ids_got.items);
+    }
+
+    // ⑤ 反过来的 ORDER BY 顺序**不许**用这条索引：索引顺序是 (g,h)，
+    //    用它回答 `ORDER BY h, g` 会得到错序。这条用例是「列序校验」的守门人
+    //    （撤掉 `findIndexMatchingOrder` 里的列序比较，这里立刻红）。
+    {
+        var g5 = try queryRows(&eng, alloc, "SELECT id, g, h FROM t ORDER BY h ASC, g ASC LIMIT 40");
+        defer g5.deinit();
+        var w5 = try queryRows(&eng, alloc, "SELECT id, g, h FROM u ORDER BY h ASC, g ASC LIMIT 40");
+        defer w5.deinit();
+        try std.testing.expectEqual(w5.rows.len, g5.rows.len);
+        for (g5.rows, w5.rows) |gr, wr| {
+            for (wr, gr) |wv, gv| try std.testing.expectEqual(wv.integer, gv.integer);
+        }
+    }
+
+    // ③ 更新（改第二列）与删除：索引项必须跟着动
+    try run(&eng, alloc, "UPDATE t SET h = 9 WHERE id = 5");
+    try run(&eng, alloc, "UPDATE u SET h = 9 WHERE id = 5");
+    try run(&eng, alloc, "DELETE FROM t WHERE id = 6");
+    try run(&eng, alloc, "DELETE FROM u WHERE id = 6");
+    {
+        var g3 = try queryRows(&eng, alloc, "SELECT id, g, h FROM t ORDER BY g ASC, h ASC LIMIT 40");
+        defer g3.deinit();
+        var w3 = try queryRows(&eng, alloc, "SELECT id, g, h FROM u ORDER BY g ASC, h ASC LIMIT 40");
+        defer w3.deinit();
+        try std.testing.expectEqual(@as(usize, 29), g3.rows.len); // 防空跑：删掉一行后是 29
+        for (g3.rows, w3.rows) |gr, wr| {
+            for (wr, gr) |wv, gv| try std.testing.expectEqual(wv.integer, gv.integer);
+        }
+    }
+
+    // ④ 重开：索引定义要从 `schema.txt` 的 `#idx idx_gh 1,2` 正确读回来
+    eng.deinit();
+    eng_live = false;
+    var eng2 = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    defer eng2.deinit();
+    const ix_def = eng2.get("t").?.schema.findIndex("idx_gh") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), ix_def.columns.len);
+    try std.testing.expectEqual(@as(usize, 1), ix_def.columns[0]);
+    try std.testing.expectEqual(@as(usize, 2), ix_def.columns[1]);
+    var g4 = try queryRows(&eng2, alloc, "SELECT id, g, h FROM t ORDER BY g ASC, h ASC LIMIT 40");
+    defer g4.deinit();
+    var w4 = try queryRows(&eng2, alloc, "SELECT id, g, h FROM u ORDER BY g ASC, h ASC LIMIT 40");
+    defer w4.deinit();
+    for (g4.rows, w4.rows) |gr, wr| {
+        for (wr, gr) |wv, gv| try std.testing.expectEqual(wv.integer, gv.integer);
+    }
+}
+
 test "ORDER BY NOT NULL 的 boolean 索引列：值分量仍是 8 字节定长" {
     const alloc = std.testing.allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
@@ -2096,7 +2241,7 @@ test "索引回填分块：强制多块（每块 7 行）后必须合并成单�
     const e = eng.get("t").?;
     var ph = FillPhases{};
     // chunk_rows = 7 => 100 行切成 15 块，每块各写一个段，最后 compact 合并成 1 段
-    try fillIndexTimedChunks(alloc, &itbl, &e.schema, &e.table, .{ .name = "idx_g", .column_idx = 1 }, &ph, 7);
+    try fillIndexTimedChunks(alloc, &itbl, &e.schema, &e.table, .{ .name = "idx_g", .columns = &[_]usize{1} }, &ph, 7);
     try std.testing.expectEqual(@as(usize, 100), ph.rows);
     try std.testing.expectEqual(@as(usize, 1), itbl.segs.items.len);
 
