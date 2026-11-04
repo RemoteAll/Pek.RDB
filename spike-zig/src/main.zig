@@ -248,7 +248,12 @@ fn benchMain() !void {
     {
         const path2 = "bench-data-batch";
         dir.deleteTree(io, path2) catch {};
-        var t3 = try tablemod.Table.open(io, dir, path2, alloc, .{ .wal_sync_every = 0 });
+        // **口径必须与 `put_txn` 对等**：SQLite 的单事务批量插入在提交时只追加 WAL，
+        // 不会把整个数据集重写成有序段（那是 checkpoint 的事）。而默认 `flush_bytes=64MB`
+        // 会让 1M 行（memtable 占用 >64MB）在**末尾触发一次整段落盘**（实测 197ms/1M 行），
+        // 把 checkpoint 的成本算进「插入吞吐」里比就失去了意义。
+        // 段落盘本身由 `big_put`（2M 行 / 8MB 阈值 ⇒ 28 段）与合并类指标覆盖，不会漏测。
+        var t3 = try tablemod.Table.open(io, dir, path2, alloc, .{ .wal_sync_every = 0, .flush_bytes = 1 << 30 });
         defer {
             t3.deinit();
             dir.deleteTree(io, path2) catch {};

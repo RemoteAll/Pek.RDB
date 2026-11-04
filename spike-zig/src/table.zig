@@ -956,13 +956,11 @@ pub const Table = struct {
         std.debug.assert(keys.len == values.len);
         self.seq += 1;
         const seq = self.seq;
-        var ops: std.ArrayList(walmod.Op) = .empty;
-        defer ops.deinit(self.alloc);
-        try ops.ensureTotalCapacity(self.alloc, keys.len);
-        for (keys, values) |k, v| {
-            ops.appendAssumeCapacity(.{ .flags = 0, .key = k, .value = v });
-        }
-        _ = try self.wal.append(seq, ops.items);
+        // **不再建 `[]Op` 中转**：100 万行 = 40 MB 的临时数组（还要再走一遍），
+        // 而 WAL 侧已经能直接从 key/value 数组编码（`Wal.appendPairs`）。
+        // 依据：2026-11-04 实测「批量 1M 行(1.56M/s) 比逐行 `put`(2.39M/s) 还慢」——
+        // 批量路径的开销随批次规模增长，根因就是这层中转 + payload 全量拷贝。
+        _ = try self.wal.appendPairs(seq, keys, values);
         for (keys, values) |k, v| {
             try self.mem.insert(k, seq, 0, v);
         }

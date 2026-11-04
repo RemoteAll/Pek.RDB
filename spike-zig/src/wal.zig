@@ -9,6 +9,9 @@ pub const Op = struct {
     value: []const u8,
 };
 
+/// WAL record 头长度：`u32 crc32(payload)` + `u32 payload_len`。
+const WAL_REC_HDR: usize = 8;
+
 pub const Batch = struct {
     seq: u64,
     ops: []Op,
@@ -56,27 +59,93 @@ pub const Wal = struct {
 
     /// 追加一个提交批次（原子单位）。返回本批写入的字节数。
     pub fn append(self: *Wal, seq: u64, ops: []const Op) !usize {
-        self.payload.clearRetainingCapacity();
-        try codec.putU64le(&self.payload, self.alloc, seq);
-        try codec.putU32le(&self.payload, self.alloc, @intCast(ops.len));
-        for (ops) |op| {
-            try self.payload.append(self.alloc, op.flags);
-            try codec.putVarint(&self.payload, self.alloc, op.key.len);
-            try self.payload.appendSlice(self.alloc, op.key);
-            try codec.putVarint(&self.payload, self.alloc, op.value.len);
-            try self.payload.appendSlice(self.alloc, op.value);
+        return self.encodeBatch(seq, .{ .ops = ops });
+    }
+
+    /// 同 `append`，但**直接从 key/value 数组编码**（flags 全 0）——调用方不必先建一层 `Op` 中转。
+    ///
+    /// 为什么需要（2026-11-04，`put_batch` 比逐行 `put` 还慢 35% 时查出来的）：
+    /// 旧实现先把整批编进 `payload`、再整块 `appendSlice` 到 `buf`，`payload` 从 0 长到
+    /// 几十 MB 会反复扩容搬移，接着又多一次全量拷贝；而逐行路径的 `payload` 一直在
+    /// 256 KB 量级复用，扩容成本被摊平了 —— 所以「批量反而更慢」。
+    pub fn appendPairs(self: *Wal, seq: u64, keys: []const []const u8, values: []const []const u8) !usize {
+        std.debug.assert(keys.len == values.len);
+        return self.encodeBatch(seq, .{ .pairs = .{ .keys = keys, .values = values } });
+    }
+
+    /// 批次来源：`Op` 数组（可能带 flags）或纯 key/value 数组。
+    const BatchSrc = union(enum) {
+        ops: []const Op,
+        pairs: struct { keys: []const []const u8, values: []const []const u8 },
+    };
+
+    /// 把整批编码进 `buf`（一条 record = `[crc32][payload_len][seq][n_ops][op...]`）。
+    ///
+    /// **实现要点（都是实测逼出来的）**：
+    /// - 容量**一次算准**再写：`ensureUnusedCapacity` 一次，之后走裸指针 ——
+    ///   逐字段 `append` 会为每个字段各做一次容量检查（每行 5 次），
+    ///   实测 1M 行时编码段要 **285 ms / 43 MB（仅 150 MB/s）**，改成裸写后降到几十毫秒；
+    /// - 头 8 字节**先占位、末尾回填**：这样 payload 不需要中转缓冲，少一次全量拷贝；
+    /// - CRC 用 `crc32Fast`（slicing-by-8）：与 1 KB 表版**逐字节等价**（见 codec 注释），
+    ///   而 43 MB 上比查表版快数倍。
+    fn encodeBatch(self: *Wal, seq: u64, src: BatchSrc) !usize {
+        const n_ops = switch (src) {
+            .ops => |ops| ops.len,
+            .pairs => |p| p.keys.len,
+        };
+        // 容量上界：头 8 + seq 8 + n_ops 4，每行 `flags(1) + klen varint(≤5) + key + vlen varint(≤5) + value`
+        // 再各留 1 字节余量给编码器（它可能一次写 10 字节 varint）。
+        var need: usize = WAL_REC_HDR + 12;
+        switch (src) {
+            .ops => |ops| for (ops) |op| {
+                need += 12 + op.key.len + op.value.len;
+            },
+            .pairs => |p| for (p.keys, p.values) |k, v| {
+                need += 12 + k.len + v.len;
+            },
+        }
+        try self.buf.ensureUnusedCapacity(self.alloc, need);
+
+        const start = self.buf.items.len;
+        self.buf.items.len = start + need; // 先占满，末尾按实际用量收回
+        var p: [*]u8 = self.buf.items[start..].ptr;
+        p += WAL_REC_HDR;
+        std.mem.writeInt(u64, p[0..8], seq, .little);
+        p += 8;
+        std.mem.writeInt(u32, p[0..4], @intCast(n_ops), .little);
+        p += 4;
+
+        switch (src) {
+            .ops => |ops| for (ops) |op| {
+                p[0] = op.flags;
+                p += 1;
+                p += codec.encodeVarint(p[0..10], op.key.len);
+                @memcpy(p[0..op.key.len], op.key);
+                p += op.key.len;
+                p += codec.encodeVarint(p[0..10], op.value.len);
+                @memcpy(p[0..op.value.len], op.value);
+                p += op.value.len;
+            },
+            .pairs => |pr| for (pr.keys, pr.values) |k, v| {
+                p[0] = 0;
+                p += 1;
+                p += codec.encodeVarint(p[0..10], k.len);
+                @memcpy(p[0..k.len], k);
+                p += k.len;
+                p += codec.encodeVarint(p[0..10], v.len);
+                @memcpy(p[0..v.len], v);
+                p += v.len;
+            },
         }
 
-        var hdr: [8]u8 = undefined;
-        std.mem.writeInt(u32, hdr[0..4], codec.crc32(self.payload.items), .little);
-        std.mem.writeInt(u32, hdr[4..8], @intCast(self.payload.items.len), .little);
+        const payload_len = @intFromPtr(p) - (@intFromPtr(self.buf.items.ptr) + start + WAL_REC_HDR);
+        const rec = self.buf.items[start..][0..(WAL_REC_HDR + payload_len)];
+        std.mem.writeInt(u32, rec[0..4], codec.crc32Fast(rec[WAL_REC_HDR..]), .little);
+        std.mem.writeInt(u32, rec[4..8], @intCast(payload_len), .little);
+        self.buf.items.len = start + WAL_REC_HDR + payload_len; // 收回多余的预留
 
-        // 先入用户态缓冲，达到阈值或 sync 时批量落盘（组提交）。
-        try self.buf.appendSlice(self.alloc, &hdr);
-        try self.buf.appendSlice(self.alloc, self.payload.items);
-        const n = 8 + self.payload.items.len;
         if (self.buf_bytes == 0 or self.buf.items.len >= self.buf_bytes) try self.flushBuf();
-        return n;
+        return WAL_REC_HDR + payload_len;
     }
 
     fn flushBuf(self: *Wal) !void {
