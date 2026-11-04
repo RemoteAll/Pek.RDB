@@ -2,6 +2,7 @@
 // 个人使用免费；商业使用需商业授权，或同样以 AGPL-3.0 开源（见 LICENSE）。
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("build_options");
 
 /// Debug/ReleaseSafe 下才做「单线程」断言；且只在**确实支持 `std.Thread.getCurrentId()`** 的目标上做。
 ///
@@ -12,7 +13,10 @@ const builtin = @import("builtin");
 /// 判据用「白名单 + 默认关」而不是「黑名单 + 默认开」：断言只是开发期辅助，
 /// 认错的代价应当是「少一个检查」，而不是「编译不过」。
 /// 白名单与 `std/Thread.zig` 里 `Thread.Id` 的 `switch` 保持一致。
-const thread_check_supported = std.debug.runtime_safety and switch (builtin.os.tag) {
+///
+/// 另有 `-Dthreads=false`（§16.5 的编译期开关）：在**支持**线程的目标上也强制关掉，
+/// 用来证明「存储核心不依赖任何线程设施」。
+const thread_check_supported = build_options.threads and std.debug.runtime_safety and switch (builtin.os.tag) {
     .windows,
     .linux,
     .macos,
