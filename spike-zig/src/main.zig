@@ -603,6 +603,46 @@ fn benchMain() !void {
             std.debug.print("sql_full,{d},{d:.0}\n", .{ rows.rows.len, opsPerSec(@intCast(rows.rows.len), ns) });
             std.debug.print("sql_full_readrows,{d},0\n", .{t4.scan_rows_read});
         }
+        // **同进程 A/B**：整表物化「一趟走完」vs「收集切片 + 两段解码」。
+        //
+        // 两条路径的结果逐格相同，唯一差别是实现：`offset` 缺省时命中
+        // `exec.materializeScan`（一趟：边取边拷字节边解码），显式 `OFFSET 0` 时不命中
+        // （退回「scanValues 收集 16MB 切片 → decodeAll 拷 buf + 解码」）。
+        // 跨轮次比较在这里没用 —— 本机同一小时内 `sql_each` 就从 26.8M 漂到 20.5M，
+        // 只有同进程背靠背、且奇偶轮交换先后顺序，差值才是实现差异。
+        {
+            var src_f = [_]spike.sql.SelectItem{.{ .star = {} }};
+            const sel_fuse = spike.sql.Select{ .items = &src_f, .table = "bench_sql" };
+            const sel_old = spike.sql.Select{ .items = &src_f, .table = "bench_sql", .offset = 0 };
+            var k: usize = 0;
+            while (k < 6) : (k += 1) {
+                // 奇偶轮交换顺序：谁先跑谁吃亏是系统性偏差，不会随轮次平均掉
+                const fuse_first = (k % 2) == 0;
+                var n_fuse: usize = 0;
+                var n_old: usize = 0;
+                var t_fuse: u64 = 0;
+                var t_old: u64 = 0;
+                var pass: usize = 0;
+                while (pass < 2) : (pass += 1) {
+                    const do_fuse = (pass == 0) == fuse_first;
+                    const selp = if (do_fuse) sel_fuse else sel_old;
+                    const t0 = nowNs(io);
+                    var rows = try spike.exec.selectRows(&t4, &s, selp, alloc);
+                    const ns = nowNs(io) - t0;
+                    if (do_fuse) {
+                        t_fuse = ns;
+                        n_fuse = rows.rows.len;
+                    } else {
+                        t_old = ns;
+                        n_old = rows.rows.len;
+                    }
+                    rows.deinit();
+                }
+                // 结果必须一致：行数不同说明 A/B 本身有问题，比值再好看也没意义
+                std.debug.assert(n_fuse == n_old);
+                std.debug.print("sql_full_ab,{d},{d},{d}\n", .{ k, t_fuse / 1_000_000, t_old / 1_000_000 });
+            }
+        }
         // 排序 + 分页（top-N）：`ORDER BY id DESC LIMIT 10`，100 万行里只要前 10 名。
         //
         // 改之前：全量解码（100 万行 ≈ 96 MB）+ 全量排序，全为了丢掉 99.999%。
@@ -1183,9 +1223,28 @@ fn benchMain() !void {
         // 本段会重新分配约 136MB，放在 t4 生命周期最后。
         {
             var hi: [16]u8 = @splat(0xFF);
+
+            // (a) **归并遍历的地板**：只走 MergeIter、只计数，不收集不解码。
+            // 这一档决定 `sql_full` 还有多少余量 —— 如果它已经接近 sql_full，
+            // 那再优化收集/解码都是白做。
+            {
+                var it = tablemod.MergeIter{};
+                try it.init(&t4, &.{}, &hi);
+                defer it.deinit();
+                const t0 = nowNs(io);
+                var cnt: u64 = 0;
+                while (it.next()) |_| cnt += 1;
+                const ns = nowNs(io) - t0;
+                std.debug.print("mat_floor,{d},{d:.0}\n", .{ cnt, opsPerSec(cnt, ns) });
+                std.debug.print("mat_floor_ms,{d},{d}\n", .{ cnt, ns / 1_000_000 });
+            }
+
             var vals: std.ArrayList([]const u8) = .empty;
             defer vals.deinit(alloc);
 
+            // (b) **真实路径的形状**：先按上界预分配再收集（`selectRows` 就是这么做的）。
+            // 旧版探针没有预分配，把 ArrayList 的增长当成「收集成本」报了出来。
+            try vals.ensureTotalCapacity(alloc, t4.mem.len() + 1_048_576);
             const ta = nowNs(io);
             try t4.scanValues(&.{}, &hi, &vals);
             const tb = nowNs(io);

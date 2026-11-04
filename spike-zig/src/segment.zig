@@ -866,6 +866,16 @@ pub const Segment = struct {
         return self.idx[e.key_off..][0..e.key_len];
     }
 
+    /// 数据文件字节数。
+    ///
+    /// `file_size` 是**懒映射的副产物**（在 `dataView()` 里 stat 出来），刚 flush 出来的段
+    /// 还没被读过时它是 0。全表物化要按它算结果缓冲的上界，所以这里显式保证它已有值。
+    /// 全表扫描本来就要映射每一个段，所以这不是额外代价。
+    pub fn dataBytes(self: *Segment) !u64 {
+        if (self.file_size == 0) _ = try self.dataView();
+        return self.file_size;
+    }
+
     /// 段内「尾部 want_rows 行」的起点 key（供 `ORDER BY pk DESC LIMIT k` 的反向快速路径）。
     ///
     /// 段的 key 递增，所以「段内最大的若干行」不需要反向解码器：把起点定在**倒数第几个

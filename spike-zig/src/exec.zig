@@ -1765,8 +1765,8 @@ pub fn selectRowsHost(
     var hi: [16]u8 = @splat(0xFF);
     // 只收集 value 切片（16B/条），不收集 key/seq/flags（`RefRecord` 是 48B/条）。
     // 100 万行时输出量 48MB -> 16MB，而实测 `scanRefs` 占物化总耗时 66%。
-    // 注意：**无 WHERE 且无 LIMIT 的主路径已经不收这个数组了**（走 `decodeAllRange` 两遍遍历），
-    // 这里只服务 WHERE 过滤与 LIMIT 提前终止两条分支。
+    // 定位：这里只服务 **WHERE 过滤 / LIMIT 提前终止 / ORDER BY + LIMIT 预筛** 三条分支；
+    // 「无 WHERE 且无 ORDER BY 且无 LIMIT」的整表物化走 `materializeScan`（一趟走完，不收这个数组）。
     var keep: std.ArrayList([]const u8) = .empty;
     defer keep.deinit(alloc);
     var all_vals: std.ArrayList([]const u8) = .empty;
@@ -1868,6 +1868,11 @@ pub fn selectRowsHost(
             if (it.corrupt) return error.SegmentCorrupt;
             src = keep.items;
         } else {
+            // **整表物化快路径**：无 WHERE / 无 ORDER BY / 无 LIMIT 时一趟走完。
+            // 100 万行 × 2 列实测 61 ms → 48 ms，归因见 `materializeScan` 的注释。
+            if (sel.order_by.len == 0 and sel.limit == null and sel.offset == null) {
+                return materializeScanToRows(t, s, sel, alloc);
+            }
             // 无 WHERE：cap 接近实际行数，预分配能避免重分配；
             // 但段合并过（大量覆盖/墓碑）时 cap 可能远大于实际，所以封顶 100 万条（16MB）。
             //
@@ -2002,6 +2007,128 @@ fn topIdxLess(_: void, a: TopItem, b: TopItem) bool {
 ///
 /// 全表扫描与索引扫描共用这一段 —— 两条路径若各写一份装配逻辑，迟早会出现
 /// 「走索引时 ORDER BY 不生效」这种只在一半场景里错的 bug。
+/// 整表物化：**一趟归并，边取、边拷字节、边解码**。
+///
+/// 为什么要有这条（2026-11-04 实测，1M 行 × 2 列，`mat_*` 探针）：
+///
+/// | 阶段 | 耗时 |
+/// |---|---|
+/// | 归并遍历地板（只走 `MergeIter` 只计数）| **30 ms** |
+/// | 收集 value 切片到 `all_vals` | 5 ms |
+/// | 把 42 MB payload 拷进 `buf` | 11 ms |
+/// | 从 `buf` 解码进 `flat` | 12.5 ms |
+/// | 建 `hdrs` 指针数组 | 2 ms |
+///
+/// 前两步里，「收集 16 MB 切片数组」**只为了知道 `buf` 要多大** —— 而 `flat`/`hdrs`
+/// 又要在下游再走一遍才能填。两趟都是白走的。
+///
+/// 段头部（`Segment.rows` / `file_size`，**不需要 `ensureParsed()`**）与 memtable 计数
+/// 已经给出上界，于是可以一次分配、一趟填完；解码时数据还在 L1 里（流式路径
+/// `forEachRow` 的解码只要 ~7 ns/行，而这里从冷 `buf` 解要 12.5 ns/行）。
+///
+/// 上界只是**虚拟**地址：没写到的页不会缺页，所以偏大几乎不花钱；最后按实际大小收缩。
+/// 这里**不能**用「先统计再第二遍填」（`decodeAllRange` 当初就是这么写的）：
+/// 多一整遍归并 25 ms，只省 3 ms，实测 -31%。
+fn materializeScan(
+    t: *tablemod.Table,
+    s: *const schema_mod.Schema,
+    alloc: std.mem.Allocator,
+    want: ?[]const usize,
+) !Materialized {
+    const ncols = if (want) |w| w.len else s.columns.len;
+
+    // 行数上界 = memtable 行数 + 各段行数（段合并过时偏大：同 key 多版本/墓碑会被归并掉）
+    // 字节上界 = memtable 字节 + 各段数据文件大小（含每条 7B 记录头，同样偏大）
+    //
+    // **`file_size` 只有 `dataView()` 之后才有值**（它是懒映射的副产物）：刚 flush 出来的段
+    // 还没被读过，这里若直接取 `file_size` 会拿到 0 —— 第一版就是这么写的，导致
+    // `ub_bytes == 0`、直接把整表当空表返回（4 个用例当场红，包括「聚合 1000 行」）。
+    // 全表扫描本来就要映射每一个段，所以这里提前映射不算额外代价。
+    var ub_rows: usize = t.mem.len();
+    var ub_bytes: u64 = t.mem.sizeBytes();
+    for (t.segs.items) |*sg| {
+        ub_rows +|= sg.rows;
+        ub_bytes +|= try sg.dataBytes();
+    }
+    if (ub_rows == 0) return try decodeAll(alloc, s, &.{}, want);
+
+    var flat = try alloc.alloc(sql.Value, ub_rows * ncols);
+    errdefer alloc.free(flat);
+    var hdrs = try alloc.alloc([]sql.Value, ub_rows);
+    errdefer alloc.free(hdrs);
+    var buf = try alloc.alloc(u8, @intCast(ub_bytes));
+    errdefer alloc.free(buf);
+
+    var hi: [16]u8 = @splat(0xFF);
+    var it = tablemod.MergeIter{};
+    try it.init(t, &.{}, &hi);
+    defer it.deinit();
+
+    var n: usize = 0;
+    var off: usize = 0;
+    while (it.next()) |rec| {
+        // 上界是**构造性**保证的（每条 yield 的记录都来自某个游标，其 value 指向该段的
+        // mmap 且长度计入该段文件大小），但这里仍然真检查而不是靠 `assert`：
+        // `assert` 在 ReleaseFast 下是空的，真越界就是静默堆溢出。
+        if (n >= ub_rows or off + rec.value.len > buf.len) return error.ScanBoundExceeded;
+        const raw = buf[off..][0..rec.value.len];
+        @memcpy(raw, rec.value);
+        off += rec.value.len;
+        const vals = flat[n * ncols ..][0..ncols];
+        if (want) |w| try s.decodeRowProjected(vals, w, raw) else try s.decodeRowInto(vals, raw);
+        hdrs[n] = vals;
+        n += 1;
+    }
+    if (it.corrupt) return error.SegmentCorrupt;
+
+    // 收缩到实际大小（`Rows` 按 len 释放，绝不能把上界长度传出去）。
+    //
+    // **两条顺序/取舍都必须遵守**：
+    // ① `hdrs[i]` 是**指进 `flat` 的切片**，`flat` 一旦 realloc 搬家，hdrs 立刻悬垂
+    //    ⇒ 先收缩 flat、按新基址重建 hdrs、再收缩 hdrs；
+    // ② `buf` **绝不收缩**：`flat` 里的 text/blob 值是指进 `buf` 的切片，realloc 搬家后
+    //    这些指针没有任何办法跟着修正（逐条记录 payload 偏移才能修，那是额外 4B/行）。
+    //    上界超出的部分只是**没写过的虚拟地址**，不缺页也不占物理内存。
+    //    第一版两条都踩了：`SELECT *` 在多段表上直接返回垃圾值（被
+    //    「融合路径与两遍路径逐格一致」用例当场抓住）。
+    if (n != ub_rows) {
+        if (n == 0) {
+            alloc.free(flat);
+            alloc.free(hdrs);
+            flat = &.{};
+            hdrs = &.{};
+        } else {
+            flat = try alloc.realloc(flat, n * ncols);
+            for (0..n) |j| hdrs[j] = flat[j * ncols ..][0..ncols];
+            hdrs = try alloc.realloc(hdrs, n);
+        }
+    }
+    return .{ .alloc = alloc, .buf = buf, .flat = flat, .hdrs = hdrs, .ncols = ncols, .pushed = want != null };
+}
+
+/// `materializeScan` 的投影层：与 `finishFromValues` 的「无排序 / 无截断」分支等价。
+fn materializeScanToRows(
+    t: *tablemod.Table,
+    s: *const schema_mod.Schema,
+    sel: sql.Select,
+    alloc: std.mem.Allocator,
+) !Rows {
+    var pg = ProjGuard.take(alloc, try buildProjection(alloc, s, sel.items));
+    defer pg.deinit();
+    const proj = pg.proj;
+    // 与 `finishFromValues` 同一条判据：`decodeRowProjected` 要求 want **严格升序**。
+    const ascending = blk: {
+        for (proj.indices, 0..) |v, k| {
+            if (k > 0 and v <= proj.indices[k - 1]) break :blk false;
+        }
+        break :blk true;
+    };
+    const want: ?[]const usize = if (ascending) proj.indices else null;
+    var m = try materializeScan(t, s, alloc, want);
+    defer m.deinit();
+    return buildOutput(alloc, s, &m, pg.release(), 0, m.hdrs.len);
+}
+
 fn finishFromValues(
     io: std.Io,
     s: *const schema_mod.Schema,
@@ -2057,8 +2184,7 @@ fn finishFromValues(
     return out;
 }
 
-/// 流式查询：逐行解码到**复用的 scratch**，回调消费，**不物化结果集**。
-///
+/// 流式查询：逐行解码到**复用的 scratch**，回调消费，**不物化结果集**。///
 /// 这是 SQLite `sqlite3_step` 的等价物（PostgreSQL 的 slot、DuckDB 的 chunk 同理）。
 /// 成熟数据库一律不把结果集攒在内存里，而是「游标 + 复用槽位」：
 /// `sqlite3_step` 每步只重填 `ncols` 个 `Mem`，整个查询期间结果集侧的分配是 **0**。
@@ -3143,6 +3269,108 @@ test "forEachRow 与 selectRows 结果逐行一致（where/limit/offset/投影/�
             if (want.len != got.len) return error.ColCountMismatch;
             for (want, got) |w, g| {
                 if (schema_mod.valueCmp(w, g) != .eq) {
+                    std.debug.print("case {d}: 值不一致\n", .{ci});
+                    return error.ValueMismatch;
+                }
+            }
+        }
+    }
+}
+
+test "整表物化融合路径与两遍路径逐格一致（多段/墓碑/多版本/投影）" {
+    // 背景（2026-11-04）：给「无 WHERE / 无 ORDER BY / 无 LIMIT」的整表物化加了
+    // 一条**一趟走完**的快路径（`materializeScan`）：段头部给出上界，一次分配，
+    // 边遍历边拷字节边解码。同进程 A/B 实测 63 → 55.5 ms（6/6）。
+    //
+    // 代价是**同一段语义存在两处实现**（本仓明令禁止的形态）。所以必须有这条用例：
+    // 同一查询分别走两条路（`offset` 缺省 = 融合；显式 `OFFSET 0` = 原来的
+    // 「收集切片 → decodeAll」），**逐行逐列比对**。任一侧将来漂移，这条立刻红。
+    //
+    // 故意造出「上界偏大」的形态：多段 + 覆盖写 + 墓碑 —— 那样融合路径必须走
+    // 「收缩到实际大小」的分支，而不是只在整齐数据上凑巧对。
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-exec-fuse-tmp";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    const cols = [_]schema_mod.Column{
+        .{ .name = "id", .col_type = .integer, .primary_key = true },
+        .{ .name = "n", .col_type = .integer },
+        .{ .name = "s", .col_type = .text },
+    };
+    var s = try schema_mod.Schema.init(alloc, "t", &cols);
+    defer s.deinit(alloc);
+    var t = try tablemod.Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+
+    // 第 1 段
+    var i: i64 = 0;
+    while (i < 120) : (i += 1) {
+        var vals = [_]sql.Value{ .{ .integer = i }, .{ .integer = @mod(i, 5) }, .{ .text = "first" } };
+        var row = [_][]sql.Value{&vals};
+        _ = try insertRows(&t, &s, .{ .table = "t", .columns = &.{ "id", "n", "s" }, .rows = &row }, alloc);
+    }
+    try t.flush();
+    // 第 2 段：覆盖写一批（同 key 新版本 → 归并时要丢掉旧版本，上界因此偏大）
+    i = 0;
+    while (i < 60) : (i += 1) {
+        var vals = [_]sql.Value{ .{ .integer = i * 2 }, .{ .integer = 9 }, .{ .text = "second" } };
+        var row = [_][]sql.Value{&vals};
+        _ = try insertRows(&t, &s, .{ .table = "t", .columns = &.{ "id", "n", "s" }, .rows = &row }, alloc);
+    }
+    try t.flush();
+    // 第 3 段：删除一批（墓碑也要被归并丢掉）
+    i = 0;
+    while (i < 30) : (i += 1) {
+        _ = try deleteRows(&t, &s, .{ .table = "t", .where = .{ .column = "id", .op = .eq, .value = .{ .integer = i * 3 + 1 } } }, alloc);
+    }
+    try t.flush();
+    // memtable 里也留几行（上界要把 memtable 算进来）
+    i = 0;
+    while (i < 10) : (i += 1) {
+        var vals = [_]sql.Value{ .{ .integer = 500 + i }, .{ .integer = 1 }, .{ .text = "mem" } };
+        var row = [_][]sql.Value{&vals};
+        _ = try insertRows(&t, &s, .{ .table = "t", .columns = &.{ "id", "n", "s" }, .rows = &row }, alloc);
+    }
+
+    // 防空跑：真的有多段、真的有墓碑与多版本
+    try std.testing.expect(t.segs.items.len >= 3);
+    try std.testing.expect(t.mem.len() > 0);
+
+    var star = [_]sql.SelectItem{.{ .star = {} }};
+    var two_desc = [_]sql.SelectItem{ .{ .column = "n" }, .{ .column = "id" } };
+    var only_id = [_]sql.SelectItem{.{ .column = "id" }};
+    var only_s = [_]sql.SelectItem{.{ .column = "s" }};
+
+    const cases = [_]sql.Select{
+        .{ .items = &star, .table = "t" }, // 恒等投影 + 全列解码
+        .{ .items = &two_desc, .table = "t" }, // want 非升序 ⇒ 全列解码 + pflat 重排
+        .{ .items = &only_id, .table = "t" }, // 投影下推（decodeRowProjected）
+        .{ .items = &only_s, .table = "t" }, // text 列投影
+    };
+
+    for (cases, 0..) |sel, ci| {
+        // 显式 `OFFSET 0` ⇒ 不命中融合路径，走「收集切片 → decodeAll」
+        var legacy = sel;
+        legacy.offset = 0;
+        var a = try selectRows(&t, &s, sel, alloc);
+        defer a.deinit();
+        var b = try selectRows(&t, &s, legacy, alloc);
+        defer b.deinit();
+        if (a.rows.len != b.rows.len) {
+            std.debug.print("case {d}: 行数不一致 fuse={d} legacy={d}\n", .{ ci, a.rows.len, b.rows.len });
+            return error.RowCountMismatch;
+        }
+        try std.testing.expect(a.rows.len > 0); // 防空跑
+        for (a.rows, b.rows) |ra, rb| {
+            if (ra.len != rb.len) return error.ColCountMismatch;
+            for (ra, rb) |va, vb| {
+                if (schema_mod.valueCmp(va, vb) != .eq) {
                     std.debug.print("case {d}: 值不一致\n", .{ci});
                     return error.ValueMismatch;
                 }
