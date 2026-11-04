@@ -633,6 +633,15 @@ pub const Table = struct {
     ns_compact_max: u64 = 0,
     /// 合并实际执行次数（`did == true` 的那些，`did == false` 的早退不计）。
     compact_calls: u64 = 0,
+    /// `prepareCompact()` 的累计纳秒：**与行数成正比**的那一半（归并 + 写新段 + 写归档）。
+    ns_prepare: u64 = 0,
+    /// `applyPrepared()` 的累计纳秒：**只与段数成正比**的那一半（rename + 删旧文件 + 换数组）。
+    ns_apply: u64 = 0,
+    /// 最近一次 apply 做了多少次文件系统操作（1 次 rename + 每个旧段 1 次删除）。
+    /// **确定性指标**：用来证明「apply 的代价与行数无关」，不依赖计时。
+    last_apply_ops: usize = 0,
+    /// 最近一次 apply 的半途状态：`null` = 最近一次没被丢弃；否则是丢弃原因。
+    last_apply_discard: ?[]const u8 = null,
     /// 扫描/归并**实际产出**的行数（累计）。
     /// 确定性指标：用来证明「LIMIT 提前终止」真的没白读，而不是靠计时猜。
     scan_rows_read: u64 = 0,
@@ -1576,42 +1585,83 @@ pub const Table = struct {
     /// - 重建 `index.bin`（用临时文件 + rename，崩溃时不会留下半个归档）
     /// - 删除旧段数据文件
     /// 内存是流式的：不为全部结果分配缓冲（200 万行时那是 100MB+）。
-    pub fn compact(self: *Table) !CompactResult {
+    /// `prepareCompact()` 的产物：**已经准备好的合并结果**，但还没生效。
+    ///
+    /// 为什么要把 `compact()` 拆成两半：合并的重活（归并全部行 + 写新数据段 + 写新归档）
+    /// 与「换归档、换段数组」这两件事的代价性质完全不同 ——
+    /// 前者与**行数**成正比（200 万行实测 438 ms），后者只与**段数**成正比
+    /// （1 次 rename + 每段 1 次删除）。拆开之后 `apply` 是 O(段数) 的，
+    /// 才有可能把它挪到不阻塞写路径的时刻（后台线程 / 空闲窗口）。
+    ///
+    /// 生命周期：`prepare` 出来的东西必须 `apply` 或 `deinit`（丢弃）。
+    /// 丢弃是安全的：新段文件与临时归档都按「点名删除」清理，正式归档没被碰过。
+    pub const Prepared = struct {
+        /// 归并时看到的段号（升序）。apply 前必须逐个核对，**任何一个变了就丢弃**。
+        snapshot_ids: []u64,
+        new_seg: segmod.Segment,
+        /// 新归档的临时路径；apply 时 rename 到 `index.bin`
+        tmp_index_path: []u8,
+        rows: usize,
+        bytes: u64,
+        archive_len: u64,
+        /// false = 已被 apply 接管（`deinit` 只释放路径/数组，不碰段与文件）
+        live: bool = true,
+
+        /// 丢弃：删临时归档、删新段数据文件、关闭新段。**已 apply 的调用它是空操作**。
+        pub fn deinit(self: *Prepared, io: std.Io, dir: std.Io.Dir, alloc: std.mem.Allocator) void {
+            if (self.live) {
+                const data_path = std.fmt.allocPrint(alloc, "{s}/seg/{d:0>6}.data", .{ self.new_seg.base_path, self.new_seg.id }) catch null;
+                if (data_path) |p| {
+                    dir.deleteFile(io, p) catch {};
+                    alloc.free(p);
+                }
+                self.new_seg.close();
+                dir.deleteFile(io, self.tmp_index_path) catch {};
+            }
+            dir.deleteFile(io, self.tmp_index_path) catch {};
+            alloc.free(self.tmp_index_path);
+            alloc.free(self.snapshot_ids);
+            self.* = undefined;
+        }
+
+        fn takeNewSeg(self: *Prepared) segmod.Segment {
+            self.live = false;
+            return self.new_seg;
+        }
+    };
+
+    /// 合并的**重活**：归并 + 写新段 + 写新归档（到临时路径）。**不动** Table 的段数组与正式归档。
+    ///
+    /// 返回 `null` = 没有可做的事（段数 ≤ 1）。
+    pub fn prepareCompact(self: *Table) !?Prepared {
         self.checkThread();
-        const t_cmp = self.nowNs();
-        defer {
-            const d = self.nowNs() - t_cmp;
-            self.ns_compact +|= d;
-            if (d > self.ns_compact_max) self.ns_compact_max = d;
-        }
-        if (self.segs.items.len <= 1) {
-            return .{ .before = self.segs.items.len, .after = self.segs.items.len, .rows = 0, .did = false };
-        }
+        const t0 = self.nowNs();
+        defer self.ns_prepare +|= self.nowNs() - t0;
 
-        // 防重入：下面会调 flush()，而 flush() 末尾可能触发自动合并 ——
-        // 不抑制就是无限递归（手动调 compact() 也一样）。
-        // 用 `was` 保留外层状态：自动触发 → compact → 内部 flush 期间标志必须仍为 true。
-        const was_going = self.going_compact;
-        self.going_compact = true;
-        defer self.going_compact = was_going;
-
-        // 先把 memtable 落盘，避免「合并结果 + memtable」重复持有同一批 key
-        // （调 flushImpl 而非 flush：flush 末尾的自动触发会绕回 compact）
+        if (self.segs.items.len <= 1) return null;
+        // memtable 先落盘，避免「合并结果 + memtable」重复持有同一批 key。
+        // 调 `flushImpl` 而非 `flush`：后者末尾的自动触发会绕回 compact。
         if (self.mem.len() > 0) try self.flushImpl();
         const before = self.segs.items.len;
+        if (before <= 1) return null;
 
+        // 段号快照：apply 前逐个核对
+        const snap = try self.alloc.alloc(u64, before);
+        errdefer self.alloc.free(snap);
+        for (self.segs.items, 0..) |s, i| snap[i] = s.id;
+
+        // 预留新段号。**即使最终丢弃也不回退**：段号空洞无害（归档记录带显式 id），
+        // 而回退会与「丢弃之后又 flush 了一次」的新段撞号。
         const id = self.next_seg;
+        self.next_seg = id + 1;
+
         const data_path = try self.alloc.print("{s}/seg/{d:0>6}.data", .{ self.base_path, id });
         defer self.alloc.free(data_path);
-        // 合并中途失败时新段是半成品：删掉它。
-        // 这里能删、`flushImpl` 里不能删，差别在**失败时权威记录有没有变**：
-        // `archiveRewrite` 是「写 tmp → sync → rename」，任何一步失败都意味着归档原封未动；
-        // 而 `archiveAppend` 在 sync 之前就已把 record 写进文件了。
+        // 失败时删半成品：此时归档**原封未动**（新的那份还在临时路径），删干净是安全的
         var orphan_maybe = true;
         errdefer if (orphan_maybe) self.dir.deleteFile(self.io, data_path) catch {};
 
-        // Bloom 位图要预先定大小，这里给一个上界：各段行数之和（去重后只会更少）。
-        // 估大只会让位图偏大（误报率更低）；估小也不出错，见 `Writer.create` 的说明。
+        // Bloom 位图按「各段行数之和」估上界：估大只让位图偏大，估小也只会让误报率高一点
         var expected_rows: usize = 0;
         for (self.segs.items) |s| expected_rows +|= s.rows;
 
@@ -1626,66 +1676,142 @@ pub const Table = struct {
                 try w.push(rec.key, rec.seq, rec.flags, rec.value);
                 rows += 1;
             }
-            // 源段有损坏就绝不能再把结果写进归档（那会把“少了几行”固化成“永久少几行”）
+            // 源段损坏就绝不能再把结果写进归档（否则「少了几行」被固化成「永久少几行」）
             if (it.corrupt) return error.SegmentCorrupt;
         }
-        // 必须在 finishBytes() **之前**取：它会接管/释放 Writer 的缓冲
         const data_bytes: u64 = @intCast(w.buf_base + w.buf.items.len);
         const fin = try w.finishBytes();
         errdefer self.alloc.free(fin.bytes);
         const out_bytes: u64 = data_bytes + fin.bytes.len;
 
-        // 关键次序：**先在内存里建好新段**（验证索引可解析），再改磁盘，最后才清理旧段。
-        // 若反过来（先清旧段再建新段），中途失败会让 Table 变成空表，而磁盘上归档已指向新段。
+        // 先在内存里建好新段并**强制全量校验索引**，再让它成为「待生效」状态：
+        // 懒解析之后 `fromBytes` 只读头部，而 apply 是「归档直接指过去」，
+        // 所以这一步必须在这里显式做掉。
         var new_seg = try segmod.Segment.fromBytes(self.io, self.dir, self.base_path, id, fin.bytes, self.alloc, true, self.opts.mmap_preheat);
         new_seg.data_prefault_max = self.opts.data_prefault_max_bytes;
-        // errdefer 必须在 ensureParsed **之前**注册：校验失败时段的 `entries` 已经分配，
-        // 而 `fromBytes` 内部的 errdefer 只覆盖它自己那一段，管不到这里。
         errdefer {
             var s = new_seg;
             s.owns_idx = false; // 字节由上面的 errdefer 释放
             s.close();
         }
-        // **懒解析之后这一句是关键**：`fromBytes` 现在只读头部、不做 CRC 校验，
-        // 而 compact 的整个安全性都建立在「动手改磁盘之前，先确认新段索引真能解析」之上
-        // （上面那条注释写的就是这件事）。不在这里强制全量校验，就等于把
-        // 「归档已指向新段」和「新段索引是否完好」这两件事脱钩了。
         try new_seg.ensureParsed();
 
-        // 重建归档（临时文件 + 原子 rename）：成功后磁盘才指向新段
-        const records = [_]segmod.ArchiveRecord{.{ .id = @intCast(id), .payload = fin.bytes }};
-        self.index_valid_len = try segmod.archiveRewrite(self.io, self.dir, self.index_path, &records, self.alloc);
-        orphan_maybe = false; // 归档已指向新段
+        // 归档写到**临时路径**：正式归档只能由 apply 用一次 rename 换掉
+        const tmp_index = try self.alloc.print("{s}.prep", .{self.index_path});
+        errdefer self.alloc.free(tmp_index);
+        errdefer self.dir.deleteFile(self.io, tmp_index) catch {};
 
-        // 磁盘已一致，现在才清理旧段与旧归档缓冲。
-        // 这里**不允许再有可能失败的分配**：一旦在这之后返回错误，归档指向新段
-        // 而内存 segs 已清空 → Table 变空表（上轮审计 P0-2 的那类状态）。
+        const records = [_]segmod.ArchiveRecord{.{ .id = @intCast(id), .payload = fin.bytes }};
+        const archive_len = try segmod.archiveRewrite(self.io, self.dir, tmp_index, &records, self.alloc);
+        orphan_maybe = false; // 交给 Prepared 负责清理
+
+        return Prepared{
+            .snapshot_ids = snap,
+            .new_seg = new_seg,
+            .tmp_index_path = tmp_index,
+            .rows = rows,
+            .bytes = out_bytes,
+            .archive_len = archive_len,
+        };
+    }
+
+    /// 把准备好的合并结果**生效**：校验快照 → rename 归档 → 换段数组 → 删旧文件。
+    ///
+    /// 代价只与**段数**成正比（1 次 rename + 每段 1 次删除），与行数无关 ——
+    /// 这一点由 `last_apply_ops` 与用例钉死，不靠计时判断。
+    ///
+    /// 返回 false = 快照已失效（期间有 flush/合并），**什么都没改**，调用方应丢弃重来。
+    pub fn applyPrepared(self: *Table, p: *Prepared) !bool {
+        self.checkThread();
+        if (!p.live) return false;
+        const t0 = self.nowNs();
+
+        // ① 快照校验：段集合必须与 prepare 时**逐个相同**
+        if (p.snapshot_ids.len != self.segs.items.len) {
+            self.last_apply_discard = "段数已变";
+            return false;
+        }
+        for (p.snapshot_ids, self.segs.items) |id, s| {
+            if (id != s.id) {
+                self.last_apply_discard = "段集合已变";
+                return false;
+            }
+        }
+        self.last_apply_discard = null;
+
+        // ② 归档生效（tmp → 正式，原子替换）。失败则磁盘与内存都没变，正好走丢弃路径。
+        try std.Io.Dir.rename(self.dir, p.tmp_index_path, self.dir, self.index_path, self.io);
+        // 从这一行开始**不允许再失败**：磁盘归档已指向新段。
+        self.index_valid_len = p.archive_len;
+        const new_seg = p.takeNewSeg();
+
+        // ③ 清理旧段与失效的归档映射
+        var ops: usize = 1; // renames
         var del_buf: [std.fs.max_path_bytes]u8 = undefined;
         for (self.segs.items) |*s| {
             const old_id = s.id;
             s.close();
             const op = std.fmt.bufPrint(&del_buf, "{s}/seg/{d:0>6}.data", .{ self.base_path, old_id }) catch continue;
             self.dir.deleteFile(self.io, op) catch {};
+            ops += 1;
         }
         self.segs.clearRetainingCapacity();
         if (self.idx_map) |*m| m.destroy();
         self.idx_map = null;
         self.idx_archive = &.{};
 
-        // 用 assumeCapacity：`segs` 刚装过 ≥2 个元素、容量一定够，append 不会重分配。
-        // 若这里用 append 而它恰好失败，磁盘归档已指向新段、旧段已删、segs 已空
-        // —— Table 会变成空表（上轮审计 P0-2 的残留路径）。
+        // `segs` 刚装过 ≥2 个元素，容量一定够 ⇒ appendAssumeCapacity 不会失败
         self.segs.appendAssumeCapacity(new_seg);
-        self.next_seg = id + 1;
         self.recomputeSegLayout();
+
+        self.last_apply_ops = ops;
+        self.ns_apply +|= self.nowNs() - t0;
+        return true;
+    }
+
+    pub fn compact(self: *Table) !CompactResult {
+        self.checkThread();
+        const t_cmp = self.nowNs();
+        defer {
+            const d = self.nowNs() - t_cmp;
+            self.ns_compact +|= d;
+            if (d > self.ns_compact_max) self.ns_compact_max = d;
+        }
+        if (self.segs.items.len <= 1) {
+            const n = self.segs.items.len;
+            return .{ .before = n, .after = n, .rows = 0, .did = false };
+        }
+
+        // 防重入：`prepareCompact` 内部会调 `flushImpl`，而 flush 末尾的自动触发会绕回 compact。
+        // 用 `was` 保留外层状态：自动触发 → compact → 内部 flush 期间标志必须仍为 true。
+        const was_going = self.going_compact;
+        self.going_compact = true;
+        defer self.going_compact = was_going;
+
+        // 合并拆成两半：
+        //   prepare —— 与**行数**成正比（归并 + 写新段 + 写新归档）
+        //   apply   —— 只与**段数**成正比（1 次 rename + 每段 1 次删除）
+        // 拆开之后两者可以分时执行；目前仍在同一线程连续调用（行为与拆分前完全一致）。
+        var p = (try self.prepareCompact()) orelse {
+            const n = self.segs.items.len;
+            return .{ .before = n, .after = n, .rows = 0, .did = false };
+        };
+        defer p.deinit(self.io, self.dir, self.alloc);
+        // `before` 的口径与拆分前一致：**内部 flush 之后**的段数（含刚落盘的那一段）
+        const before = self.segs.items.len;
+        if (!try self.applyPrepared(&p)) {
+            // prepare 与 apply 之间没有任何写入 ⇒ 快照必然仍然成立。
+            // 不成立就说明「单属主 + 不并发写」这个契约被破坏了，必须报错而不是静默重来。
+            return error.PreparedSnapshotStale;
+        }
 
         // 合并成功：清除自动触发积累的失败状态
         self.auto_compact_error = null;
         self.auto_compact_fails = 0;
-        self.compact_bytes_total += out_bytes;
+        self.compact_bytes_total += p.bytes;
         self.compact_calls +|= 1;
 
-        return .{ .before = before, .after = self.segs.items.len, .rows = rows, .bytes = out_bytes, .did = true };
+        return .{ .before = before, .after = self.segs.items.len, .rows = p.rows, .bytes = p.bytes, .did = true };
     }
 
     /// 用磁盘上的归档**重建整个段数组**。
@@ -3385,6 +3511,113 @@ test "自动 compaction: compact 内部的 flush 不得递归触发" {
     try std.testing.expectEqual(@as(usize, 1), cr_again.before);
     try std.testing.expect(!cr_again.did);
     try std.testing.expectEqual(@as(u64, 0), cr_again.bytes);
+}
+
+test "prepare/apply 分离：apply 的代价只与段数有关（与行数无关），快照失效时安全丢弃" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-prepare-apply";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    // ---------------------------------------------------------------
+    // ① prepare → apply：重活准备好之后，apply 只做 rename + 删旧文件
+    // ---------------------------------------------------------------
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+        defer t.deinit();
+
+        var i: usize = 0;
+        while (i < 3) : (i += 1) {
+            var kb: [16]u8 = undefined;
+            try t.put(try std.fmt.bufPrint(&kb, "k{d}", .{i}), "v");
+            try t.flush();
+        }
+        try std.testing.expectEqual(@as(usize, 3), t.segs.items.len);
+
+        const prep_path = try std.fmt.allocPrint(alloc, "{s}/seg/index.bin.prep", .{tmp});
+        defer alloc.free(prep_path);
+
+        var p1 = (try t.prepareCompact()).?;
+        try std.testing.expectEqual(@as(usize, 3), p1.snapshot_ids.len);
+        try std.testing.expectEqual(@as(usize, 3), p1.rows);
+        // 临时归档已就位（正式归档 `index.bin` 还没被动过）
+        {
+            const f = try dir.openFile(io, prep_path, .{});
+            f.close(io);
+        }
+
+        // 快照只看**段集合**：prepare 之后写 memtable 不影响 apply
+        try t.put("k9", "v9");
+        try std.testing.expect(try t.applyPrepared(&p1));
+        p1.deinit(io, dir, alloc);
+
+        try std.testing.expectEqual(@as(usize, 1), t.segs.items.len);
+        // **确定性指标**：1 次 rename + 3 次删除 = 4 —— 与行数无关
+        try std.testing.expectEqual(@as(usize, 4), t.last_apply_ops);
+        try std.testing.expect(t.last_apply_discard == null);
+        // 临时归档已被 rename 走
+        try std.testing.expectError(error.FileNotFound, dir.openFile(io, prep_path, .{}));
+
+        var ov: std.ArrayList(u8) = .empty;
+        defer ov.deinit(alloc);
+        try std.testing.expectEqualStrings("v", (try t.get("k2", &ov)).?);
+        try std.testing.expectEqualStrings("v9", (try t.get("k9", &ov)).?);
+
+        // ---------------------------------------------------------------
+        // ② 丢弃：prepare 之后段集合变了 ⇒ apply 返回 false，表原样可用
+        // ---------------------------------------------------------------
+        // apply 之后只剩 1 段，`prepareCompact` 会返回 null（没得可并），
+        // 所以先再落一段出来，凑够 2 段。
+        try t.put("kB", "vb");
+        try t.flush();
+        try std.testing.expectEqual(@as(usize, 2), t.segs.items.len);
+
+        var p2 = (try t.prepareCompact()).?; // memtable 已在上一次 flush 里落盘 ⇒ 段数不变
+        try std.testing.expectEqual(@as(usize, 2), t.segs.items.len);
+        try t.put("kA", "va");
+        try t.flush(); // 段集合又变了 ⇒ 快照失效
+        try std.testing.expectEqual(@as(usize, 3), t.segs.items.len);
+        try std.testing.expect(!try t.applyPrepared(&p2));
+        try std.testing.expect(t.last_apply_discard != null);
+        try std.testing.expectEqual(@as(usize, 3), t.segs.items.len); // 什么都没改
+        p2.deinit(io, dir, alloc);
+        // 丢弃必须把临时归档清干净（否则每次丢弃都留垃圾）
+        try std.testing.expectError(error.FileNotFound, dir.openFile(io, prep_path, .{}));
+        try std.testing.expectEqualStrings("va", (try t.get("kA", &ov)).?);
+        try std.testing.expectEqualStrings("v9", (try t.get("k9", &ov)).?);
+    }
+
+    // ---------------------------------------------------------------
+    // ③ 「与行数无关」再钉一次：同样 3 段、但每段 100 行 ⇒ apply_ops 仍是 4
+    // ---------------------------------------------------------------
+    {
+        const tmp2 = "test-table-prepare-apply-many";
+        dir.deleteTree(io, tmp2) catch {};
+        defer dir.deleteTree(io, tmp2) catch {};
+
+        var t = try Table.open(io, dir, tmp2, alloc, .{ .wal_sync_every = 0 });
+        defer t.deinit();
+        var i: usize = 0;
+        while (i < 300) : (i += 1) {
+            var kb: [24]u8 = undefined;
+            try t.put(try std.fmt.bufPrint(&kb, "k{d:0>4}", .{i}), "v");
+            if ((i + 1) % 100 == 0) try t.flush();
+        }
+        try std.testing.expectEqual(@as(usize, 3), t.segs.items.len);
+
+        var p = (try t.prepareCompact()).?;
+        try std.testing.expectEqual(@as(usize, 300), p.rows);
+        try std.testing.expect(try t.applyPrepared(&p));
+        p.deinit(io, dir, alloc);
+        try std.testing.expectEqual(@as(usize, 1), t.segs.items.len);
+        // 行数 3 → 300（100×），apply 的文件操作数完全一样
+        try std.testing.expectEqual(@as(usize, 4), t.last_apply_ops);
+    }
 }
 
 test "自动 compaction: 阈值 1 不得虚增合并次数（compact 提前返回）" {
