@@ -11,6 +11,8 @@ pub const wal = @import("wal.zig");
 pub const segment = @import("segment.zig");
 pub const table = @import("table.zig");
 pub const shutdown = @import("shutdown.zig");
+/// 固定池分配器（§16.5 `-Dalloc` 档：无系统堆也能跑 KV 全流程）
+pub const pool = @import("pool.zig");
 
 // ---- SQL 层（`-Dsql=false` 时整层编译掉）----
 // §16.5 硬约束：任何能力都必须能**编译期关闭**。关掉这一层之后，KV 核心的回归
