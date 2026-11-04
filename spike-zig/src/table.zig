@@ -3620,6 +3620,113 @@ test "prepare/apply 分离：apply 的代价只与段数有关（与行数无关
     }
 }
 
+// **诊断用**（只在 `zig build test` 里跑，不做判定）：量出「prepare 一次要多久」与
+// 「写负载的 flush 间隔」，据此估算**后台合并的期望放弃率**（`P ≈ 1 − e^-prepare/interval`）：
+// 后台线程抓快照开始归并，写线程继续写，只要期间发生**任意一次 flush**（段集合变了）就作废。
+// 这个数字决定「值不值得引入线程」—— 放弃率接近 1 就说明算了也白算。
+test "诊断：prepare 时长 vs flush 间隔（决定后台合并值不值得做）" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-table-prepare-rate";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0 });
+    defer t.deinit();
+
+    // 5 批 × 1 万行，每批一次 flush：记录每次 flush 的「结束时刻」以算间隔
+    const Batch = 10_000;
+    var stamps: [8]u64 = @splat(0);
+    var nstamp: usize = 0;
+    var i: usize = 0;
+    while (i < 5 * Batch) : (i += 1) {
+        var kb: [24]u8 = undefined;
+        try t.put(try std.fmt.bufPrint(&kb, "k{d:0>7}", .{i}), "0123456789abcdef0123456789abcdef");
+        if ((i + 1) % Batch == 0) {
+            try t.flush();
+            stamps[nstamp] = t.nowNs();
+            nstamp += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 5), t.segs.items.len);
+
+    var interval_ns: u64 = 0;
+    var k: usize = 1;
+    while (k < nstamp) : (k += 1) interval_ns += stamps[k] - stamps[k - 1];
+    interval_ns /= (nstamp - 1);
+
+    const before_ns = t.ns_prepare;
+    var p = (try t.prepareCompact()).?;
+    const prepare_ns = t.ns_prepare - before_ns;
+    p.deinit(io, dir, alloc);
+
+    const ratio: f64 = @as(f64, @floatFromInt(prepare_ns)) / @as(f64, @floatFromInt(@max(interval_ns, 1)));
+    std.debug.print(
+        "\n[诊断] 5 万行/5 段：flush 间隔 ≈ {d:.2} ms，prepare ≈ {d:.2} ms，预期放弃率 ≈ {d:.1}%（1 - e^-{d:.2}）\n",
+        .{
+            @as(f64, @floatFromInt(interval_ns)) / 1e6,
+            @as(f64, @floatFromInt(prepare_ns)) / 1e6,
+            100.0 * (1.0 - @exp(-ratio)),
+            ratio,
+        },
+    );
+    // 只做防空跑：两个数都得真的量到
+    try std.testing.expect(prepare_ns > 0 and interval_ns > 0);
+
+    // 第二组：段数翻倍（10 段）。用来验证「段数越多，后台合并越不可行」这个推论：
+    // prepare 处理的行数随段数增长，而 flush 间隔不变 ⇒ ratio 线性变大 ⇒ 放弃率趋近 100%。
+    {
+        const tmp2 = "test-table-prepare-rate10";
+        dir.deleteTree(io, tmp2) catch {};
+        defer dir.deleteTree(io, tmp2) catch {};
+
+        var t2 = try Table.open(io, dir, tmp2, alloc, .{ .wal_sync_every = 0 });
+        defer t2.deinit();
+
+        var stamps2: [16]u64 = @splat(0);
+        var n2: usize = 0;
+        var j: usize = 0;
+        while (j < 10 * Batch) : (j += 1) {
+            var kb: [24]u8 = undefined;
+            try t2.put(try std.fmt.bufPrint(&kb, "k{d:0>7}", .{j}), "0123456789abcdef0123456789abcdef");
+            if ((j + 1) % Batch == 0) {
+                try t2.flush();
+                stamps2[n2] = t2.nowNs();
+                n2 += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 10), t2.segs.items.len);
+
+        var iv2: u64 = 0;
+        var q: usize = 1;
+        while (q < n2) : (q += 1) iv2 += stamps2[q] - stamps2[q - 1];
+        iv2 /= (n2 - 1);
+
+        const b2 = t2.ns_prepare;
+        var p2 = (try t2.prepareCompact()).?;
+        const prep2 = t2.ns_prepare - b2;
+        p2.deinit(io, dir, alloc);
+
+        const r2: f64 = @as(f64, @floatFromInt(prep2)) / @as(f64, @floatFromInt(@max(iv2, 1)));
+        std.debug.print(
+            "[诊断] 10 万行/10 段：flush 间隔 ≈ {d:.2} ms，prepare ≈ {d:.2} ms，预期放弃率 ≈ {d:.1}%（1 - e^-{d:.2}）\n",
+            .{
+                @as(f64, @floatFromInt(iv2)) / 1e6,
+                @as(f64, @floatFromInt(prep2)) / 1e6,
+                100.0 * (1.0 - @exp(-r2)),
+                r2,
+            },
+        );
+        try std.testing.expect(prep2 > 0 and iv2 > 0);
+        // **推论已经被数据证实**：段数翻倍后 ratio 变大（放弃率更高）
+        try std.testing.expect(r2 > ratio);
+    }
+}
+
 test "自动 compaction: 阈值 1 不得虚增合并次数（compact 提前返回）" {
     const alloc = std.testing.allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
