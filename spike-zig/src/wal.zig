@@ -12,10 +12,21 @@ pub const Op = struct {
 /// WAL record 头长度：`u32 crc32(payload)` + `u32 payload_len`。
 const WAL_REC_HDR: usize = 8;
 
+/// 每条 op 在 `buf` 里的**预留量**：`flags(1) + klen varint(≤5) + vlen varint(≤5)`，再留 1 字节余量
+/// 给 `codec.encodeVarint`（它要一个 ≥ 10 字节的可写窗口，见 `encodeBatch`）。
+/// 实际写的字节数比它少，末尾按实际用量 `items.len` 收回，所以不会浪费。
+const OP_RESERVE: usize = 12;
+
 pub const Batch = struct {
     seq: u64,
     ops: []Op,
 };
+
+/// 预留量累加的溢出出口：`encodeBatch` 后面的写入全是裸指针，**少预留就等于写越界**，
+/// 所以宁可显式报错也不能让 `usize` 卷回去。
+fn addOrTooLarge(a: usize, b: usize) error{WalBatchTooLarge}!usize {
+    return std.math.add(usize, a, b) catch error.WalBatchTooLarge;
+}
 
 pub const Wal = struct {
     io: std.Io,
@@ -39,7 +50,6 @@ pub const Wal = struct {
     /// 也就是说默认的 256 KB 缓冲档 **比 SQLite 弱** —— 跨引擎比吞吐时必须把这条对齐。
     buf_bytes: usize = 256 * 1024,
     buf: std.ArrayList(u8) = .empty,
-    payload: std.ArrayList(u8) = .empty,
     alloc: std.mem.Allocator,
 
     pub fn create(io: std.Io, dir: std.Io.Dir, path: []const u8, alloc: std.mem.Allocator) !Wal {
@@ -93,21 +103,39 @@ pub const Wal = struct {
             .ops => |ops| ops.len,
             .pairs => |p| p.keys.len,
         };
-        // 容量上界：头 8 + seq 8 + n_ops 4，每行 `flags(1) + klen varint(≤5) + key + vlen varint(≤5) + value`
-        // 再各留 1 字节余量给编码器（它可能一次写 10 字节 varint）。
+        // 预留量 = 头(8) + seq(8) + n_ops(4) + 每行 `OP_RESERVE + klen + vlen`。
+        //
+        // **必须用 checked add**：这个式子把「调用方给的 key/value 长度」直接累进 `usize`，
+        // 一旦溢出就会**少预留**，而下面全是裸指针写入（不经 `ArrayList` 的容量检查）
+        // ⇒ 直接写越界。现实的批次不可能到 usize 上限，但「不可信输入参与算术」必须显式拒绝，
+        // 不能靠「应该不会」。
         var need: usize = WAL_REC_HDR + 12;
         switch (src) {
             .ops => |ops| for (ops) |op| {
-                need += 12 + op.key.len + op.value.len;
+                need = try addOrTooLarge(need, OP_RESERVE);
+                need = try addOrTooLarge(need, op.key.len);
+                need = try addOrTooLarge(need, op.value.len);
             },
             .pairs => |p| for (p.keys, p.values) |k, v| {
-                need += 12 + k.len + v.len;
+                need = try addOrTooLarge(need, OP_RESERVE);
+                need = try addOrTooLarge(need, k.len);
+                need = try addOrTooLarge(need, v.len);
             },
         }
+        // **必须在写之前就拒绝超 u32 的批次**：record 头里 `n_ops` 与 `payload_len` 都是 u32，
+        // 而 `@intCast` 在 ReleaseFast 下**不做检查**（溢出是未定义行为，实际表现为静默截断）——
+        // 一旦截断，写出去的是一条长度字段与内容不符的 record，replay 时 CRC 必不过，
+        // 整段 WAL 变成不可恢复的垃圾。宁可在这里显式报错，让调用方拆批。
+        if (n_ops > std.math.maxInt(u32)) return error.WalBatchTooLarge;
+        if (need - WAL_REC_HDR > std.math.maxInt(u32)) return error.WalBatchTooLarge;
         try self.buf.ensureUnusedCapacity(self.alloc, need);
 
         const start = self.buf.items.len;
-        self.buf.items.len = start + need; // 先占满，末尾按实际用量收回
+        // 先把 `items.len` 推到「预留末尾」（占位），末尾按实际用量收回。
+        // 这样做的合法性依赖：**中间没有任何可失败操作**（只有裸内存写），所以不存在
+        // 「返回错误时把未初始化区当数据用」的路径。
+        self.buf.items.len = start + need;
+        const limit = start + need; // 写入不得越过它（Debug 断言用）
         var p: [*]u8 = self.buf.items[start..].ptr;
         p += WAL_REC_HDR;
         std.mem.writeInt(u64, p[0..8], seq, .little);
@@ -115,6 +143,10 @@ pub const Wal = struct {
         std.mem.writeInt(u32, p[0..4], @intCast(n_ops), .little);
         p += 4;
 
+        // **`p[0..10]` 是不经边界检查的裸指针切片**（`[*]u8` 取切片没有运行时检查）：
+        // 它安全的唯一依据是「每行留了 `OP_RESERVE`，且 `encodeVarint` 只会按实际需要写
+        // 1..5 字节（u32 量级的长度），绝不写满 10 字节」。
+        // `std.debug.assert` 在 ReleaseFast 下不生成代码，所以这里零成本。
         switch (src) {
             .ops => |ops| for (ops) |op| {
                 p[0] = op.flags;
@@ -125,6 +157,7 @@ pub const Wal = struct {
                 p += codec.encodeVarint(p[0..10], op.value.len);
                 @memcpy(p[0..op.value.len], op.value);
                 p += op.value.len;
+                std.debug.assert(@intFromPtr(p) <= @intFromPtr(self.buf.items.ptr) + limit);
             },
             .pairs => |pr| for (pr.keys, pr.values) |k, v| {
                 p[0] = 0;
@@ -135,10 +168,13 @@ pub const Wal = struct {
                 p += codec.encodeVarint(p[0..10], v.len);
                 @memcpy(p[0..v.len], v);
                 p += v.len;
+                std.debug.assert(@intFromPtr(p) <= @intFromPtr(self.buf.items.ptr) + limit);
             },
         }
 
         const payload_len = @intFromPtr(p) - (@intFromPtr(self.buf.items.ptr) + start + WAL_REC_HDR);
+        // 预留量里，`WAL_REC_HDR` 给 record 头、剩下的（12 + Σ 每行）全都归 payload。
+        std.debug.assert(payload_len <= need - WAL_REC_HDR); // 预留真的够（Debug）
         const rec = self.buf.items[start..][0..(WAL_REC_HDR + payload_len)];
         std.mem.writeInt(u32, rec[0..4], codec.crc32Fast(rec[WAL_REC_HDR..]), .little);
         std.mem.writeInt(u32, rec[4..8], @intCast(payload_len), .little);
@@ -201,7 +237,6 @@ pub const Wal = struct {
             .{ self.buf.items.len, @errorName(e) },
         );
         self.buf.deinit(self.alloc);
-        self.payload.deinit(self.alloc);
         self.file.close(self.io);
         self.* = undefined;
     }
@@ -402,4 +437,80 @@ test "wal append + replay" {
     try std.testing.expectEqual(@as(usize, 2), r.batches.items[1].ops.len);
     try std.testing.expectEqualStrings("k2", r.batches.items[1].ops[0].key);
     try std.testing.expectEqual(@as(u8, 1), r.batches.items[1].ops[1].flags);
+}
+
+test "wal 编码：varint 进位边界（127/128/16383/16384/7 万）与空 key/空 value 必须逐字节往返" {
+    // **为什么必须测这几个长度**：`encodeBatch` 现在是「一次算准容量 + 裸指针写」，
+    // 而长度是用 varint 编码的 —— 127→128、16383→16384 正是 varint 从 1 字节变 2 字节、
+    // 2 字节变 3 字节的进位点。预留量只要在进位点算少 1 字节，写就越界；
+    // 而既有往返用例的 key/value 都很短（8/32 字节，varint 恒 1 字节），**覆盖不到这些点**。
+    // 空 key / 空 value 也要测：它们的 varint 是 1 字节 0x00，长度 0 最容易在上界里被算掉。
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-wal-varint-edges";
+    dir.deleteTree(io, tmp) catch {};
+    try dir.createDirPath(io, tmp);
+    defer dir.deleteTree(io, tmp) catch {};
+
+    // 边界长度：0 / 1 / 127 / 128 / 16383 / 16384 / 70000（跨 3 字节 varint）
+    const lens = [_]usize{ 0, 1, 127, 128, 16383, 16384, 70000 };
+    const big = try alloc.alloc(u8, lens[lens.len - 1]);
+    defer alloc.free(big);
+    for (big, 0..) |*b, i| b.* = @truncate('a' + (i % 26));
+
+    {
+        var w = try Wal.create(io, dir, tmp ++ "/000001.wal", alloc);
+        defer w.close();
+        var seq: u64 = 0;
+        // ① 逐个长度：key 长 = len、value 空
+        for (lens) |len| {
+            seq += 1;
+            _ = try w.append(seq, &.{.{ .flags = 0, .key = big[0..len], .value = "" }});
+        }
+        // ② 逐个长度：key 空、value 长 = len
+        for (lens) |len| {
+            seq += 1;
+            _ = try w.append(seq, &.{.{ .flags = 1, .key = "", .value = big[0..len] }});
+        }
+        // ③ 同一批里混合各种长度（走 out = appendPairs 那条也不会错）
+        var keys: [lens.len][]const u8 = undefined;
+        var vals: [lens.len][]const u8 = undefined;
+        for (lens, 0..) |len, i| {
+            keys[i] = big[0..len];
+            vals[i] = big[0..lens[lens.len - 1 - i]];
+        }
+        seq += 1;
+        _ = try w.appendPairs(seq, &keys, &vals);
+        try w.sync();
+    }
+
+    var r = try replay(io, dir, tmp ++ "/000001.wal", alloc);
+    defer r.deinit();
+    try std.testing.expectEqual(lens.len * 2 + 1, r.count());
+
+    for (lens, 0..) |len, i| {
+        const b = r.batches.items[i];
+        try std.testing.expectEqual(@as(u64, @intCast(i + 1)), b.seq);
+        try std.testing.expectEqual(@as(usize, 1), b.ops.len);
+        try std.testing.expectEqualSlices(u8, big[0..len], b.ops[0].key);
+        try std.testing.expectEqual(@as(usize, 0), b.ops[0].value.len);
+    }
+    for (lens, 0..) |len, i| {
+        const b = r.batches.items[lens.len + i];
+        try std.testing.expectEqual(@as(usize, 0), b.ops[0].key.len);
+        try std.testing.expectEqual(@as(u8, 1), b.ops[0].flags);
+        try std.testing.expectEqualSlices(u8, big[0..len], b.ops[0].value);
+    }
+    {
+        const b = r.batches.items[lens.len * 2];
+        try std.testing.expectEqual(lens.len, b.ops.len);
+        for (lens, 0..) |len, i| {
+            try std.testing.expectEqualSlices(u8, big[0..len], b.ops[i].key);
+            try std.testing.expectEqualSlices(u8, big[0..lens[lens.len - 1 - i]], b.ops[i].value);
+        }
+    }
 }

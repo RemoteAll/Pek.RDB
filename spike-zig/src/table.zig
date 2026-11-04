@@ -654,9 +654,9 @@ pub const Table = struct {
     /// 合并实际执行次数（`did == true` 的那些，`did == false` 的早退不计）。
     compact_calls: u64 = 0,
     /// `prepareCompact()` 的累计纳秒：**与行数成正比**的那一半（归并 + 写新段 + 写归档）。
+    /// （`applyPrepared()` 那一半的 `ns_apply` 已删：它只写不读 —— 结论已在
+    /// §一百二十二 用一次性测量拿到，留着只会多一份「写了没人看」的状态。）
     ns_prepare: u64 = 0,
-    /// `applyPrepared()` 的累计纳秒：**只与段数成正比**的那一半（rename + 删旧文件 + 换数组）。
-    ns_apply: u64 = 0,
     /// 索引顺序扫描（`ORDER BY <索引列> LIMIT n`）的耗时拆分这次只做过**一次性**诊断：
     /// 拆成「索引游标推进 + 逐行回表」与「装配成 `Rows`」两段，实测前者占 94%
     /// （4.62 µs / 4.7 µs），定位完就把计时删掉了 —— 留着会白送约 75 ns/次
@@ -670,6 +670,16 @@ pub const Table = struct {
     /// **确定性指标**：正常必须恒为 0；不为 0 说明「窗口行数上界」的推算与实际不符
     /// （这类偏差最容易演成「keybuf 扩容 ⇒ 已记录的 key 切片悬垂」的 UAF）。
     topk_arena_short: u64 = 0,
+    /// `topKDesc` 走「memtable 整体高于所有段」快判的次数。
+    /// **确定性指标**：用来钉住「顺序写入场景真的没去碰段」——只看返回值看不出走的是哪条路。
+    topk_mem_only: u64 = 0,
+    /// `topKDesc` 的**可复用草稿**（每次查询清空复用，省掉 5 次 malloc / 4 次 free）。
+    /// 只能存「查询期间有效」的东西：返回给调用方的只有 `out` 里的 value 切片，
+    /// 它们指向段 mmap / memtable arena，与这些草稿无关。
+    topk_kbuf: std.ArrayList(u8) = .empty,
+    topk_cand: std.ArrayList(TopCand) = .empty,
+    topk_mem_groups: std.ArrayList(TopCand) = .empty,
+    topk_picked: std.ArrayList(TopCand) = .empty,
     /// 扫描/归并**实际产出**的行数（累计）。
     /// 确定性指标：用来证明「LIMIT 提前终止」真的没白读，而不是靠计时猜。
     scan_rows_read: u64 = 0,
@@ -854,6 +864,10 @@ pub const Table = struct {
         self.idx_archive = &.{};
         self.key_arena.deinit(self.alloc);
         self.hit_buf.deinit(self.alloc);
+        self.topk_kbuf.deinit(self.alloc);
+        self.topk_cand.deinit(self.alloc);
+        self.topk_mem_groups.deinit(self.alloc);
+        self.topk_picked.deinit(self.alloc);
         self.mem.deinit();
         self.wal.close();
         self.alloc.free(self.base_path);
@@ -924,12 +938,19 @@ pub const Table = struct {
         }
     }
 
-    pub fn put(self: *Table, key: []const u8, value: []const u8) !void {
+    /// 单条写（`put` / `delete`）的**唯一**提交骨架。
+    ///
+    /// 为什么要收成一处：原先 `put` 与 `delete` 各写了一遍，然后 `delete` 那版**漏了**两件事 ——
+    /// ① 不计数 `pending` ⇒ 只有删除的负载永远不会触发周期 `fsync`（持久化比承诺的弱）；
+    /// ② 不判 `flush_bytes` ⇒ 墓碑全留在 memtable 里**无界增长**（批量清理时直接吃满内存）。
+    /// 两条都是「同一段逻辑写两遍必然漂移」的典型后果，不是笔误。
+    /// `inline`：热路径（1M 行/轮）多一层调用不影响生成的代码。
+    inline fn putOne(self: *Table, key: []const u8, value: []const u8, flags: u8) !void {
         self.checkThread();
         self.seq += 1;
         const seq = self.seq;
-        _ = try self.wal.append(seq, &.{.{ .flags = 0, .key = key, .value = value }});
-        try self.mem.insert(key, seq, 0, value);
+        _ = try self.wal.append(seq, &.{.{ .flags = flags, .key = key, .value = value }});
+        try self.mem.insert(key, seq, flags, value);
         self.visible = seq;
         self.pending += 1;
         if (self.opts.wal_sync_every > 0 and self.pending >= self.opts.wal_sync_every) {
@@ -938,16 +959,20 @@ pub const Table = struct {
             self.ns_wal_sync += self.nowNs() - t_sync;
             self.pending = 0;
         }
+        try self.maybeFlush();
+    }
+
+    /// `flush_bytes` 回落。**每条写路径都必须调**（漏掉就是 memtable 无界增长）。
+    inline fn maybeFlush(self: *Table) !void {
         if (self.mem.sizeBytes() >= self.opts.flush_bytes) try self.flush();
     }
 
+    pub fn put(self: *Table, key: []const u8, value: []const u8) !void {
+        try self.putOne(key, value, 0);
+    }
+
     pub fn delete(self: *Table, key: []const u8) !void {
-        self.checkThread();
-        self.seq += 1;
-        const seq = self.seq;
-        _ = try self.wal.append(seq, &.{.{ .flags = 1, .key = key, .value = "" }});
-        try self.mem.insert(key, seq, 1, "");
-        self.visible = seq;
+        try self.putOne(key, "", 1);
     }
 
     /// 批量写：一批一个 WAL 提交（对应 SQLite 的单事务批量插入）。
@@ -974,10 +999,7 @@ pub const Table = struct {
             try self.wal.flushToOs();
         }
         self.ns_wal_sync += self.nowNs() - t_sync;
-        // **必须和 `put` 一样按 `flush_bytes` 回落**：漏了这一句的后果是「批量导入时 memtable
-        // 无界增长」——1 亿行 × 39 B ≈ 3.9 GB 全留在内存里，最后一次性 flush 要 71 s，
-        // 而且只产出一个巨型段（段数=1 会让点查/合并的实测结果失去意义）。
-        if (self.mem.sizeBytes() >= self.opts.flush_bytes) try self.flush();
+        try self.maybeFlush();
     }
 
     pub fn get(self: *Table, key: []const u8, out: *std.ArrayList(u8)) !?[]const u8 {
@@ -1049,6 +1071,24 @@ pub const Table = struct {
     /// 返回 `false` ⇒ 候选凑不够 k 组（表太小 / 尾部全是墓碑），调用方回退全量路径。
     /// 正确性不依赖快速路径够不够用。
     ///
+    /// **结构性快判**：memtable 里的每个 key 是否都大于所有段的最大 key。
+    ///
+    /// 顺序写入（PK 自增 / 时序 / 日志）+ 定期 flush 时这恒成立：段里是更早、更小的 key。
+    /// 一旦成立，`ORDER BY pk DESC LIMIT k` 的答案**完全在 memtable 里**，不需要收候选、
+    /// 不需要排序、也不必碰任何段的数据视图。
+    ///
+    /// 判据只需要两个 key（memtable 最小 vs 段最大），代价 O(段数) 次比较 ——
+    /// 相比「收 k+16 条候选 + 排序 + 归组」便宜一个数量级。
+    /// 不成立时**安全退化**：返回 false，走原来的多来源路径。
+    fn memAboveAllSegs(self: *const Table) !bool {
+        const mem_min = self.mem.minKey() orelse return false;
+        for (self.segs.items) |*sg| {
+            const mx = sg.maxKey() orelse continue; // 空段不参与
+            if (segmod.keyCmp(mem_min, mx) != .gt) return false;
+        }
+        return true;
+    }
+
     /// `out` 里的切片指向段 mmap / memtable arena，查询期间有效（与 `scanValues` 同口径）。
     pub fn topKDesc(self: *Table, k: usize, out: *std.ArrayList([]const u8)) !bool {
         self.checkThread();
@@ -1059,14 +1099,23 @@ pub const Table = struct {
         if (self.opts.topk_desc_max == 0 or k > self.opts.topk_desc_max) return false;
         const alloc = self.alloc;
 
-        // **单来源快路径**：只有 memtable（没有段）时，`Skiplist` 本身就是有序的 ——
+        // **单来源快路径**：答案完全落在 memtable 里时（`memAboveAllSegs()`：段里全是更小的 key，
+        // 包括「压根没有段」这种特例），`Skiplist` 本身就是有序的 ——
         // 反向走一遍、按 key 分组、每组取**最新**版本即可，**不需要收候选、不需要排序、
         // 不需要拷 key**（arena 里的切片本来就稳定）。
         //
         // 实测意义（2026-11-02 阶段拆解）：`topKDesc` 占整条查询 7.8 µs 里的 7.8 µs，
         // 而其中大头是「收 74+64 条候选再排序」。刚写完还没落盘的查询（以及小表）走的
         // 正是这条单来源路径，直接省掉整个排序与拷贝。
-        if (self.segs.items.len == 0 and self.mem.len() > 0) {
+        //
+        // **「没有段」不是唯一条件**（2026-11-04 补）：顺序写入 + 定期 flush 时，
+        // 段里存的是**更早、更小**的 key，而 memtable 里全是更大的新 key ——
+        // 这时答案完全落在 memtable 里。判据是结构性的、只比两个 key：
+        // 「memtable 的最小 key > 所有段的最大 key」⇒ 任何段都不可能进 top-k。
+        // 这条判据把 `ORDER BY id DESC LIMIT 10`（1M 行、1 段、memtable 有尾巴）从
+        // 「收 26 条候选 + 排序 + 归组」（实测 1.59 µs）变成「反向走 k 步」。
+        if (self.mem.len() > 0 and try self.memAboveAllSegs()) {
+            self.topk_mem_only +|= 1;
             // **先一次分配到位**：`out` 每次查询都是新建的 `.empty`，不预分配就要经历
             // 8→16→…→k 的一串扩容（每次 realloc + 拷贝）。
             try out.ensureTotalCapacity(alloc, k);
@@ -1096,10 +1145,16 @@ pub const Table = struct {
 
         const window = k + TOPK_MARGIN;
 
-        var kbuf: std.ArrayList(u8) = .empty; // 稳定 key 区（段游标的 key 指向双缓冲）
-        defer kbuf.deinit(alloc);
-        var cand: std.ArrayList(TopCand) = .empty;
-        defer cand.deinit(alloc);
+        // **草稿缓冲复用**：这四个容器每次查询都新建再释放（5 次 malloc + 4 次 free，
+        // 实测开销占这条查询的相当一部分）。它们是纯草稿 —— 返回给调用方的只有 `out`
+        // 里的 value 切片（指向段 mmap / memtable arena），所以复用完全安全。
+        // `topKDesc` 是单属主单线程且不会重入（`checkThread()` 已守），所以直接挂在 Table 上。
+        self.topk_kbuf.clearRetainingCapacity();
+        self.topk_cand.clearRetainingCapacity();
+        self.topk_mem_groups.clearRetainingCapacity();
+        self.topk_picked.clearRetainingCapacity();
+        const kbuf = &self.topk_kbuf; // 稳定 key 区（段游标的 key 指向双缓冲）
+        const cand = &self.topk_cand;
 
         // ---- 1) **先收 memtable**（它最可能直接给出答案，且它的 key 能当剪枝门槛）----
         // 顺序写入（PK 自增 / 时序 / 日志）时 memtable 装的是**最新、也是最大**的 key，
@@ -1144,10 +1199,9 @@ pub const Table = struct {
 
         // memtable 候选先排序归组：既得到「第 k 名门槛」，也可能直接就是最终答案。
         std.mem.sort(TopCand, cand.items[0..mem_end], {}, candLess);
-        var mem_groups: std.ArrayList(TopCand) = .empty; // key 升序
-        defer mem_groups.deinit(alloc);
+        const mem_groups = &self.topk_mem_groups; // key 升序
         var mem_edge: ?[]const u8 = null;
-        try collectGroups(cand.items[0..mem_end], alloc, &mem_groups, &mem_edge);
+        try collectGroups(cand.items[0..mem_end], alloc, mem_groups, &mem_edge);
         // 门槛 = 第 k 大的组（升序数组的 len-k），它的 key 指向 arena ⇒ 稳定
         const floor_key: ?[]const u8 = if (mem_groups.items.len >= k) mem_groups.items[mem_groups.items.len - k].key else null;
 
@@ -1172,10 +1226,14 @@ pub const Table = struct {
         // 用 `ensureTotalCapacityPrecise` 而不是 `ensureTotalCapacity`：
         // 后者会让分配器按 2 的幂向上取整，**把上界算漏 40% 也看不出来**
         // （实测：`+1` 的旧上界本应溢出，却因为 714→1024 的取整一直「恰好够用」）。
-        // 精确分配后，`topk_arena_short` 这条守卫才真的会响。
-        try kbuf.ensureTotalCapacityPrecise(alloc, seg_key_cap);
+        //
+        // 改用复用缓冲后，容量可能已经比本次需要的**更大**（上一次查询留下的），
+        // 所以容量本身不能再当守卫 —— 下面改用 `seg_key_cap`（**算出来的上界**）
+        // 直接比对实际用量，这比看分配器容量更严。
+        if (kbuf.capacity < seg_key_cap) try kbuf.ensureTotalCapacityPrecise(alloc, seg_key_cap);
 
         var si = self.segs.items.len;
+        var segs_contrib: usize = 0; // 真正贡献了候选的段数（决定能不能跳过排序）
         while (si > 0) {
             si -= 1;
             const sg = &self.segs.items[si];
@@ -1195,10 +1253,11 @@ pub const Table = struct {
             var c = try sg.cursor(start, &.{}, self.visible);
             defer c.deinit();
             var first = head_trunc;
+            const n_before = cand.items.len;
             while (c.next()) |rec| {
                 // **绝不允许扩容**：`cand` 里已经存了 `kbuf` 的切片，扩容搬移会让它们悬垂。
                 // 上界真算漏了就退回全量路径（计数器 `topk_arena_short` 供用例守住）。
-                if (kbuf.items.len + rec.key.len > kbuf.capacity) {
+                if (kbuf.items.len + rec.key.len > seg_key_cap) {
                     self.topk_arena_short +|= 1;
                     return false;
                 }
@@ -1213,6 +1272,7 @@ pub const Table = struct {
                 });
                 first = false;
             }
+            if (cand.items.len > n_before) segs_contrib += 1;
             if (self.segs_disjoint_asc and cand.items.len - mem_end >= window) break;
         }
         if (cand.items.len == 0) return false;
@@ -1235,11 +1295,25 @@ pub const Table = struct {
         }
 
         // ---- 4) 有段候选：合并排序 → 归组 → 取 k ----
-        std.mem.sort(TopCand, cand.items, {}, candLess);
-        var picked: std.ArrayList(TopCand) = .empty; // key 升序
-        defer picked.deinit(alloc);
+        //
+        // **单来源可以跳过排序**：段游标产出的顺序就是 `(key asc, seq desc)`，与 `candLess`
+        // 完全一致（这是段格式的定义）。所以「memtable 没贡献 + 只有一个段贡献」时
+        // `cand` 已经有序。实测这条查询（1 段 + 空 memtable、k=10）时，
+        // 候选有 48 条，排一次占了不少开销。
+        const already_sorted = mem_end == 0 and segs_contrib == 1;
+        if (!already_sorted) {
+            std.mem.sort(TopCand, cand.items, {}, candLess);
+        } else if (std.debug.runtime_safety) {
+            // Debug / ReleaseSafe 下真的验证一遍「游标顺序 == candLess 顺序」这个前提，
+            // 否则哪天段格式变成别的排序，这里就会静默返回错的 top-k。ReleaseFast 下不生成代码。
+            var i: usize = 1;
+            while (i < cand.items.len) : (i += 1) {
+                std.debug.assert(!candLess({}, cand.items[i], cand.items[i - 1]));
+            }
+        }
+        const picked = &self.topk_picked; // key 升序
         var picked_edge: ?[]const u8 = null;
-        try collectGroups(cand.items, alloc, &picked, &picked_edge);
+        try collectGroups(cand.items, alloc, picked, &picked_edge);
         if (picked.items.len < k) return false; // 凑不够 ⇒ 让调用方走全量路径
         // **不能只把边界组「丢掉就算了」**：`topKDesc` 是在**跨来源合并后**取最大的 k 个，
         // 丢掉一个边界组之后，第 k 名会由「另一个来源里更小的 key」顶上，
@@ -1791,7 +1865,6 @@ pub const Table = struct {
     pub fn applyPrepared(self: *Table, p: *Prepared) !bool {
         self.checkThread();
         if (!p.live) return false;
-        const t0 = self.nowNs();
 
         // ① 快照校验：段集合必须与 prepare 时**逐个相同**
         if (p.snapshot_ids.len != self.segs.items.len) {
@@ -1832,7 +1905,6 @@ pub const Table = struct {
         self.recomputeSegLayout();
 
         self.last_apply_ops = ops;
-        self.ns_apply +|= self.nowNs() - t0;
         return true;
     }
 
@@ -4726,6 +4798,121 @@ test "归档自愈的步长探测：错步长必须被判为损坏，对步长�
         // ② 错步长：必须报损坏（不能「解出一些行」就当成功 —— 那正是会写出半段的场景）
         const other = if (stride == segmod.INDEX_STRIDE) segmod.LEGACY_INDEX_STRIDE else segmod.INDEX_STRIDE;
         try std.testing.expectError(error.SegmentCorrupt, countRowsStrict(alloc, blob.items, other));
+    }
+}
+
+test "delete 也必须按 flush_bytes 回落、并计入周期 fsync（原先只有 put 做了这两件事）" {
+    // 收编写路径时发现的**真缺陷**：`delete` 自己写了一遍提交骨架，漏了：
+    //   ① `pending` 计数 ⇒ 只有删除的负载永远不触发周期 `fsync`（持久化比文档承诺的弱）；
+    //   ② `flush_bytes` 判定 ⇒ 墓碑全堆在 memtable 里**无界增长**。
+    // 这条用例用「只删不写」的负载把两条都钉住；两条断言都是**确定性**的
+    // （段数 / 计数），不依赖计时。
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-delete-flush";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    // ① flush 回落：`flush_bytes = 1` ⇒ 每删一条都该落一个段
+    {
+        var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0, .flush_bytes = 1 });
+        defer t.deinit();
+        try t.put("k1", "v1");
+        const segs_before = t.segs.items.len;
+        try t.delete("k1");
+        try std.testing.expect(t.segs.items.len > segs_before); // 墓碑确实被落盘了
+        try std.testing.expectEqual(@as(usize, 0), t.mem.len());
+    }
+
+    // ② 周期 sync 计数：`wal_sync_every = 1` ⇒ 每次 delete 之后 `pending` 必须清零
+    {
+        const tmp2 = "test-delete-sync";
+        dir.deleteTree(io, tmp2) catch {};
+        defer dir.deleteTree(io, tmp2) catch {};
+        var t2 = try Table.open(io, dir, tmp2, alloc, .{ .wal_sync_every = 1, .flush_bytes = 1 << 30 });
+        defer t2.deinit();
+        try t2.put("a", "1");
+        try std.testing.expectEqual(@as(usize, 0), t2.pending);
+        try t2.delete("a");
+        try std.testing.expectEqual(@as(usize, 0), t2.pending); // delete 也参与了周期组提交
+    }
+}
+
+test "topKDesc 结构性快判：段里全是更小的 key 时，答案必须完全来自 memtable（且真的没走合并路径）" {
+    // 场景：顺序写入 + 中途 flush ⇒ 段里是最早那批（小 key），memtable 里是最新那批（大 key）。
+    // 这时 `ORDER BY pk DESC LIMIT k` 的答案**全在 memtable 里**，理想路径是「反向走 k 步」。
+    //
+    // 这条用例钉两件事：
+    //   ① 结果正确（含「memtable 不足 k 时必须回退全量路径」这一档）；
+    //   ② **真的走了快判**（`topk_mem_only` 计数）—— 只看返回值无法区分「走了快路径」
+    //      和「走了慢路径但碰巧算对」，而这条优化的全部价值就在于不碰段。
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-topkdesc-mem-above-segs";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    // `flush_bytes` 必须开大：设成 1 的话 `putBatch` 末尾会自动 flush，memtable 永远是空的，
+    // 就造不出「段里小 key + memtable 里大 key」这个场景（第一版用例就是这么假红的）。
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0, .flush_bytes = 1 << 30 });
+    defer t.deinit();
+
+    var kb: [200][16]u8 = undefined;
+    var vb: [200][16]u8 = undefined;
+    var keys: [200][]const u8 = undefined;
+    var vals: [200][]const u8 = undefined;
+    for (0..200) |i| {
+        keys[i] = std.fmt.bufPrint(&kb[i], "k{d:0>6}", .{i}) catch unreachable;
+        vals[i] = std.fmt.bufPrint(&vb[i], "v{d:0>6}", .{i}) catch unreachable;
+    }
+
+    // 前 190 行显式落段（key 都小）
+    try t.putBatch(keys[0..190], vals[0..190]);
+    try t.flush();
+    try std.testing.expect(t.segs.items.len >= 1);
+    // 后 10 行留在 memtable（key 都更大）
+    try t.putBatch(keys[190..200], vals[190..200]);
+    try std.testing.expect(t.mem.len() > 0);
+    try std.testing.expect(try t.memAboveAllSegs());
+
+    var out: std.ArrayList([]const u8) = .empty;
+    defer out.deinit(alloc);
+
+    // ① k=5 ⇒ 全部来自 memtable，且必须是最大的 5 个（199..195）
+    const before = t.topk_mem_only;
+    try std.testing.expect(try t.topKDesc(5, &out));
+    try std.testing.expectEqual(before + 1, t.topk_mem_only); // 真的走了快判
+    try std.testing.expectEqual(@as(usize, 5), out.items.len);
+    for (out.items, 0..) |got, i| {
+        try std.testing.expectEqualStrings(vals[199 - i], got);
+    }
+
+    // ② k=10 ⇒ 正好是 memtable 的全部 10 行
+    try std.testing.expect(try t.topKDesc(10, &out));
+    try std.testing.expectEqual(@as(usize, 10), out.items.len);
+    try std.testing.expectEqualStrings(vals[190], out.items[9]);
+
+    // ③ k=50 > memtable 行数 ⇒ 快判给不出答案，必须回退（返回 false 交给全量路径）
+    try std.testing.expect(!try t.topKDesc(50, &out));
+
+    // ④ 一旦有更大的 key 落进段里（打破「memtable 全大于段」），快判就必须失效
+    try t.flush();
+    try t.put(keys[0], vals[0]); // 写一个很小的 key 进 memtable
+    try std.testing.expect(!try t.memAboveAllSegs());
+    const before2 = t.topk_mem_only;
+    try std.testing.expect(try t.topKDesc(5, &out));
+    try std.testing.expectEqual(before2, t.topk_mem_only); // 没走快判
+    // 正确答案仍是 199..195
+    for (out.items, 0..) |got, i| {
+        try std.testing.expectEqualStrings(vals[199 - i], got);
     }
 }
 

@@ -84,6 +84,22 @@ pub const Skiplist = struct {
         return self.bytes;
     }
 
+    /// 最小 key（空表返回 null）。
+    ///
+    /// **用途**：`Table.topKDesc` 需要判断「memtable 里的 key 是否整体大于所有段」——
+    /// 顺序写入 + 定期 flush 时这是常态（段里是旧的小 key，memtable 里是新的大的 key），
+    /// 一旦成立，`ORDER BY pk DESC LIMIT k` 的答案**完全在 memtable 里**，
+    /// 可以直接反向走 k 步，不需要收候选、不需要排序、也不需要碰任何段。
+    pub fn minKey(self: *const Skiplist) ?[]const u8 {
+        if (self.count == 0) return null;
+        // 顺序追加时 `nodes` 数组就是 key 递增序 ⇒ 第一个就是最小
+        if (self.pure_append) return self.keyOf(&self.nodes.items[0]);
+        // 否则从 head 沿 0 层走一步（head 只存 next[]）
+        const first = self.head[0];
+        if (first == NIL) return null;
+        return self.keyOf(&self.nodes.items[first]);
+    }
+
     fn keyOf(self: *const Skiplist, n: *const Node) []const u8 {
         return self.arena.items[n.key_off..][0..n.key_len];
     }
