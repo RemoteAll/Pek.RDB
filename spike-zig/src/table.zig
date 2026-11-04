@@ -62,13 +62,23 @@ pub const Options = struct {
     /// 历史上这里写死过 `64 << 30`，结果 64 GiB ÷ 实测 1.56 B/行 ≈ **440 亿行/表** 就成了单表
     /// 容量天花板 —— 一个防呆常量不该决定产品容量（决策记录八十九）。
     index_max_bytes: u64 = 0,
-    /// 归档不超过该值时**整段预缺页**（populate），超过则不预缺页。
+    /// 归档不超过该值时**整段预缺页**（populate），超过则不预缺页；**`0` = 从不预取（默认）**。
     ///
-    /// 必须按大小限制：Zig 0.17 的 `MemoryMap.CreateOptions.populate` 默认 true，
+    /// 必须可按大小限制：Zig 0.17 的 `MemoryMap.CreateOptions.populate` 默认 true，
     /// 而 Windows 实现真的会对整段调 `NtSetInformationVirtualMemory(Prefetch)`
-    /// （见 `std/Io/Threaded.zig` 的 `createFileMap`）。3 MB 时预取是好事
-    /// （冷重开 0.6 ms 里有它一份），100 GB 时预取 = 打开时读 100 GB 索引。
-    index_prefault_max_bytes: u64 = 32 << 20,
+    /// （见 `std/Io/Threaded.zig` 的 `createFileMap`）—— 100 GB 索引开一次就读 100 GB。
+    ///
+    /// **默认从 32 MiB 改成 0，依据是实测而不是直觉**（决策记录一百三十，ABBA 探针
+    /// `pfrecover_ab`，2M 行 / 25 段 / 3.1 MB 归档，同进程 `A B B A` 八次采样）：
+    /// 预取让 `Table.open` 从 **0.46 ms 变成 0.84 ms（1.4–1.9× 更慢）**，
+    /// 而打开后 10 万次点查 **1.073M/s vs 1.055M/s（差 1.7%，噪声内）**、
+    /// 前 2 万次 539K vs 534K 也一致 —— **这笔预取没买回任何东西**。
+    /// 旧注释写的「3 MB 时预取是好事」是当时没有对照的推测，已被上述数据推翻。
+    ///
+    /// 未实测的边界（如实留在这里）：**真冷盘**上首次 open 时，25 段随机缺页
+    /// 可能不如一次顺序预取 —— 本机无法可靠打掉页缓存，所以不敢断言。
+    /// 需要那个行为时把这个值调大（例如 `32 << 20`）即可，它只是旋钮不是格式。
+    index_prefault_max_bytes: u64 = 0,
     /// 新段索引的 Bloom 位数/key（0 = 不生成）。
     /// Bloom 占索引体积 ~80%，只对「不存在的 key」有用；关闭后冷重开与索引 IO 同步变小。
     bloom_bits: u8 = 10,

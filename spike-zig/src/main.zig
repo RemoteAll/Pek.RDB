@@ -1551,6 +1551,56 @@ fn benchMain() !void {
             t8.deinit();
         }
 
+        // 归档预缺页 A/B（`index_prefault_max_bytes`）：A = 32 MiB（现行默认）B = 0（关闭）。
+        //
+        // 背景：`big_recover` 的分项实测里 `dirs` 占 0.55–0.60ms / 总 0.77–0.89ms，
+        // 而 `dirs` 段里只有一件重活 —— `mapWholeFile` 把 3.1MB 归档 mmap 进来。
+        // Zig 0.17 的 `MemoryMap.CreateOptions.populate` 默认 true，Windows 上会真的
+        // 调 `NtSetInformationVirtualMemory(Prefetch)` 把整段拉进工作集。
+        // 问题：这笔钱该不该在 open 时付？还是留给第一次读时的缺页？
+        //
+        // 顺序 **A B B A**（同一次运行内背靠背，抵消冷热漂移）：
+        // 每个组合都量「打开」和「打开后 2 万次点查」——只看打开时间会得出错误的结论，
+        // 关掉预缺页只是把成本搬到了读路径上。
+        {
+            const on: u64 = 32 << 20;
+            const order = [4]u64{ on, 0, 0, on };
+            // 与 `big_get_after_reopen` 同口径（10 万次）；另外单独打「前 2 万次」，
+            // 用来区分「头几次查询付缺页」与「稳态一致」——只看总数会看不出差别在哪。
+            const probe_get: u64 = get_n;
+            const probe_head: u64 = 20_000;
+            var oi: usize = 0;
+            while (oi < order.len) : (oi += 1) {
+                const t3 = nowNs(io);
+                var t9 = try tablemod.Table.open(io, dir, path6, alloc, .{
+                    .wal_sync_every = 0,
+                    .flush_bytes = 8 << 20,
+                    .index_prefault_max_bytes = order[oi],
+                });
+                const ns_open = nowNs(io) - t3;
+                // 打开后立刻点查：随机键，与 `big_get` 同一序列口径
+                const t4 = nowNs(io);
+                var xp: u64 = 88172645463325252;
+                var hits9: u64 = 0;
+                var ns_head: u64 = 0;
+                var gi: u64 = 0;
+                while (gi < probe_get) : (gi += 1) {
+                    xp ^= xp << 13;
+                    xp ^= xp >> 7;
+                    xp ^= xp << 17;
+                    const kb9 = keyOf(@intCast(xp % big_n));
+                    if (try t9.get(&kb9, &out) != null) hits9 += 1;
+                    if (gi + 1 == probe_head) ns_head = nowNs(io) - t4;
+                }
+                const ns_get = nowNs(io) - t4;
+                std.debug.print("pfrecover_ab,{d},{d:.3}\n", .{ oi, @as(f64, @floatFromInt(ns_open)) / 1e6 });
+                std.debug.print("pfrecover_ab_get,{d},{d:.0}\n", .{ oi, opsPerSec(probe_get, ns_get) });
+                std.debug.print("pfrecover_ab_get_head,{d},{d:.0}\n", .{ oi, opsPerSec(probe_head, ns_head) });
+                std.debug.print("pfrecover_ab_get_hits,{d},{d}\n", .{ oi, hits9 });
+                t9.deinit();
+            }
+        }
+
         // 诊断：索引「读取方式」对照 —— 堆读 vs mmap。
         //
         // 背景：`big_recover` 的分阶段实测显示 `idx_copy` = 1.01ms 占 57%
