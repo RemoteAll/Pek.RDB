@@ -99,8 +99,20 @@ const crc_tables8: [8][256]u32 = blk: {
 pub const CRC_FAST_TABLE_BYTES: usize = @sizeOf(@TypeOf(crc_tables8));
 
 /// slicing-by-8 CRC32（实测 3MB 从 6.5ms 降到 ~1ms 量级）。
-pub fn crc32Fast(bytes: []const u8) u32 {
-    var c: u32 = 0xFFFFFFFF;
+///
+/// 拆成 seed/update/final 三段是为了**增量算**：段写入是流式落盘的（`flushBuf` 一次几 MB），
+/// 只有增量接口才能「写多少算多少」，不必回头再读一遍文件。
+/// 三者拼起来与旧的一次性实现**逐位等价**（下面的用例守住这一点）。
+pub fn crc32FastSeed() u32 {
+    return 0xFFFFFFFF;
+}
+
+pub fn crc32FastFinal(c: u32) u32 {
+    return ~c;
+}
+
+pub fn crc32FastUpdate(c_in: u32, bytes: []const u8) u32 {
+    var c = c_in;
     var i: usize = 0;
     const n8 = bytes.len & ~@as(usize, 7);
     while (i < n8) : (i += 8) {
@@ -118,7 +130,11 @@ pub fn crc32Fast(bytes: []const u8) u32 {
     while (i < bytes.len) : (i += 1) {
         c = (c >> 8) ^ crc_tables8[0][@as(u8, @truncate(c)) ^ bytes[i]];
     }
-    return ~c;
+    return c;
+}
+
+pub fn crc32Fast(bytes: []const u8) u32 {
+    return crc32FastFinal(crc32FastUpdate(crc32FastSeed(), bytes));
 }
 
 // ---------- 小工具 ----------

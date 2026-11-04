@@ -6,6 +6,7 @@ const schema_mod = @import("schema.zig");
 const tablemod = @import("table.zig");
 const exec = @import("exec.zig");
 const catalog = @import("catalog.zig");
+const segmod = @import("segment.zig");
 
 pub const Options = struct {
     table: tablemod.Options = .{},
@@ -435,6 +436,35 @@ pub const Engine = struct {
             .opts = opts,
             .tables = tables,
         };
+    }
+
+    /// 显式校验全部段的数据完整性（重算整段 CRC32，与索引头里的值比对）。
+    ///
+    /// **只在显式调用时跑**：实测 `crc32Fast` 1.9–2.1 GB/s，一个 1.5 KB 块要 775 ns，
+    /// 而点查总共 1285 ns —— 把它放进读路径会让点查慢 60%。所以完整性校验做成
+    /// 「写入时增量算、读时零开销、校验按需调用」，返回实际校验过的段数。
+    ///
+    /// v5 旧段没有 `data_crc`，跳过（不计入返回值）—— 旧库不需要迁移，
+    /// `compact` 重写段时自然变成 v6。
+    pub fn verifyAll(self: *Engine) !usize {
+        var checked: usize = 0;
+        var it = self.tables.iterator();
+        while (it.next()) |e| {
+            for (e.value_ptr.table.segs.items) |seg| {
+                const want = seg.data_crc orelse continue;
+                const ok = try segmod.verifyDataFile(
+                    self.io,
+                    self.dir,
+                    e.value_ptr.table.base_path,
+                    seg.id,
+                    want,
+                    self.alloc,
+                );
+                if (!ok) return error.DataChecksumMismatch;
+                checked += 1;
+            }
+        }
+        return checked;
     }
 
     pub fn deinit(self: *Engine) void {

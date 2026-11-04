@@ -14,7 +14,18 @@ const FLUSH_BYTES: usize = 1 << 20;
 pub const KeyArena = codec.KeyArena;
 /// `PEKZIX05`：行格式改成「块内公共前缀压缩」（每 64 行一个块，块头 1 字节前缀长度），
 /// 索引头多了 `max_klen`。旧库不兼容，按项目约定（尚未正式使用）直接升版本、不做迁移。
-const IDX_MAGIC = "PEKZIX05";
+/// 索引格式版本。
+///
+/// v5 → v6：magic 之后多一个 `u32 data_crc`（整段 `.data` 的 CRC32，写入时增量算出）。
+/// 读侧**两个版本都接受**：v5 段没有校验和，`Segment.data_crc == null`，
+/// `verifyData()` 对这些段做不了校验（会跳过）—— 旧库不需要离线迁移，
+/// `compact` 重写段时自然变成 v6。
+///
+/// 为什么整段 CRC 而不是「每块读时验」：实测 `crc32Fast` 只有 1.9–2.1 GB/s，
+/// 一个 1.5 KB 的块要 775 ns，而点查总共 1285 ns —— 读时逐块验会让点查**慢 60%**。
+/// 整段 CRC 在写入时增量算（不额外读盘），读路径**零开销**，代价是校验要显式调用。
+const IDX_MAGIC_V5 = "PEKZIX05";
+const IDX_MAGIC = "PEKZIX06";
 
 /// 两串的最长公共前缀长度。
 fn commonPrefixLen(a: []const u8, b: []const u8) usize {
@@ -199,6 +210,9 @@ pub const Writer = struct {
     /// 引用版会在 `compact` 里直接触发升序断言。
     last_key: []const u8 = &.{},
     last_buf: std.ArrayList(u8) = .empty,
+    /// 整段 `.data` 的 CRC32 累加器（未取反的中间值；`crc32FastSeed()` 起步）。
+    /// 在 `flushBuf` 里**随写入增量累加**，收尾时取反写进索引头。
+    data_crc: u32 = codec.crc32FastSeed(),
     /// 本段内 key 长度上界（读侧靠它一次性预留重建缓冲，避免热路径分配）。
     max_klen: usize = 0,
     /// **块缓冲**：当前块最多 `INDEX_STRIDE` 条记录（key 先按完整长度写进来）。
@@ -392,6 +406,8 @@ pub const Writer = struct {
     fn flushBuf(self: *Writer) !void {
         if (self.buf.items.len == 0) return;
         const t = monoNs(self.io);
+        // 整段 CRC 就在落盘前增量累加：**不额外读盘**，也不影响读路径。
+        self.data_crc = codec.crc32FastUpdate(self.data_crc, self.buf.items);
         try self.file.writePositionalAll(self.io, self.buf.items, self.buf_base);
         self.ns_write += monoNs(self.io) - t;
         self.buf_base += self.buf.items.len;
@@ -412,6 +428,8 @@ pub const Writer = struct {
         var idx: std.ArrayList(u8) = .empty;
         errdefer idx.deinit(self.alloc);
         try idx.appendSlice(self.alloc, IDX_MAGIC);
+        // v6 新增：整段 `.data` 的 CRC32（增量算出来的，见 `flushBuf`）。
+        try codec.putU32le(&idx, self.alloc, codec.crc32FastFinal(self.data_crc));
         try codec.putU64le(&idx, self.alloc, @intCast(self.rows));
         try codec.putU64le(&idx, self.alloc, if (self.rows == 0) 0 else self.min_seq);
         try codec.putU64le(&idx, self.alloc, self.max_seq);
@@ -462,6 +480,40 @@ pub const Finished = struct {
     bytes: []u8,
     meta: Meta,
 };
+
+/// 校验一个段数据文件的完整性（重算整段 CRC32，与索引头里记录的值比对）。
+///
+/// **为什么不在读路径上验**：实测 `crc32Fast` 只有 1.9–2.1 GB/s，一个 1.5 KB 的块要
+/// 775 ns，而点查总共 1285 ns —— 读时逐块验会让点查慢 60%，直接毁掉点查基准。
+/// 所以选择「写入时增量算、读时零开销、校验显式调用」，并把代价写进决策记录。
+///
+/// `expected == null`（v5 旧段）时不做校验并返回 `null`，让调用方知道「这段没被验过」。
+pub fn verifyDataFile(
+    io: std.Io,
+    dir: std.Io.Dir,
+    base_path: []const u8,
+    id: u64,
+    expected: u32,
+    alloc: std.mem.Allocator,
+) !bool {
+    const path = try std.fmt.allocPrint(alloc, "{s}/seg/{d:0>6}.data", .{ base_path, id });
+    defer alloc.free(path);
+    const f = try dir.openFile(io, path, .{});
+    defer f.close(io);
+
+    const chunk = try alloc.alloc(u8, 256 * 1024);
+    defer alloc.free(chunk);
+
+    var crc = codec.crc32FastSeed();
+    var off: u64 = 0;
+    while (true) {
+        const n = try f.readPositionalAll(io, chunk, off);
+        if (n == 0) break;
+        crc = codec.crc32FastUpdate(crc, chunk[0..n]);
+        off += n;
+    }
+    return codec.crc32FastFinal(crc) == expected;
+}
 
 // ---------------- 索引聚合文件（seg/index.bin） ----------------
 // 冷重开的最大成本原本是「每段一次 open/stat/read/close」：25 段实测 3.66ms，
@@ -711,6 +763,9 @@ pub const Segment = struct {
     entries: std.ArrayList(Entry) = .empty,
     /// 稀疏索引总条数（来自段头部，**不需要解析全量 entries 就能知道**）。
     n_entries: u32 = 0,
+    /// 整段 `.data` 的 CRC32（仅在索引为 v6 时存在；v5 段为 `null`）。
+    /// 校验入口是 `verifyData()` —— **不在读路径上验**（实测会拖慢点查 60%）。
+    data_crc: ?u32 = null,
     /// 段内最大 key 在 `idx` 里的偏移/长度（0 长度 = 空段）。
     max_key_off: u32 = 0,
     max_key_len: u32 = 0,
@@ -856,9 +911,12 @@ pub const Segment = struct {
     /// - `parseIdxBody`：首次使用时才做（CRC 覆盖整段，必须全读）。
     fn parseIdxHeader(self: *Segment, idx_bytes: []const u8) !void {
         if (idx_bytes.len < 16) return error.BadIndexChecksum;
-        if (!std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC)) return error.BadIndexMagic;
+        const v6 = std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC);
+        if (!v6 and !std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC_V5)) return error.BadIndexMagic;
+        const base: usize = if (v6) 12 else 8;
+        if (v6) self.data_crc = std.mem.readInt(u32, idx_bytes[8..12], .little);
 
-        var r = codec.Reader{ .buf = idx_bytes[8..] };
+        var r = codec.Reader{ .buf = idx_bytes[base..] };
         self.rows = @intCast(try r.u64le());
         self.min_seq = try r.u64le();
         self.max_seq = try r.u64le();
@@ -892,7 +950,8 @@ pub const Segment = struct {
         if (idx_bytes.len < 16 or std.mem.readInt(u64, idx_bytes[idx_bytes.len - 8 ..][0..8], .little) != codec.hashIdx(idx_bytes[0 .. idx_bytes.len - 8])) {
             return error.BadIndexChecksum;
         }
-        if (!std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC)) return error.BadIndexMagic;
+        if (!std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC) and
+            !std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC_V5)) return error.BadIndexMagic;
 
         if (timing_enabled) {
             const t1 = tick(self.io);
@@ -901,7 +960,9 @@ pub const Segment = struct {
         }
 
         self.entries.clearRetainingCapacity();
-        var r = codec.Reader{ .buf = idx_bytes[8..] };
+        const v6 = std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC);
+        if (!v6 and !std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC_V5)) return error.BadIndexMagic;
+        var r = codec.Reader{ .buf = idx_bytes[if (v6) 12 else 8..] };
         _ = try r.u64le(); // rows（头部已读）
         _ = try r.u64le(); // min_seq
         _ = try r.u64le(); // max_seq

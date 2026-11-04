@@ -1527,6 +1527,9 @@ fn captureWalBytes(io: std.Io, dir: std.Io.Dir, root: []const u8, alloc: std.mem
 fn reopenAndRead(io: std.Io, dir: std.Io.Dir, root: []const u8, alloc: std.mem.Allocator) ![][]sql.Value {
     var eng = try engine.Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
     defer eng.deinit();
+    // 先做一次显式完整性校验：`.data` 位翻转只能靠整段 CRC 发现（`crc32Fast` 只有
+    // ~2 GB/s，放进读路径会让点查慢 60%，所以校验是**按需调用**的）。
+    _ = try eng.verifyAll();
     return fetchAll(&eng, alloc, "SELECT id, g, s FROM t ORDER BY id");
 }
 
@@ -1831,8 +1834,8 @@ test "段文件损坏/截断：必须显式报错或自愈到一行不少，不�
 
     // 防空跑：必须真的注入了多次，且不可能全部「自愈成功」（段损坏没有修复来源）
     try std.testing.expect(cases >= 6);
-    // 棘轮：已知缺口只允许 ≤ 2（两个位翻转点），修好格式后这个数必须变小、不能变大
-    try std.testing.expect(gaps <= 2);
+    // 棘轮：已知缺口只允许 ≤ 0（整段 CRC 已到位，位翻转必须被验出来）
+    try std.testing.expectEqual(@as(usize, 0), gaps);
     try std.testing.expect(tolerated <= 1);
     std.debug.print("[段注入] {d} 个注入点：显式报错 {d}、成功打开 {d}、容忍边界 {d}、已知缺口 {d}、不合格 {d}\n", .{
         cases, explicit_errors, self_healed, tolerated, gaps, fails,
