@@ -36,10 +36,12 @@ $pairs = @(
     @('put_batch', 'put_txn', $true),
     @('get', 'get', $true),
     @('scan', 'scan_v', $true),
-    @('count_10k', 'scan_big', $true),
-    # scan_refs COLLECTS the matching records (200k x 48B); the old pairing used scan_big, which only
-    # advances the cursor -- not the same criteria (that once produced a fake 0.70x). Now uses the
-    @('scan_refs', 'scan_big_collect', $true),
+    # 同规模对同规模：以前是「我们 1 万行」比「SQLite 20 万行」，固定开销全压在我们的分母上
+    # （且 1 万行样本仅 ~1 ms，本机抖动就能翻倍）。现在两侧都跑 20 万行，且都做「重复 N 次取中位」。
+    @('count_range', 'scan_big', $true),
+    # scan_refs_full 收集匹配记录的完整 48B 值（20 万 x 48B），对应 SQLite scan_big_collect；
+    # 旧的 scan_refs 只取 1 万行且不带值，与 scan_big 口径不同（历史上曾因此得出假 0.70x）。
+    @('scan_refs_full', 'scan_big_collect', $true),
     # sql_put is our SQL-layer per-row INSERT (one insertRows call per row, no transaction wrapper),
     # so it must pair with SQLite put (per-row autocommit), NOT put_txn (single-transaction batch).
     # The old map paired it with put_txn, crushing 48.4x into 1.85x and suggesting the gap came from

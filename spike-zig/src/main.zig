@@ -15,6 +15,18 @@ fn nowNs(io: std.Io) u64 {
     return @intCast(ts.nanoseconds);
 }
 
+/// 同一份工作重复 N 次的样本取**中位**。
+///
+/// **为什么必须这么做**：扫描类档位单次只有 1–50 ms，本机（Windows + Defender）的抖动
+/// 足以让同一二进制的同一档在进程之间相差 2×（实测 `scan` 9.08–11.69M/s、
+/// `scan_refs` 8.64–11.25M/s）。单次采样下「比值是否 > 1.0」就是掷骰子 ——
+/// ABBA 会把噪声报成 UNRESOLVED，读的人只能猜。
+/// 重复的是**同一份查询、同一份工作**，不改口径；取中位是为了抗单次抖动（均值会被离群拉偏）。
+fn medianNs(samples: []u64) u64 {
+    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+    return samples[samples.len / 2];
+}
+
 /// 解析 + 执行一条 SQL（基准里建表/灌数用；结果若是 `rows` 立刻释放）。
 fn runSql(eng: *spike.engine.Engine, alloc: std.mem.Allocator, text: []const u8) !void {
     var p = try spike.sql.parse(alloc, text);
@@ -302,11 +314,19 @@ fn benchMain() !void {
     {
         const lo = keyOf(scan_lo);
         const hi = keyOf(scan_hi);
-        const t0 = nowNs(io);
-        var set = try t.scanRange(&lo, &hi);
-        const ns = nowNs(io) - t0;
-        defer set.deinit();
-        std.debug.print("scan,{d},{d:.0}\n", .{ set.records.len, opsPerSec(@intCast(set.records.len), ns) });
+        // **重复 9 次取中位**：单次 ~1 ms，本机（Windows + Defender）的抖动足以让
+        // 同一二进制的同一档在进程之间相差 2×（实测 scan 9.08–11.69M/s），
+        // 于是「比值是否 >1.0」变成掷骰子。重复不改口径，只让结论可复现。
+        var samples: [9]u64 = undefined;
+        var n_recs: usize = 0;
+        for (&samples) |*sm| {
+            const t0 = nowNs(io);
+            var set = try t.scanRange(&lo, &hi);
+            sm.* = nowNs(io) - t0;
+            n_recs = set.records.len;
+            set.deinit();
+        }
+        std.debug.print("scan,{d},{d:.0}\n", .{ n_recs, opsPerSec(@intCast(n_recs), medianNs(&samples)) });
     }
 
     // 同口径对照（1 万行区间「只数行」）：对应 SQLite 的 `SELECT id ... while rows.next()`。
@@ -345,10 +365,14 @@ fn benchMain() !void {
         defer refs.deinit(alloc);
         const lo0 = keyOf(0);
         const hi0 = keyOf(200_000);
-        const t0 = nowNs(io);
-        try t.scanRefs(&lo0, &hi0, &refs);
-        const ns = nowNs(io) - t0;
-        std.debug.print("scan_refs_full,{d},{d:.0}\n", .{ refs.items.len, opsPerSec(@intCast(refs.items.len), ns) });
+        var samples: [7]u64 = undefined;
+        for (&samples) |*sm| {
+            refs.clearRetainingCapacity();
+            const t0 = nowNs(io);
+            try t.scanRefs(&lo0, &hi0, &refs);
+            sm.* = nowNs(io) - t0;
+        }
+        std.debug.print("scan_refs_full,{d},{d:.0}\n", .{ refs.items.len, opsPerSec(@intCast(refs.items.len), medianNs(&samples)) });
     }
     {
         const lo0 = keyOf(0);
@@ -369,14 +393,18 @@ fn benchMain() !void {
     {
         const lo0 = keyOf(0);
         const hi0 = keyOf(200_000);
-        var it = tablemod.MergeIter{};
-        try it.init(&t, &lo0, &hi0);
-        defer it.deinit();
-        const t0 = nowNs(io);
+        var samples: [7]u64 = undefined;
         var cnt: u64 = 0;
-        while (it.next()) |_| cnt += 1;
-        const ns = nowNs(io) - t0;
-        std.debug.print("count_range,{d},{d:.0}\n", .{ cnt, opsPerSec(cnt, ns) });
+        for (&samples) |*sm| {
+            var it = tablemod.MergeIter{};
+            try it.init(&t, &lo0, &hi0);
+            defer it.deinit();
+            const t0 = nowNs(io);
+            cnt = 0;
+            while (it.next()) |_| cnt += 1;
+            sm.* = nowNs(io) - t0;
+        }
+        std.debug.print("count_range,{d},{d:.0}\n", .{ cnt, opsPerSec(cnt, medianNs(&samples)) });
     }
 
     // 多段合并扫描（默认 64MB memtable 会中途自动 flush → 多段）
@@ -898,8 +926,6 @@ fn benchMain() !void {
             // 范围条件、多列、非等值仍全扫；这里量的就是「等值点查」这一档。
             // 两侧**同一条索引、同一串查询、同一份 digest**。
             {
-                const idx_path = try alloc.print("{s}/idx/idx_g", .{path5});
-                defer alloc.free(idx_path);
                 _ = try s5.addIndex(alloc, "idx_g", &[_]usize{1}); // 列 1 = g
 
                 var idx_tables = std.StringHashMap(tablemod.Table).init(alloc);
@@ -908,21 +934,41 @@ fn benchMain() !void {
                     while (mi.next()) |kv| kv.value_ptr.deinit();
                     idx_tables.deinit();
                 }
-                try idx_tables.put("idx_g", try tablemod.Table.open(io, dir, idx_path, alloc, .{ .wal_sync_every = 0 }));
-                const ip = idx_tables.getPtr("idx_g").?;
 
-                // 建索引耗时（一次性指标，与 big_recover 同类）
-                {
+                // 建索引耗时：一次性、毫秒级，单次采样会被本机抖动主导 ——
+                // `abba perf-b13` 里出现过一次 709ms 的离群样本（其余 240–257ms），
+                // 把中位 1.33× 直接压成 0.698×。与扫描类指标同口径：**重复 5 次取中位**。
+                // 每次都在**全新空表**上建（建索引要求目标表为空），最后一次建成的表留给下面的等值点查。
+                const build_k = 5;
+                var build_paths: [build_k][]const u8 = undefined;
+                var build_ms: [build_k]u64 = undefined;
+                defer {
+                    for (build_paths) |bp| alloc.free(bp);
+                }
+                var bk: usize = 0;
+                while (bk < build_k) : (bk += 1) {
+                    const p = try alloc.print("{s}/idx/idx_g{d}", .{ path5, bk });
+                    build_paths[bk] = p;
+                    var it_tbl = try tablemod.Table.open(io, dir, p, alloc, .{ .wal_sync_every = 0 });
                     const t0 = nowNs(io);
                     var ph = spike.engine.FillPhases{};
-                    try spike.engine.fillIndexTimed(alloc, ip, &s5, &t5, s5.findIndex("idx_g").?, &ph);
-                    const ns = nowNs(io) - t0;
-                    std.debug.print("sql_index_build,{d},{d}\n", .{ n, ns / 1_000_000 });
-                    // 三阶段拆分：官方指标仍是 `sql_index_build`，这几行只用来定位「慢在哪一步」
-                    std.debug.print("sql_index_build_scan_ms,{d},{d}\n", .{ ph.rows, ph.scan_ns / 1_000_000 });
-                    std.debug.print("sql_index_build_sort_ms,{d},{d}\n", .{ ph.rows, ph.sort_ns / 1_000_000 });
-                    std.debug.print("sql_index_build_write_ms,{d},{d}\n", .{ ph.rows, ph.write_ns / 1_000_000 });
+                    try spike.engine.fillIndexTimed(alloc, &it_tbl, &s5, &t5, s5.findIndex("idx_g").?, &ph);
+                    build_ms[bk] = (nowNs(io) - t0) / 1_000_000;
+                    if (bk == 0) {
+                        // 三阶段拆分：官方指标仍是 `sql_index_build`，这几行只用来定位「慢在哪一步」
+                        std.debug.print("sql_index_build_scan_ms,{d},{d}\n", .{ ph.rows, ph.scan_ns / 1_000_000 });
+                        std.debug.print("sql_index_build_sort_ms,{d},{d}\n", .{ ph.rows, ph.sort_ns / 1_000_000 });
+                        std.debug.print("sql_index_build_write_ms,{d},{d}\n", .{ ph.rows, ph.write_ns / 1_000_000 });
+                    }
+                    if (bk + 1 == build_k) {
+                        try idx_tables.put("idx_g", it_tbl);
+                    } else {
+                        it_tbl.deinit();
+                    }
                 }
+                std.debug.print("sql_index_build,{d},{d}\n", .{ n, medianNs(&build_ms) });
+                const ip = idx_tables.getPtr("idx_g").?;
+                const idx_path = build_paths[build_k - 1];
                 // 索引落盘占用：证明「查得快」不是因为「建得小」
                 {
                     var total: u64 = 0;

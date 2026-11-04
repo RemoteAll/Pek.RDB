@@ -22,6 +22,15 @@ fn sqlite_paths() -> (&'static str, &'static str, &'static str) {
     ("bench-sqlite.db", "bench-sqlite.db-wal", "bench-sqlite.db-shm")
 }
 
+/// 同一份工作重复 N 次的样本取中位（与 Zig 旁 `medianNs` 对称）。
+///
+/// 为什么必须这么做：扫描类档位单次只有 1–50 ms，本机抖动能让它相差 2×，
+/// 单次采样下「比值是否 > 1.0」就是掷骰子。重复的是同一份查询、同一份工作，不改口径。
+fn median_secs(mut v: Vec<f64>) -> f64 {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[v.len() / 2]
+}
+
 fn cleanup() {
     let (db, wal, shm) = sqlite_paths();
     for p in [db, wal, shm] {
@@ -110,26 +119,36 @@ fn main() -> rusqlite::Result<()> {
     println!("scan,{},{}", count, count as f64 / secs);
 
     // 鑼冨洿鎵弿锛堝甫鍊硷紝涓?Zig 渚у悓鍙ｅ緞锛?
-    let t0 = Instant::now();
-    let mut bytes: i64 = 0;
-    {
-        let mut stmt = conn.prepare("SELECT id, v FROM t WHERE id >= ?1 AND id < ?2")?;
-        let mut rows = stmt.query(params![SCAN_LO, SCAN_HI])?;
-        while let Some(row) = rows.next()? {
-            let _id: i64 = row.get(0)?;
-            let v: Vec<u8> = row.get(1)?;
-            bytes += v.len() as i64;
+    // 重复 9 次取中位（见 median_secs 的注释）。
+    let mut scan_v_samples: Vec<f64> = Vec::with_capacity(9);
+    let mut scan_v_bytes: i64 = 0;
+    for _ in 0..9 {
+        let t0 = Instant::now();
+        let mut bytes: i64 = 0;
+        {
+            let mut stmt = conn.prepare("SELECT id, v FROM t WHERE id >= ?1 AND id < ?2")?;
+            let mut rows = stmt.query(params![SCAN_LO, SCAN_HI])?;
+            while let Some(row) = rows.next()? {
+                let _id: i64 = row.get(0)?;
+                let v: Vec<u8> = row.get(1)?;
+                bytes += v.len() as i64;
+            }
         }
+        scan_v_bytes = bytes;
+        scan_v_samples.push(t0.elapsed().as_secs_f64());
     }
-    let secs = t0.elapsed().as_secs_f64();
-    println!("scan_v,{},{}", bytes / 32, (bytes as f64 / 32.0) / secs);
+    let secs = median_secs(scan_v_samples);
+    println!("scan_v,{},{}", scan_v_bytes / 32, (scan_v_bytes as f64 / 32.0) / secs);
 
     // 澶ф牱鏈寖鍥存壂鎻忥紙20 涓囪锛屽尯闂?0..200000锛屼笌 Zig 渚?scan_full / scan_refs_full 鍚屽彛寰勶級銆?
     // 涓婇潰閭ｄ袱妗ｅ彧鎵?1 涓囪锛岀粷瀵硅€楁椂 <1碌s锛屾祴鐨勬槸鍥哄畾寮€閿€涓庤鏃剁矑搴?鈥斺€?
     // 鐢ㄥ畠姣斻€屾壂鎻忚兘鍔涖€嶄細璁╀袱杈瑰尯闂撮噸鍙犮€佹案杩滃緱涓嶅嚭缁撹銆?
-    {
+    // 20 万行区间「只数行」：重复 7 次取中位，与 Zig 侧 count_range 同口径（都是 20 万行）。
+    let mut scan_big_samples: Vec<f64> = Vec::with_capacity(7);
+    let mut n: usize = 0;
+    for _ in 0..7 {
         let t0 = Instant::now();
-        let mut n: usize = 0;
+        n = 0;
         {
             let mut stmt = conn.prepare("SELECT id FROM t WHERE id >= ?1 AND id < ?2")?;
             let mut rows = stmt.query(params![0i64, 200_000i64])?;
@@ -137,9 +156,10 @@ fn main() -> rusqlite::Result<()> {
                 n += 1;
             }
         }
-        let secs = t0.elapsed().as_secs_f64();
-        println!("scan_big,{},{}", n, n as f64 / secs);
+        scan_big_samples.push(t0.elapsed().as_secs_f64());
     }
+    let secs = median_secs(scan_big_samples);
+    println!("scan_big,{},{}", n, n as f64 / secs);
     {
         let t0 = Instant::now();
         let mut bytes: i64 = 0;
@@ -162,7 +182,9 @@ fn main() -> rusqlite::Result<()> {
     // 鑰?`scan_big` 鍙帹杩涙父鏍囥€佷竴鏉￠兘涓嶆敹 鈥斺€?鎷胯繖涓や釜姣斿緱鍑恒€屾垜浠?0.70脳銆嶆槸**鍙ｅ緞涓嶅绛?*鐨勪骇鐗┿€?
     // 杩欓噷琛ヤ笂銆孲QLite 涔熸敹闆嗐€嶇殑鐗堟湰锛氱敤 `get_ref` 鍙栧紩鐢紙**涓嶅鍒?payload**锛夛紝
     // 涓?`RefRecord{key 鎸囬拡,len, seq, flags, value 鎸囬拡,len}` 鍋氱殑宸ヤ綔绛変环銆?
-    {
+    let mut collect_samples: Vec<f64> = Vec::with_capacity(7);
+    let mut collect_n: usize = 0;
+    for _ in 0..7 {
         let t0 = Instant::now();
         let mut out: Vec<(i64, i64)> = Vec::with_capacity(200_000);
         {
@@ -174,9 +196,11 @@ fn main() -> rusqlite::Result<()> {
                 out.push((id, vlen));
             }
         }
-        let secs = t0.elapsed().as_secs_f64();
-        println!("scan_big_collect,{},{}", out.len(), out.len() as f64 / secs);
+        collect_n = out.len();
+        collect_samples.push(t0.elapsed().as_secs_f64());
     }
+    let secs = median_secs(collect_samples);
+    println!("scan_big_collect,{},{}", collect_n, collect_n as f64 / secs);
 
     drop(conn);
 
@@ -331,16 +355,21 @@ fn main() -> rusqlite::Result<()> {
         // 绾亶鍘嗚鏁帮紙涓嶅彇鍊硷級銆備笌涓婇潰 big_scan 鐨勫樊鍒彧鏄牱鏈粠 1 涓囪鏀惧ぇ鍒?50 涓囪 鈥斺€?
         // 1 涓囪鐨勭粷瀵硅€楁椂 <1碌s锛屾祴鐨勬槸鍥哄畾寮€閿€鑰岄潪鎵弿鑳藉姏銆?
         {
-            let t0 = Instant::now();
+            let mut samples: Vec<f64> = Vec::with_capacity(5);
             let mut n: usize = 0;
-            {
-                let mut stmt = c.prepare("SELECT id FROM t WHERE id >= 0 AND id < 500000")?;
-                let mut rows = stmt.query([])?;
-                while rows.next()?.is_some() {
-                    n += 1;
+            for _ in 0..5 {
+                let t0 = Instant::now();
+                n = 0;
+                {
+                    let mut stmt = c.prepare("SELECT id FROM t WHERE id >= 0 AND id < 500000")?;
+                    let mut rows = stmt.query([])?;
+                    while rows.next()?.is_some() {
+                        n += 1;
+                    }
                 }
+                samples.push(t0.elapsed().as_secs_f64());
             }
-            let secs = t0.elapsed().as_secs_f64();
+            let secs = median_secs(samples);
             println!("big_count,{},{}", n, n as f64 / secs);
         }
 
@@ -348,16 +377,21 @@ fn main() -> rusqlite::Result<()> {
         // big_scan 鍙壂 1 涓囪銆佺粷瀵硅€楁椂 <1碌s锛沚ig_count 鎵?50 涓囪浣嗚捣鐐?0 鈥斺€?
         // 杩欎竴妗ｅ浐瀹?20 涓囪鍖洪棿锛屼笌鍐呭瓨鍐呴偅妗ｅ悓鏍锋湰閲忥紝渚夸簬妯瘮銆屽唴瀛樺唴 vs 瓒呭唴瀛樸€嶈“鍑忓箙搴︺€?
         {
-            let t0 = Instant::now();
+            let mut samples: Vec<f64> = Vec::with_capacity(5);
             let mut n: usize = 0;
-            {
-                let mut stmt = c.prepare("SELECT id FROM t WHERE id >= 0 AND id < 200000")?;
-                let mut rows = stmt.query([])?;
-                while rows.next()?.is_some() {
-                    n += 1;
+            for _ in 0..5 {
+                let t0 = Instant::now();
+                n = 0;
+                {
+                    let mut stmt = c.prepare("SELECT id FROM t WHERE id >= 0 AND id < 200000")?;
+                    let mut rows = stmt.query([])?;
+                    while rows.next()?.is_some() {
+                        n += 1;
+                    }
                 }
+                samples.push(t0.elapsed().as_secs_f64());
             }
-            let secs = t0.elapsed().as_secs_f64();
+            let secs = median_secs(samples);
             println!("big_count_range,{},{}", n, n as f64 / secs);
         }
 
@@ -700,9 +734,24 @@ fn main() -> rusqlite::Result<()> {
             // 杈圭晫涓?Zig 渚т竴鑷达細鍙鐩栧崟鍒楃瓑鍊兼煡璇€?
             {
                 let before = std::fs::metadata(agg_db).map(|m| m.len()).unwrap_or(0);
+                // 建索引耗时：一次性、毫秒级，单次采样会被本机抖动主导。与 Zig 侧同口径：
+                // 重复 5 次（DROP + CREATE 重建，DROP 在计时之外）、取中位。
+                // `before` / `after` 夹住整段重建，所以 `sql_index_disk_bytes` 仍是「一份索引占多少」。
+                let mut build_samples: Vec<f64> = Vec::with_capacity(5);
                 let t0 = Instant::now();
                 ca.execute_batch("CREATE INDEX idx_g ON agg(g)")?;
-                println!("sql_index_build,{},{}", N, t0.elapsed().as_millis());
+                build_samples.push(t0.elapsed().as_secs_f64());
+                for _ in 0..4 {
+                    ca.execute_batch("DROP INDEX idx_g")?;
+                    let t1 = Instant::now();
+                    ca.execute_batch("CREATE INDEX idx_g ON agg(g)")?;
+                    build_samples.push(t1.elapsed().as_secs_f64());
+                }
+                println!(
+                    "sql_index_build,{},{}",
+                    N,
+                    (median_secs(build_samples) * 1000.0).round() as u64
+                );
                 ca.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
                 let after = std::fs::metadata(agg_db).map(|m| m.len()).unwrap_or(0);
                 println!("sql_index_disk_bytes,{},{}", N, after.saturating_sub(before));
