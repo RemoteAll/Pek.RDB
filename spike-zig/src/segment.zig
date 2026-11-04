@@ -22,6 +22,8 @@ inline fn monoNs(io: std.Io) u64 {
 ///
 /// 代价：索引项数量与步长成反比（每条索引项约 16 B），100k 行 64→16 约 25 KB → 100 KB。
 pub const INDEX_STRIDE: usize = 16;
+/// v5 / v6 段的块步长（当时的常量值）。**只用于读旧段**，写路径永远用 `INDEX_STRIDE`。
+pub const LEGACY_INDEX_STRIDE: usize = 64;
 const FLUSH_BYTES: usize = 1 << 20;
 /// `scanRefs` 这类「先收集再交还」的 API 用来落稳定 key 的分块 arena（实现在 codec 里，与段格式无关）。
 pub const KeyArena = codec.KeyArena;
@@ -823,6 +825,16 @@ pub const Segment = struct {
     max_key_len: u32 = 0,
     /// 段内 key 长度上界（写索引时记录的），用于一次性预留行重建缓冲。
     max_klen: u32 = 0,
+    /// **本段数据文件的块步长** —— 必须按**文件自己的版本**来，不能用编译期常量。
+    ///
+    /// 为什么这个字段必须有（2026-11-04 审计发现）：`codec.RecIter` 靠「块头 1 字节 pfx +
+    /// 每 `stride` 条记录一个块」来定位块边界（`blk_left = stride` 递减），
+    /// 所以**步长是数据分帧的一部分**，不是可选旋钮。
+    /// 把 `INDEX_STRIDE` 从 64 改成 16 之后，如果读 v5/v6 段时还用编译期常量，
+    /// 就会把第 17 条记录当成块头去读 pfx 字节 —— **静默乱读**（不是报错）。
+    /// 现在改成「按 magic 推导」：v5/v6 = 64（那时的常量值）、v7 = `INDEX_STRIDE`。
+    /// 反过来，这也意味着**以后再改步长就必须再升一次版本号**，否则旧文件会被错解析。
+    stride: usize = INDEX_STRIDE,
     /// 复用的行迭代器（`get` / `scanRefs` / `scanRange` 专用）。
     /// **游标不共用它**：`RefCursor` 自带一份，否则多段归并时会被互相覆盖。
     it: ?codec.RecIter = null,
@@ -974,6 +986,9 @@ pub const Segment = struct {
         if (!v6 and !std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC_V5)) return error.BadIndexMagic;
         const base: usize = if (v6) 12 else 8;
         if (v6) self.data_crc = std.mem.readInt(u32, idx_bytes[8..12], .little);
+        // 块步长跟着版本走（见 `stride` 字段的注释）：v5/v6 的块是 64 条。
+        self.stride = if (std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC_V5) or
+            std.mem.eql(u8, idx_bytes[0..8], IDX_MAGIC_V6)) LEGACY_INDEX_STRIDE else INDEX_STRIDE;
 
         var r = codec.Reader{ .buf = idx_bytes[base..] };
         self.rows = @intCast(try r.u64le());
@@ -1135,9 +1150,10 @@ pub const Segment = struct {
     /// `get` / `scanRefs` / `scanRange` 都是「一次调用从头扫一遍」，不会嵌套，所以可以共用。
     fn iter(self: *Segment) !*codec.RecIter {
         const view = try self.dataView();
-        if (self.it == null) self.it = try codec.RecIter.init(self.alloc, view, INDEX_STRIDE, self.max_klen);
+        if (self.it == null) self.it = try codec.RecIter.init(self.alloc, view, self.stride, self.max_klen);
         const it = &self.it.?;
         it.buf = view;
+        it.stride = self.stride; // 复用同一份游标时步长不能丢：`Writer` 换了步长、段不会换
         it.sink = null; // 只有 `scanRefs` 需要稳定切片，其余入口保持双缓冲
         return it;
     }
@@ -1322,7 +1338,7 @@ pub const Segment = struct {
     pub fn cursor(self: *Segment, start: []const u8, end: []const u8, snapshot: u64) !RefCursor {
         try self.ensureParsed();
         const view = try self.dataView();
-        var it = try codec.RecIter.init(self.alloc, view, INDEX_STRIDE, self.max_klen);
+        var it = try codec.RecIter.init(self.alloc, view, self.stride, self.max_klen);
         if (self.entries.items.len > 0) {
             const ei = self.candidateIndex(start);
             const off: u64 = self.entries.items[ei].offset;
@@ -1970,6 +1986,8 @@ test "索引格式 v6 带整段 CRC，且 v5 旧格式仍可读（data_crc 为�
     try s6.parseIdxHeader(fin.bytes);
     try std.testing.expect(s6.data_crc != null);
     try std.testing.expectEqual(@as(u64, 2), s6.rows);
+    // 当前 `Writer` 写出的就是 v7（块 = `INDEX_STRIDE`）。这条断言顺带钉住「升版本忘了改 stride 映射」：
+    try std.testing.expectEqual(INDEX_STRIDE, s6.stride);
 
     // ② 手工降级成 v5：magic 换 05、去掉 4 字节 crc、重算尾部 hash
     const body = fin.bytes[12 .. fin.bytes.len - 8];
@@ -1984,7 +2002,48 @@ test "索引格式 v6 带整段 CRC，且 v5 旧格式仍可读（data_crc 为�
     try s5.parseIdxHeader(v5);
     try std.testing.expect(s5.data_crc == null); // 旧段不参与 CRC 校验
     try std.testing.expectEqual(@as(u64, 2), s5.rows);
+    try std.testing.expectEqual(LEGACY_INDEX_STRIDE, s5.stride);
     // 旧格式还必须能**全量解析**（头部对了但 body 解析错，一样是打不开库）
     try s5.parseIdxBody(v5);
     try std.testing.expect(s5.n_entries > 0);
+}
+
+test "当前格式(v7)的段必须按 INDEX_STRIDE 解析（步长跟着版本走，不是常量）" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+    const tmp = "test-idx-stride-v7";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+    try dir.createDirPath(io, tmp);
+
+    // 造一个**行数远多于两块**的段（否则步长错了也看不出差别）
+    const N = INDEX_STRIDE * 5 + 3;
+    var sb: [N][16]u8 = undefined;
+    var keys: [N][]const u8 = undefined;
+    for (0..N) |i| keys[i] = std.fmt.bufPrint(&sb[i], "k{d:0>6}-{d}", .{ i, i }) catch unreachable;
+
+    {
+        var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc, 10, N);
+        defer w.deinit();
+        for (keys, 0..) |k, i| try w.push(k, i + 1, 0, "v");
+        _ = try w.finish(dir, tmp ++ "/000001.idx");
+    }
+
+    var seg = try Segment.open(io, dir, tmp ++ "/000001.data", tmp ++ "/000001.idx", alloc, false);
+    defer seg.close();
+    try std.testing.expectEqual(INDEX_STRIDE, seg.stride);
+
+    // 行为证明：游标按段自己的步长走，**每一条 key 都要能原样读回**
+    // （步长比真实块小会把记录尾部当块头，比真实块大会把 suffix 当完整 key —— 两种都会错）
+    var c = try seg.cursor("", &.{}, std.math.maxInt(u64));
+    defer c.deinit();
+    var n: usize = 0;
+    while (c.next()) |rec| : (n += 1) {
+        if (n >= N) return error.TooManyRows;
+        try std.testing.expectEqualStrings(keys[n], rec.key);
+    }
+    try std.testing.expectEqual(@as(usize, N), n);
 }

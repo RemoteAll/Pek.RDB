@@ -303,6 +303,18 @@ fn expectIterEnd(rit: *const codec.RecIter, bytes: []const u8) !void {
     if (rit.pos < bytes.len) return error.SegmentCorrupt;
 }
 
+/// 用给定块步长「严格」解一遗整份数据，返回行数；有任何解不出的字节就报 `SegmentCorrupt`。
+/// 供 `rebuildArchive` 探测步长用（只有 `.data` 时步长无法从索引得知）。
+fn countRowsStrict(alloc: std.mem.Allocator, bytes: []const u8, stride: usize) !usize {
+    var rit = try codec.RecIter.init(alloc, bytes, stride, 0);
+    defer rit.deinit(alloc);
+    var n: usize = 0;
+    while (rit.next(alloc)) |_| n += 1;
+    if (rit.corrupt) return error.SegmentCorrupt;
+    try expectIterEnd(&rit, bytes);
+    return n;
+}
+
 /// 归档（`seg/index.bin`）丢失但 `seg/*.data` 还在 ⇒ 从数据文件重建归档。
 ///
 /// **为什么允许重建**：`.data` 是自描述的（块头带前缀长度、每条带 klen/vlen/seq/flags），
@@ -391,19 +403,27 @@ fn rebuildArchive(
         // **第一遍只数行数**：Bloom 位图大小必须按**真实行数**定 ——
         // 位图大小写进索引头且不可变，估大会让自愈后的索引**永久膨胀**
         // （按 `size/16` 估实测约为真实行数的 2.5 倍，而 Bloom 占索引体积 80%）。
+        //
+        // **步长必须探测**：这一路径只有 `.data`、拿不到索引，而块边界是「每 `stride` 条一个块头」，
+        // 步长错了就会把记录字节当块头读 ⇒ 必须先用当前步长严格解析到文件末尾，
+        // 不成功再试旧步长（v5/v6 段是 64）。两条都失败才报损坏。
+        // 为什么「严格解析成功」足以判定：块头只有 1 字节 pfx，错的步长下几乎不可能
+        // 逐条解出合法记录并**恰好**走完文件（`expectIterEnd` 要求 pos 落到 `bytes.len`）。
+        var seg_stride: usize = segmod.INDEX_STRIDE;
         var n_rows: usize = 0;
-        {
-            var rit = try codec.RecIter.init(alloc, bytes, segmod.INDEX_STRIDE, 0);
-            defer rit.deinit(alloc);
-            while (rit.next(alloc)) |_| n_rows += 1;
-            try expectIterEnd(&rit, bytes);
+        if (countRowsStrict(alloc, bytes, seg_stride)) |n| {
+            n_rows = n;
+        } else |e| {
+            if (e != error.SegmentCorrupt) return e;
+            seg_stride = segmod.LEGACY_INDEX_STRIDE;
+            n_rows = try countRowsStrict(alloc, bytes, seg_stride);
         }
 
         // **第二遍真正写出**（同一份 mmap，不重新建映射）。
         var w = try segmod.Writer.create(io, dir, seg_tmp, alloc, bloom_bits, n_rows);
         defer w.deinit();
         {
-            var rit = try codec.RecIter.init(alloc, bytes, segmod.INDEX_STRIDE, 0);
+            var rit = try codec.RecIter.init(alloc, bytes, seg_stride, 0);
             defer rit.deinit(alloc);
             var written: usize = 0;
             while (rit.next(alloc)) |rec| {
@@ -646,6 +666,10 @@ pub const Table = struct {
     last_apply_ops: usize = 0,
     /// 最近一次 apply 的半途状态：`null` = 最近一次没被丢弃；否则是丢弃原因。
     last_apply_discard: ?[]const u8 = null,
+    /// `topKDesc` 的 key 区上界算漏、被迫退回全量路径的次数。
+    /// **确定性指标**：正常必须恒为 0；不为 0 说明「窗口行数上界」的推算与实际不符
+    /// （这类偏差最容易演成「keybuf 扩容 ⇒ 已记录的 key 切片悬垂」的 UAF）。
+    topk_arena_short: u64 = 0,
     /// 扫描/归并**实际产出**的行数（累计）。
     /// 确定性指标：用来证明「LIMIT 提前终止」真的没白读，而不是靠计时猜。
     scan_rows_read: u64 = 0,
@@ -1135,11 +1159,23 @@ pub const Table = struct {
         //
         // 段候选的 key 必须拷贝（游标双缓冲），所以 key 区**按上界一次分配到位** ——
         // 否则中途扩容搬移会让已记录的 key 切片全部悬垂。
+        //
+        // **上界是「窗口 + 2 整块」不是「窗口 + 1 块」**（2026-11-04 审计发现）：
+        // `tailStartKey` 要的块数是 `want/stride + 2`，而**最后一块常常不满**，
+        // 所以窗口里的行数上界是 `want + 2*stride`（不是 `want + stride`）。
+        // 原来写 `window + INDEX_STRIDE + 1`，在我把块余量从 `+1` 改成 `+2` 之后就**不够了**，
+        // 而 `kbuf` 一旦扩容就会把已记入 `cand` 的 key 切片全部变成悬垂指针
+        // （读到的可能是搬移后的新内存、也可能是垃圾）—— 这是**真 UAF**，不是浪费内存。
+        // 每段用自己的 `stride`（v5/v6 段是 64）。
         var seg_key_cap: usize = 0;
         for (self.segs.items) |*sg| {
-            seg_key_cap += (window + segmod.INDEX_STRIDE + 1) * @max(@as(usize, 1), @as(usize, sg.max_klen));
+            seg_key_cap += (window + 2 * sg.stride) * @max(@as(usize, 1), @as(usize, sg.max_klen));
         }
-        try kbuf.ensureTotalCapacity(alloc, seg_key_cap);
+        // 用 `ensureTotalCapacityPrecise` 而不是 `ensureTotalCapacity`：
+        // 后者会让分配器按 2 的幂向上取整，**把上界算漏 40% 也看不出来**
+        // （实测：`+1` 的旧上界本应溢出，却因为 714→1024 的取整一直「恰好够用」）。
+        // 精确分配后，`topk_arena_short` 这条守卫才真的会响。
+        try kbuf.ensureTotalCapacityPrecise(alloc, seg_key_cap);
 
         var si = self.segs.items.len;
         while (si > 0) {
@@ -1162,8 +1198,14 @@ pub const Table = struct {
             defer c.deinit();
             var first = head_trunc;
             while (c.next()) |rec| {
+                // **绝不允许扩容**：`cand` 里已经存了 `kbuf` 的切片，扩容搬移会让它们悬垂。
+                // 上界真算漏了就退回全量路径（计数器 `topk_arena_short` 供用例守住）。
+                if (kbuf.items.len + rec.key.len > kbuf.capacity) {
+                    self.topk_arena_short +|= 1;
+                    return false;
+                }
                 const off = kbuf.items.len;
-                try kbuf.appendSlice(alloc, rec.key);
+                kbuf.appendSliceAssumeCapacity(rec.key);
                 try cand.append(alloc, .{
                     .key = kbuf.items[off..][0..rec.key.len],
                     .seq = rec.seq,
@@ -4586,6 +4628,107 @@ test "topKDesc：跨段 + 旧版本 + 墓碑，取最大的 k 个可见行（降
     try std.testing.expect(!try t.topKDesc(10, &out));
     t.opts.topk_desc_max = 4096;
     try std.testing.expect(try t.topKDesc(10, &out));
+
+    // ⑦ **key 区上界必须真的够**：`topk_arena_short` 是确定性计数器，
+    // 一旦「窗口行数上界」推算落后于实际（`kbuf` 会扩容 ⇒ 已记录的 key 切片悬垂 = UAF），
+    // 它就会 > 0。这里断言整轮下来恒为 0；同时钉住结果仍然正确。
+    try std.testing.expectEqual(@as(u64, 0), t.topk_arena_short);
+}
+
+test "topKDesc 的 key 区上界：段行数是块步长整数倍时（窗口最宽）也不许触及上限" {
+    // **为什么要专门造这个形状**：窗口起点是 `n - (want/stride + 2)` 块，
+    // 只有**最后一块是满的**（行数 % stride == 0）时窗口里才真的装着 `want + 2*stride` 行
+    // —— 这正是 `seg_key_cap` 必须覆盖的最坏情况。
+    //
+    // **还必须让所有段都被走到**：不重叠递增布局下，凑够 `window` 条就 `break`，
+    // 只走一段时上界写小也够用（这就是「撤销验证没红」的原因）。
+    // 所以这里刻意造一段**覆盖中间范围**的新段，让 `segs_disjoint_asc == false`。
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-topkdesc-cap";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+
+    const stride = segmod.INDEX_STRIDE;
+    const N = stride * 20; // 20 个满块
+    var t = try Table.open(io, dir, tmp, alloc, .{ .wal_sync_every = 0, .flush_bytes = 1 });
+    defer t.deinit();
+
+    var kb: [N][16]u8 = undefined;
+    var keys: [N][]const u8 = undefined;
+    var vs: [N][]const u8 = undefined;
+    for (0..N) |i| {
+        keys[i] = std.fmt.bufPrint(&kb[i], "k{d:0>6}", .{i}) catch unreachable;
+        vs[i] = if (i < N / 2) "a" else "b";
+    }
+
+    // 段 1：0..159（'a'）；段 2：160..319（'b'）——两者不重叠递增
+    try t.putBatch(keys[0 .. N / 2], vs[0 .. N / 2]);
+    try t.putBatch(keys[N / 2 ..], vs[N / 2 ..]);
+    // 段 3：80..239 覆盖更新（'c'）⇒ 与前后两段都重叠
+    for (N / 4..N / 4 + N / 2) |i| vs[i] = "c";
+    try t.putBatch(keys[N / 4 .. N / 4 + N / 2], vs[N / 4 .. N / 4 + N / 2]);
+    try t.flush();
+    try std.testing.expect(!t.segs_disjoint_asc);
+
+    var out: std.ArrayList([]const u8) = .empty;
+    defer out.deinit(alloc);
+
+    // 多档 k（窗口 = k + TOPK_MARGIN，不同 k 落到不同块边界上）
+    for ([_]usize{ 1, 5, 10, 37, 100, 256 }) |k| {
+        try std.testing.expect(try t.topKDesc(k, &out));
+        try std.testing.expectEqual(k, out.items.len);
+        for (out.items, 0..) |got, i| {
+            const n = N - 1 - i;
+            const want: []const u8 = if (n >= N / 4 and n < N / 4 + N / 2) "c" else if (n >= N / 2) "b" else "a";
+            try std.testing.expectEqualStrings(want, got);
+        }
+    }
+    // 上界真算漏了就会走 `topk_arena_short` 的退回分支（并且 `kbuf` 会扩容 ⇒ UAF）
+    try std.testing.expectEqual(@as(u64, 0), t.topk_arena_short);
+}
+
+test "归档自愈的步长探测：错步长必须被判为损坏，对步长必须逐行解出" {
+    // `rebuildArchive` 只有 `.data`、拿不到索引 ⇒ 步长只能靠「能否严格解析到文件末尾」判定。
+    // 这条用例造两份**分帧不同**的数据（16 条一块 / 64 条一块），
+    // 断言「对步长成功、错步长失败」，等于把「探测」这个前提钉死。
+    // 没有这条，探测逻辑写成「总能成功」也不会有人发现。
+    const alloc = std.testing.allocator;
+
+    const N = 100;
+    var kb: [N][12]u8 = undefined;
+    var keys: [N][]const u8 = undefined;
+    for (0..N) |i| keys[i] = std.fmt.bufPrint(&kb[i], "k{d:0>4}", .{i}) catch unreachable;
+
+    for ([_]usize{ segmod.INDEX_STRIDE, segmod.LEGACY_INDEX_STRIDE }) |stride| {
+        // 按给定步长手工分帧：块头 1 字节 pfx（这里统一用 0，不做前缀压缩）
+        var blob: std.ArrayList(u8) = .empty;
+        defer blob.deinit(alloc);
+        var i: usize = 0;
+        while (i < N) {
+            const n = @min(stride, N - i);
+            try blob.append(alloc, 0); // pfx = 0 ⇒ 每条都是完整 key
+            for (0..n) |j| {
+                const key = keys[i + j];
+                var hdr: [6 + 33]u8 = undefined;
+                const hn = codec.writeRecHdr(&hdr, key.len, 1, i + j + 1, 0);
+                try blob.appendSlice(alloc, hdr[0..hn]);
+                try blob.appendSlice(alloc, key);
+                try blob.append(alloc, 'v');
+            }
+            i += n;
+        }
+
+        // ① 对步长：严格解析必须是全部 N 行
+        try std.testing.expectEqual(N, try countRowsStrict(alloc, blob.items, stride));
+        // ② 错步长：必须报损坏（不能「解出一些行」就当成功 —— 那正是会写出半段的场景）
+        const other = if (stride == segmod.INDEX_STRIDE) segmod.LEGACY_INDEX_STRIDE else segmod.INDEX_STRIDE;
+        try std.testing.expectError(error.SegmentCorrupt, countRowsStrict(alloc, blob.items, other));
+    }
 }
 
 test "topKDesc 单来源快路径（只有 memtable）：版本/墓碑/不足 k" {
