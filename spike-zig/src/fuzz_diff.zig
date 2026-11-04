@@ -1842,3 +1842,144 @@ test "段文件损坏/截断：必须显式报错或自愈到一行不少，不�
     });
     try std.testing.expectEqual(@as(usize, 0), fails);
 }
+
+// ===========================================================================
+// `verifyAll()` 的覆盖面：**必须包含二级索引表**
+//
+// 第一版只遍历了 `tables`（基表），索引表整个被跳过。而索引段损坏的后果比基表更隐蔽 ——
+// 索引项驱动查找，坏了会**漏行/错行**而不是报错，且用户不会看到任何异常。
+// ===========================================================================
+
+test "verifyAll 覆盖二级索引表：索引段位翻转必须报错" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+    const root = "test-verify-idx";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    // 每插一行就 flush 一个段（基表与索引表都会有多个段）
+    {
+        var eng = try engine.Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0, .flush_bytes = 1 } });
+        defer eng.deinit();
+        try execSilent(&eng, alloc, "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, s TEXT)");
+        for (buildT()[0..6]) |r| {
+            var b: Buf = .empty;
+            defer b.deinit(alloc);
+            try b.appendSlice(alloc, "INSERT INTO t (id, g, s) VALUES (");
+            try addInt(alloc, &b, r.id);
+            try b.appendSlice(alloc, ", ");
+            if (r.g) |g| try addInt(alloc, &b, g) else try b.appendSlice(alloc, "NULL");
+            try b.appendSlice(alloc, ", ");
+            if (r.s) |v| {
+                try b.appendSlice(alloc, "'");
+                try b.appendSlice(alloc, v);
+                try b.appendSlice(alloc, "'");
+            } else try b.appendSlice(alloc, "NULL");
+            try b.appendSlice(alloc, ")");
+            try execSilent(&eng, alloc, b.items);
+        }
+        try execSilent(&eng, alloc, "CREATE INDEX idx_t_g ON t (g)");
+    }
+
+    // ① 完好库：verifyAll 必须真的校验到东西（防空跑）
+    {
+        var eng = try engine.Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+        defer eng.deinit();
+        const n = try eng.verifyAll();
+        try std.testing.expect(n > 0);
+    }
+
+    // ② 把二级索引表某个段的中间字节翻一位
+    {
+        const idx_seg = try alloc.print("{s}/t/idx/idx_t_g/seg/000001.data", .{root});
+        defer alloc.free(idx_seg);
+        const f = try dir.openFile(io, idx_seg, .{ .mode = .read_write });
+        defer f.close(io);
+        const size: usize = @intCast((try f.stat(io)).size);
+        try std.testing.expect(size > 2); // 防空跑：文件太小就说明没造出索引段
+        var one = [_]u8{0};
+        const at = size / 2;
+        _ = try f.readPositionalAll(io, &one, at);
+        one[0] ^= 0xFF;
+        try f.writePositionalAll(io, &one, at);
+        try f.sync(io);
+    }
+
+    // ③ 必须报错（如果 verifyAll 漏了索引表，这里会"成功"，用例就红）
+    {
+        var eng = try engine.Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+        defer eng.deinit();
+        const r = eng.verifyAll();
+        try std.testing.expectError(error.DataChecksumMismatch, r);
+    }
+}
+
+// ===========================================================================
+// CRC 的两条**间接路径**：这两条都会重写 `.data`，写完之后的 CRC 必须与新内容一致。
+// 不做的话，正常运维动作（compact / 归档自愈）会给自己造出"看起来损坏"的段。
+// ===========================================================================
+
+test "compact 与归档自愈重写段之后，verifyAll 必须通过" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+    const root = "test-verify-rewrite";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    // 每插一行 flush 一个段 ⇒ 有多个段可合并
+    {
+        var eng = try engine.Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0, .flush_bytes = 1 } });
+        defer eng.deinit();
+        try execSilent(&eng, alloc, "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, s TEXT)");
+        for (buildT()[0..8]) |r| {
+            var b: Buf = .empty;
+            defer b.deinit(alloc);
+            try b.appendSlice(alloc, "INSERT INTO t (id, g, s) VALUES (");
+            try addInt(alloc, &b, r.id);
+            try b.appendSlice(alloc, ", ");
+            if (r.g) |g| try addInt(alloc, &b, g) else try b.appendSlice(alloc, "NULL");
+            try b.appendSlice(alloc, ", ");
+            if (r.s) |v| {
+                try b.appendSlice(alloc, "'");
+                try b.appendSlice(alloc, v);
+                try b.appendSlice(alloc, "'");
+            } else try b.appendSlice(alloc, "NULL");
+            try b.appendSlice(alloc, ")");
+            try execSilent(&eng, alloc, b.items);
+        }
+    }
+
+    // ① compact 重写段 → CRC 必须与新内容一致
+    {
+        var eng = try engine.Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+        defer eng.deinit();
+        const e = eng.get("t").?;
+        const before = e.table.segs.items.len;
+        const res = try e.table.compact();
+        try std.testing.expect(before >= 2); // 防空跑：至少要有两段可合并
+        try std.testing.expect(res.did);
+        const n = try eng.verifyAll();
+        try std.testing.expect(n > 0);
+    }
+
+    // ② 删掉归档 → 重开走「从 .data 重建」，重建后同样必须能验过
+    {
+        const arc = try alloc.print("{s}/t/seg/index.bin", .{root});
+        defer alloc.free(arc);
+        try dir.deleteFile(io, arc);
+        var eng = try engine.Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+        defer eng.deinit();
+        const n = try eng.verifyAll();
+        try std.testing.expect(n > 0);
+        // 行也必须一行不少（自愈不能顺手丢数据）
+        const got = try fetchAll(&eng, alloc, "SELECT id FROM t ORDER BY id");
+        defer freeRows(got, alloc);
+        try std.testing.expectEqual(@as(usize, 8), got.len);
+    }
+}

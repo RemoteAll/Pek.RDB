@@ -968,6 +968,40 @@ test "crc32 known value" {
     }
 }
 
+test "crc32Fast 增量等价：任意切分点都必须等于一次性计算" {
+    // **为什么必须测这个**：段写入是流式的，`flushBuf` 每次落盘的字节数是任意的
+    // （取决于块边界），所以增量算法必须在**任意切分点**都与一次性计算一致；
+    // 差一个字节就会让 `verifyAll()` 对完好的段报 `DataChecksumMismatch`，
+    // 或者反过来说：损坏的段反而"验过了"。
+    var buf: [97]u8 = undefined; // 97 是质数，刻意不是 8 的倍数
+    for (&buf, 0..) |*b, i| b.* = @truncate(i *% 37 +% 11);
+    const whole = crc32Fast(&buf);
+
+    // 单切分点：覆盖 0..97 全部位置
+    for (0..buf.len + 1) |cut| {
+        var c = crc32FastSeed();
+        c = crc32FastUpdate(c, buf[0..cut]);
+        c = crc32FastUpdate(c, buf[cut..]);
+        try std.testing.expectEqual(whole, crc32FastFinal(c));
+    }
+    // 双切分点：覆盖 (a,b) 全部组合
+    for (0..buf.len + 1) |a| {
+        for (a..buf.len + 1) |b| {
+            var c = crc32FastSeed();
+            c = crc32FastUpdate(c, buf[0..a]);
+            c = crc32FastUpdate(c, buf[a..b]);
+            c = crc32FastUpdate(c, buf[b..]);
+            try std.testing.expectEqual(whole, crc32FastFinal(c));
+        }
+    }
+    // 逐字节喂（最极端的切分）
+    {
+        var c = crc32FastSeed();
+        for (buf) |b| c = crc32FastUpdate(c, &.{b});
+        try std.testing.expectEqual(whole, crc32FastFinal(c));
+    }
+}
+
 test "varint roundtrip" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(std.testing.allocator);

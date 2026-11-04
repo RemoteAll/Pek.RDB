@@ -450,21 +450,33 @@ pub const Engine = struct {
         var checked: usize = 0;
         var it = self.tables.iterator();
         while (it.next()) |e| {
-            for (e.value_ptr.table.segs.items) |seg| {
-                const want = seg.data_crc orelse continue;
-                const ok = try segmod.verifyDataFile(
-                    self.io,
-                    self.dir,
-                    e.value_ptr.table.base_path,
-                    seg.id,
-                    want,
-                    self.alloc,
-                );
-                if (!ok) return error.DataChecksumMismatch;
-                checked += 1;
-            }
+            const ent = e.value_ptr;
+            checked += try self.verifyOneTable(&ent.table);
+            // **二级索引表也要验**：它们的段文件同样是不可变数据，而索引段损坏的后果
+            // 比基表更隐蔽 —— 索引项驱动查找，坏了会直接**漏行/错行**而不是报错。
+            // （第一版只遍历了 `tables`，索引表整个被跳过。）
+            var iit = ent.idx_tables.iterator();
+            while (iit.next()) |kv| checked += try self.verifyOneTable(kv.value_ptr);
         }
         return checked;
+    }
+
+    fn verifyOneTable(self: *Engine, t: *const tablemod.Table) !usize {
+        var n: usize = 0;
+        for (t.segs.items) |seg| {
+            const want = seg.data_crc orelse continue;
+            const ok = try segmod.verifyDataFile(
+                self.io,
+                self.dir,
+                t.base_path,
+                seg.id,
+                want,
+                self.alloc,
+            );
+            if (!ok) return error.DataChecksumMismatch;
+            n += 1;
+        }
+        return n;
     }
 
     pub fn deinit(self: *Engine) void {

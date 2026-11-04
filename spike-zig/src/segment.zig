@@ -1780,3 +1780,49 @@ test "mmap 存活时 rename 覆盖同路径：验证 compact 重写归档是否�
     _ = try f3.readPositionalAll(io, &rd, 0);
     try std.testing.expectEqualStrings(replacement, &rd);
 }
+
+test "索引格式 v6 带整段 CRC，且 v5 旧格式仍可读（data_crc 为空）" {
+    // **为什么必须测 v5**：「旧库免迁移」是这次格式变更对外的承诺，
+    // 而所有既有用例都是新建库（只会产出 v6），这条承诺**没有任何用例守着** ——
+    // 一旦 v5 分支写错，用户升级上来才会发现整个库打不开。
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+    const tmp = "test-idx-v5";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+    try dir.createDirPath(io, tmp);
+
+    var w = try Writer.create(io, dir, tmp ++ "/000001.data", alloc, 10, 2);
+    defer w.deinit();
+    try w.push("a", 1, 0, "va");
+    try w.push("b", 2, 0, "vb");
+    const fin = try w.finishBytes();
+    defer alloc.free(fin.bytes);
+
+    // ① v6：解析出来必须带 data_crc
+    var s6 = Segment{ .io = io, .alloc = alloc };
+    defer s6.close();
+    try s6.parseIdxHeader(fin.bytes);
+    try std.testing.expect(s6.data_crc != null);
+    try std.testing.expectEqual(@as(u64, 2), s6.rows);
+
+    // ② 手工降级成 v5：magic 换 05、去掉 4 字节 crc、重算尾部 hash
+    const body = fin.bytes[12 .. fin.bytes.len - 8];
+    const v5 = try alloc.alloc(u8, 8 + body.len + 8);
+    defer alloc.free(v5);
+    @memcpy(v5[0..8], IDX_MAGIC_V5);
+    @memcpy(v5[8..][0..body.len], body);
+    std.mem.writeInt(u64, v5[8 + body.len ..][0..8], codec.hashIdx(v5[0 .. 8 + body.len]), .little);
+
+    var s5 = Segment{ .io = io, .alloc = alloc };
+    defer s5.close();
+    try s5.parseIdxHeader(v5);
+    try std.testing.expect(s5.data_crc == null); // 旧段不参与 CRC 校验
+    try std.testing.expectEqual(@as(u64, 2), s5.rows);
+    // 旧格式还必须能**全量解析**（头部对了但 body 解析错，一样是打不开库）
+    try s5.parseIdxBody(v5);
+    try std.testing.expect(s5.n_entries > 0);
+}
