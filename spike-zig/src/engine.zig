@@ -2161,6 +2161,79 @@ test "复合索引：WHERE 首列走前缀、ORDER BY 两列免排序、更新/�
     }
 }
 
+test "复合索引与 JOIN：ON 列是索引首列走前缀扫描，不是首列就退回全表 —— 两条结果必须相同" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const root = "test-engine-composite-idx-join";
+    dir.deleteTree(io, root) catch {};
+    defer dir.deleteTree(io, root) catch {};
+
+    var eng = try Engine.open(io, dir, root, alloc, .{ .table = .{ .wal_sync_every = 0 } });
+    defer eng.deinit();
+
+    try run(&eng, alloc, "CREATE TABLE a (id INTEGER PRIMARY KEY, g INTEGER NOT NULL)");
+    try run(&eng, alloc, "INSERT INTO a (id, g) VALUES (1,1),(2,2),(3,0),(4,1),(5,2),(6,0)");
+    // 三张**数据完全相同**的右表，只有索引不同：
+    //   b1 索引 (k,n) → ON 列 k 是首列 ⇒ 走复合索引前缀扫描
+    //   b2 索引 (n,k) → ON 列 k 是第二列 ⇒ 用不上，退回全表扫
+    //   b3 无索引      → 全表扫（基准对照）
+    for ([_][]const u8{
+        "CREATE TABLE b1 (id INTEGER PRIMARY KEY, k INTEGER NOT NULL, n TEXT NOT NULL)",
+        "CREATE TABLE b2 (id INTEGER PRIMARY KEY, k INTEGER NOT NULL, n TEXT NOT NULL)",
+        "CREATE TABLE b3 (id INTEGER PRIMARY KEY, k INTEGER NOT NULL, n TEXT NOT NULL)",
+    }) |st| try run(&eng, alloc, st);
+    for ([_][]const u8{ "b1", "b2", "b3" }) |tb| {
+        var q: [256]u8 = undefined;
+        try run(&eng, alloc, try std.fmt.bufPrint(&q, "INSERT INTO {s} (id, k, n) VALUES (10,0,'zero'),(11,1,'one'),(12,1,'one'),(13,2,'two'),(14,2,'two'),(15,3,'three')", .{tb}));
+    }
+    try run(&eng, alloc, "CREATE INDEX idx_b1 ON b1 (k, n)");
+    try run(&eng, alloc, "CREATE INDEX idx_b2 ON b2 (n, k)");
+
+    const Case = struct { sql: []const u8, tb: []const u8 };
+    const cases = [_]Case{
+        .{ .sql = "SELECT a.id, b1.n FROM a JOIN b1 ON a.g = b1.k", .tb = "b1" },
+        .{ .sql = "SELECT a.id, b2.n FROM a JOIN b2 ON a.g = b2.k", .tb = "b2" },
+        .{ .sql = "SELECT a.id, b3.n FROM a JOIN b3 ON a.g = b3.k", .tb = "b3" },
+    };
+    // 无 ORDER BY ⇒ 顺序未定义，按**多重集**比：每行拼成字符串、排序、再拼成一个大串比较。
+    // （不能用 `expectEqualSlices([]u8, …)`：`std.meta.eql` 对切片比的是指针 + 长度，
+    //  内容相同但分配不同也会判不等 —— 第一版就是这么假红的。）
+    var got: [3]std.ArrayList([]u8) = .{ .empty, .empty, .empty };
+    defer for (&got) |*g| {
+        for (g.items) |s| alloc.free(s);
+        g.deinit(alloc);
+    };
+    for (cases, 0..) |c, k| {
+        var rows = try queryRows(&eng, alloc, c.sql);
+        defer rows.deinit();
+        for (rows.rows) |r| {
+            const line = try std.fmt.allocPrint(alloc, "{d}|{s}", .{ r[0].integer, r[1].text });
+            try got[k].append(alloc, line);
+        }
+        std.mem.sort([]u8, got[k].items, {}, strLess);
+    }
+    try std.testing.expect(got[0].items.len > 0); // 防空跑：JOIN 真的出了行
+
+    var flat: [3]std.ArrayList(u8) = .{ .empty, .empty, .empty };
+    defer for (&flat) |*f| f.deinit(alloc);
+    for (&got, 0..) |*g, k| {
+        for (g.items) |line| {
+            try flat[k].appendSlice(alloc, line);
+            try flat[k].append(alloc, '\n');
+        }
+    }
+    try std.testing.expectEqualStrings(flat[2].items, flat[0].items); // 首列索引 == 全表
+    try std.testing.expectEqualStrings(flat[2].items, flat[1].items); // 非首列退回 == 全表
+}
+
+fn strLess(_: void, a: []u8, b: []u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
 test "ORDER BY NOT NULL 的 boolean 索引列：值分量仍是 8 字节定长" {
     const alloc = std.testing.allocator;
     var threaded = std.Io.Threaded.init(alloc, .{});
@@ -2443,8 +2516,12 @@ const oom_lifecycle = [_][]const u8{
     "CREATE TABLE a (id INTEGER PRIMARY KEY, g INTEGER NOT NULL, s TEXT NOT NULL)",
     "INSERT INTO a (id, g, s) VALUES (1,10,'x'), (2,10,'y'), (3,20,'z'), (4,99,'w')",
     "CREATE INDEX idx_a_g ON a (g)",
+    // 复合索引也进扫描：回填时多分配了 want/idx_pos/parts、键里多段值分量，
+    // 这条路径只有在「分配就绪之后又失败」时才暴露漏释放，日常用例碰不到。
+    "CREATE INDEX idx_a_gs ON a (g, s)",
     "UPDATE a SET g = 11 WHERE id = 2",
     "DELETE FROM a WHERE id = 4",
+    "DROP INDEX idx_a_gs",
 };
 
 test "任意分配失败：开库/恢复/重开全生命周期不泄漏" {

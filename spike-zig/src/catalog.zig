@@ -134,8 +134,14 @@ pub fn loadSchema(io: std.Io, dir: std.Io.Dir, table_path: []const u8, alloc: st
         for (ix.cols.items) |ci| {
             if (ci >= sch.columns.len) return error.BadCatalog;
         }
-        // addIndex 内部会 dupe 名字与列号：这里传的是 text 的借用，函数返回前 text 就释放了
-        _ = try sch.addIndex(alloc, ix.name, ix.cols.items);
+        // addIndex 内部会 dupe 名字与列号：这里传的是 text 的借用，函数返回前 text 就释放了。
+        // **除了 OOM，其余错误都意味着目录文件坏了**（如重复列/非法列号）：
+        // 不能把 `InvalidIdentifier` 这种内部错误名泄给上层，否则运维看到的报错与
+        // 「catalog 损坏」这个事实对不上。
+        _ = sch.addIndex(alloc, ix.name, ix.cols.items) catch |e| switch (e) {
+            error.OutOfMemory => return e,
+            else => return error.BadCatalog,
+        };
     }
     return sch;
 }
@@ -213,6 +219,52 @@ test "schema save/load roundtrip" {
     try std.testing.expect(loaded.columns[0].auto_increment);
     try std.testing.expect(loaded.columns[1].not_null);
     try std.testing.expectEqual(sql.ColumnType.text, loaded.columns[1].col_type);
+}
+
+test "catalog：索引行坏掉时必须报 BadCatalog（不是内部错误名、更不是默默少一个索引）" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir = std.Io.Dir.cwd();
+
+    const tmp = "test-catalog-bad-idx";
+    dir.deleteTree(io, tmp) catch {};
+    defer dir.deleteTree(io, tmp) catch {};
+    try dir.createDirPath(io, tmp);
+
+    const head = "v1\nt\nid integer 1 1 0\ng integer 0 1 0\n";
+    // 四种坏法：列号列表为空、尾逗号、重复列、越界列号
+    const bad = [_][]const u8{
+        "#idx x \n",
+        "#idx x 1,\n",
+        "#idx x 1,1\n",
+        "#idx x 0,9\n",
+    };
+    for (bad) |line| {
+        const text = try std.fmt.allocPrint(alloc, "{s}{s}", .{ head, line });
+        defer alloc.free(text);
+        try writeText(io, dir, tmp ++ "/schema.txt", text);
+        try std.testing.expectError(error.BadCatalog, loadSchema(io, dir, tmp, alloc));
+    }
+
+    // 对照：合法格式必须读得回来 —— ① 旧的单列写法（只有列号，没有逗号）
+    {
+        try writeText(io, dir, tmp ++ "/schema.txt", head ++ "#idx x 1\n");
+        var s1 = try loadSchema(io, dir, tmp, alloc);
+        defer s1.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), s1.indexes[0].columns.len);
+        try std.testing.expectEqual(@as(usize, 1), s1.indexes[0].columns[0]);
+    }
+    // ② 新的多列写法（顺序必须原样保留：(1,0) 不能变成 (0,1)）
+    {
+        try writeText(io, dir, tmp ++ "/schema.txt", head ++ "#idx x 1,0\n");
+        var s2 = try loadSchema(io, dir, tmp, alloc);
+        defer s2.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), s2.indexes[0].columns.len);
+        try std.testing.expectEqual(@as(usize, 1), s2.indexes[0].columns[0]);
+        try std.testing.expectEqual(@as(usize, 0), s2.indexes[0].columns[1]);
+    }
 }
 
 test "catalog save/load roundtrip" {
